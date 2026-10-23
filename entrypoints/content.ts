@@ -33,10 +33,6 @@ export function detectBvid(url: string): string | null {
 
 function report(bvid: string | null) {
   console.log('[doubao-poc] bvid =', bvid);
-  if (bvid) {
-    // PoC E2E 载波（进页即跑链路，任务 1.4 移除）
-    void browser.runtime.sendMessage({ type: 'VIDEO_SEEN', bvid }).catch(() => {});
-  }
   void startWatcher(bvid);
 }
 

@@ -115,4 +115,34 @@ describe('mapReduceSummarize 集成（mock SSE）', () => {
     expect(out.attempts).toBe(2);
     expect(out.plainText).toContain('不是JSON');
   });
+
+  it('5 块时并发封顶 MAP_CONCURRENCY=3（峰值恰为 3，不多不少）', async () => {
+    // 60 条 × 300 字 = 18000 字，chunkChars=4000 → 5 块
+    const cues: StoredCue[] = Array.from({ length: 60 }, (_, i) => cue(i * 20, `${i}:` + 'y'.repeat(298)));
+    const chunks = chunkCues(cues, { chunkChars: 4000 });
+    expect(chunks).toHaveLength(5);
+    let inFlight = 0;
+    let peak = 0;
+    const server = await startMockLlm((call) => {
+      const isMap = call.body.messages?.[0]?.content.includes('字幕片段分析器');
+      if (!isMap) return { chunks: [validSummaryJson()] };
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      return { chunks: ['[00:00] 要点'], delayMs: 80 };
+    });
+    servers.push(server);
+    const out = await mapReduceSummarize(
+      { baseUrl: server.url, model: 'mock', apiKey: 'k' },
+      { title: 't', duration: 1200, cueCount: cues.length },
+      cues,
+      {
+        chunkChars: 4000,
+        onMapComplete: () => {
+          inFlight = Math.max(0, inFlight - 1);
+        },
+      },
+    );
+    expect(out.degraded).toBe(false);
+    expect(peak).toBe(MAP_CONCURRENCY); // 5 块、上限 3：峰值恰为 3（既证明并行也证明封顶）
+  });
 });

@@ -1,12 +1,10 @@
 // background service worker：轻量编排（架构 §8：长任务一律 offscreen，SW 不执行 LLM SSE）。
 // - P1.2 watcher 服务端（VIDEO_ENTER/WATCH_TICK/TRIGGER_SUMMARY）
 // - P1.4 pipeline 编排：job 派发给 offscreen 执行体，进度回流落库；SW 启动 recover+drain
-// - Phase 0 PoC 链保留为 E2E 载波（VIDEO_SEEN → console 标记，scripts/e2e-poc.mjs 依赖；
-//   真实触发链为 TRIGGER_SUMMARY → pipeline → offscreen → chain）
+// 触发链：watcher 20s → TRIGGER_SUMMARY → pipeline.enqueue → offscreen → lib/summarize/chain → 落库
+// （Phase 0 的 VIDEO_SEEN 进页即跑链已随 1.4 移除：SW 内不留 LLM 路径，E2E 改走真实触发链）
 import { BiliClient, pickPage } from '../src/lib/bilibili/client';
-import { selectTrack } from '../src/lib/bilibili/track';
-import { resolveConfig, summarize } from '../src/lib/llm/summary';
-import type { StoredLlmConfig } from '../src/lib/llm/summary';
+import { readStoredLlmConfig, resolveConfig } from '../src/lib/llm/summary';
 import { Pipeline, type JobContext, type JobOutcome } from '../src/lib/pipeline';
 import {
   CompanionDB,
@@ -20,7 +18,6 @@ import {
 } from '../src/lib/storage';
 import { browserKv } from '../src/lib/storage/browserKv';
 
-const seen = new Set<string>();
 const db = new CompanionDB();
 
 // ---- P1.4 · pipeline：执行体=offscreen（LLM SSE 长任务不在 SW 跑） -----------------
@@ -29,14 +26,14 @@ let offscreenReady = false;
 
 async function ensureOffscreen(): Promise<void> {
   if (offscreenReady) return;
-  const existing = await browser.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT' as never],
-  });
-  if (existing.length > 0) {
-    offscreenReady = true;
-    return;
-  }
   try {
+    const existing = await browser.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT' as never],
+    });
+    if (existing.length > 0) {
+      offscreenReady = true;
+      return;
+    }
     await browser.offscreen.createDocument({
       url: 'offscreen.html', // WXT 构建产物路径（entrypoints/offscreen/index.html → 根 offscreen.html）
       reasons: ['DOM_PARSER' as never],
@@ -46,7 +43,10 @@ async function ensureOffscreen(): Promise<void> {
   } catch (e) {
     // 并发创建时"已存在"类报错按就绪处理；其余抛给 pipeline 记失败重试
     if (String(e).includes('Only a single offscreen')) offscreenReady = true;
-    else throw e;
+    else {
+      console.log(`[doubao] ensureOffscreen error: ${String(e).slice(0, 200)}`);
+      throw e;
+    }
   }
 }
 
@@ -54,8 +54,24 @@ async function ensureOffscreen(): Promise<void> {
  * job 执行器：发 offscreen 跑全链路，SUMMARY_PROGRESS 消息转 pipeline ctx 落库。
  * shortcut: 600s 看门狗兜 offscreen 挂死（不回包）阻塞队列；SW 中途死亡由 recover() 重排幂等重跑。
  */
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** offscreen 文档刚创建时监听器可能尚未注册（Receiving end does not exist）——短重试等它就绪。 */
+async function sendToOffscreen(payload: Record<string, unknown>): Promise<unknown> {
+  let lastErr: unknown;
+  for (let i = 0; i < 12; i++) {
+    try {
+      return await browser.runtime.sendMessage(payload);
+    } catch (e) {
+      lastErr = e;
+      if (!String(e).includes('Receiving end does not exist')) throw e;
+      await sleep(300);
+    }
+  }
+  throw lastErr;
+}
+
 async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOutcome> {
-  await ensureOffscreen();
   const onProgress = (msg: unknown) => {
     const m = msg as { type?: string; jobId?: string; stage?: JobStage; progress?: number };
     if (m?.type === 'SUMMARY_PROGRESS' && m.jobId === job.id) {
@@ -68,22 +84,42 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
   browser.runtime.onMessage.addListener(onProgress);
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   try {
-    const reply = await Promise.race([
-      browser.runtime.sendMessage({ type: 'OFFSCREEN_RUN_JOB', job: { id: job.id, videoKey: job.videoKey } }),
+    await ensureOffscreen();
+    // offscreen 文档读不了 storage（API 受限）：LLM 配置与 persona 在 SW 解析后随 job 传入
+    const { config, error: cfgErr } = resolveConfig(await readStoredLlmConfig(browserKv));
+    if (!config) return { result: 'failed', error: { code: 'NO_LLM_CONFIG', msg: cfgErr ?? '未配置 LLM' } };
+    const persona = ((await browser.storage.local.get('settings'))['settings'] as { persona?: string } | undefined)
+      ?.persona;
+    const reply = (await Promise.race([
+      sendToOffscreen({ type: 'OFFSCREEN_RUN_JOB', job: { id: job.id, videoKey: job.videoKey }, llm: config, persona }),
       new Promise<never>((_, rej) => {
         watchdog = setTimeout(() => rej(new Error('offscreen 执行超时(600s)')), 600_000);
       }),
-    ]);
-    return reply as JobOutcome;
+    ])) as JobOutcome | undefined;
+    if (reply && reply.result === 'failed') {
+      // offscreen 的 console 不易被 CDP 捕获，失败原因回灌 SW console 便于诊断
+      console.log(`[doubao] offscreen job failed: ${reply.error?.code}: ${reply.error?.msg}`);
+    }
+    if (!reply) throw new Error('offscreen 无应答（文档可能未加载完成）');
+    return reply;
+  } catch (e) {
+    console.log(`[doubao] offscreen executor error: ${String(e).slice(0, 200)}`);
+    offscreenReady = false; // offscreen 文档可能已被系统回收：下次执行重建
+    throw e;
   } finally {
     browser.runtime.onMessage.removeListener(onProgress);
     if (watchdog !== undefined) clearTimeout(watchdog);
   }
 }
 
+const lastLoggedStatus = new Map<string, string>();
 const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   onTransition: (j) => {
-    if (j.status !== 'pending') console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
+    // 进度写回也会触发本回调：只在状态真正变化时打日志
+    if (j.status !== 'pending' && lastLoggedStatus.get(j.id) !== j.status) {
+      lastLoggedStatus.set(j.id, j.status);
+      console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
+    }
   },
 });
 
@@ -109,9 +145,6 @@ export default defineBackground(() => {
     switch (m?.type) {
       case 'PING':
         return Promise.resolve({ pong: true });
-      case 'VIDEO_SEEN':
-        if (m.bvid) void runChain(m.bvid);
-        return undefined; // 单向通知，无应答
       case 'VIDEO_ENTER':
         return handleVideoEnter(m);
       case 'WATCH_TICK':
@@ -210,62 +243,3 @@ async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> 
   return { ok: true };
 }
 
-/** PoC 触发=进页面即跑（幂等：每视频每会话一次）；Phase 1 换 watcher 的 20s 有效观看触发。 */
-async function runChain(bvid: string): Promise<void> {
-  if (seen.has(bvid)) return;
-  seen.add(bvid);
-  const t0 = Date.now();
-  try {
-    const client = new BiliClient(); // credentials:'include' 内置：扩展宿主下自动带登录 Cookie
-    await client.fetchWbiKeys();
-    const view = await client.getView(bvid);
-    console.log(`[doubao-poc] E2E view ok: "${view.title.slice(0, 30)}" dur=${view.duration}s cid=${view.cid}`);
-
-    const { subtitles } = await client.getPlayerSubtitles(bvid, view.cid);
-    const track = selectTrack(subtitles);
-    if (!track?.subtitle_url) {
-      console.log(
-        `[doubao-poc] E2E FAIL subtitle: 无可用轨（tracks=${subtitles.length}；有轨样本出现此错误=登录态未带上）`,
-      );
-      return;
-    }
-    const cues = await client.fetchTranscript(track.subtitle_url);
-    console.log(`[doubao-poc] E2E subtitle ok: cues=${cues.length} lan=${track.lan}`);
-
-    const stored = ((await browser.storage.local.get('llm'))['llm'] ?? undefined) as
-      | StoredLlmConfig
-      | undefined;
-    const { config } = resolveConfig(stored);
-    if (!config) {
-      console.log('[doubao-poc] E2E FAIL llm: 未配置（storage.local.llm 三件套或构建期 POC_LLM_* 环境变量）');
-      return;
-    }
-    const transcript = cues.map((c) => `[${mmss(c.from)}]${c.content}`).join('\n');
-    const out = await summarize(
-      config,
-      { title: view.title, duration: view.duration, cueCount: cues.length },
-      transcript,
-    );
-    if (out.summaryResult) {
-      const r = out.summaryResult;
-      console.log(
-        `[doubao-poc] E2E llm ok: degraded=false rating=${r.rating} summaryChars=${r.summary.length}` +
-          ` attempts=${out.attempts} ttft=${out.ttftMs}ms outline=${r.outline.length}条`,
-      );
-      console.log(`[doubao-poc] 摘要：${r.summary}`);
-      console.log(`[doubao-poc] 豆包说：${r.evaluation}（${r.rating}🫘）`);
-    } else {
-      console.log(
-        `[doubao-poc] E2E llm ok: degraded=true chars=${out.plainText?.length ?? 0} attempts=${out.attempts}`,
-      );
-    }
-    console.log(`[doubao-poc] E2E CHAIN DONE bvid=${bvid} in ${Date.now() - t0}ms`);
-  } catch (e) {
-    console.log(`[doubao-poc] E2E FAIL ${String(e).slice(0, 300)}`);
-  }
-}
-
-function mmss(sec: number): string {
-  const s = Math.floor(sec);
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-}

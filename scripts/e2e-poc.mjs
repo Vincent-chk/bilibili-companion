@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-// Phase 0 · 任务 0.5 扩展端到端真机验证（E2E）
+// 扩展端到端真机验证（E2E）· Phase 0 任务 0.5 建立，P1.4 起驱动真实触发链
 //
 // 链路：pnpm build（注入 mock LLM 地址）→ 干净临时 user-data-dir
 //   → headless Chrome for Testing + --load-extension（branded Chrome 137+ 屏蔽该开关）
 //   → 登录态注入（提取器从真实 Chrome 解密取 Cookie → bilibili.com 页 document.cookie 写入）
-//   → 导航到真实视频页 → CDP 收集 page+SW console → 校验标记链 + DOM 探针 → 截图留证 → 清理。
+//   → SW 注入 sessionPointer+低阈值 → reload → 页面 muted play() 让 watcher 真实累计 5s
+//   → TRIGGER_SUMMARY → pipeline → offscreen 全链（lib/summarize/chain）
+//   → CDP 收集 page+SW+offscreen console → 标记链 + DOM 探针 + IndexedDB 终态断言 → 截图留证 → 清理。
 //
 // 用法：node scripts/e2e-poc.mjs [bvid]        （默认 BV1XynB6EEiM，样本清单内）
 // 前置：pnpm install 已跑；真实 Chrome 已登录 B 站；CfT 已就位（.bin/，或 E2E_BROWSER 覆盖）。
@@ -99,6 +101,7 @@ async function main() {
     const lines = [];
     const pageSessions = new Set(); // page session（截图/探针用）
     const sessionByTarget = new Map(); // targetId → sessionId（导航/Cookie 注入用）
+    let swSessionId = null; // 扩展 background SW 的 session（storage 注入用，SW 重启自动更新）
     const ws = new WebSocket(ver.webSocketDebuggerUrl);
     await onceEvent(ws, 'open');
     let msgId = 0;
@@ -116,6 +119,7 @@ async function main() {
       if (m.method === 'Target.attachedToTarget') {
         const { sessionId, targetInfo: t } = m.params;
         sessionByTarget.set(t.targetId, sessionId);
+        if (t.type === 'service_worker' && t.url.includes('background')) swSessionId = sessionId; // SW 可能重启，始终取最新
         cdp('Runtime.enable', {}, sessionId).catch(() => {});
         if (t.type === 'page') {
           cdp('Page.enable', {}, sessionId).catch(() => {});
@@ -127,7 +131,7 @@ async function main() {
       if (m.method === 'Runtime.consoleAPICalled') {
         const text = (m.params.args || []).map(renderRemote).join(' ');
         lines.push({ t: Date.now(), type: m.params.type, text });
-        if (text.includes('[doubao-poc]') || m.params.type === 'error') {
+        if (text.includes('[doubao') || m.params.type === 'error') {
           log(`console:${m.params.type}:`, text.slice(0, 220));
         }
         return;
@@ -183,13 +187,59 @@ async function main() {
     const nav = await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
     log('navigate →', PAGE_URL, nav.result?.frameId ? 'ok' : JSON.stringify(nav.error ?? nav.result));
 
-    // 7) 等标记链
+    // 7) 驱动真实链（P1.4 起旧 VIDEO_SEEN 载波已移除）：
+    //    SW 注入 sessionPointer + 低阈值(5s) → reload 让 VIDEO_ENTER 建 visit
+    //    → 页面 muted play() 让 watcher 真实累计 5s → TRIGGER_SUMMARY → pipeline → offscreen → 落库
+    for (let i = 0; i < 40 && !swSessionId; i++) { await sleep(250); }
+    if (!swSessionId) throw new Error('扩展 service worker 未 attach——扩展未加载？');
+    const setStorageRes = await cdp('Runtime.evaluate', {
+      expression: `chrome.storage.local.set({sessionPointer:{sessionId:'s_e2e',state:'ACTIVE',lastActiveAt:Date.now()},settings:{triggerSeconds:5}})`,
+      awaitPromise: true, returnByValue: true,
+    }, swSessionId);
+    log('sessionPointer+settings 注入:', JSON.stringify(setStorageRes?.result?.result?.value ?? setStorageRes?.result ?? 'void'));
+
+    await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
+    await sleep(4000); // 等 content script 重注入 + VIDEO_ENTER 建 visit + 播放器就绪
+
+    const playExpr = `(async () => {
+      const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+      if (!v) return 'no-video';
+      v.muted = true;
+      try { await v.play(); return 'ok paused=' + v.paused + ' t=' + Math.floor(v.currentTime); } catch (e) { return 'rejected:' + e.name; }
+    })()`;
+    let playResult = 'unset';
+    for (let i = 0; i < 12; i++) {
+      const r = await cdp('Runtime.evaluate', { expression: playExpr, awaitPromise: true, returnByValue: true }, landingSid);
+      playResult = String(r?.result?.result?.value ?? r?.result?.exceptionDetails?.text ?? 'eval-error');
+      log(`play attempt ${i + 1}:`, playResult.slice(0, 60));
+      if (playResult.startsWith('ok paused=false')) break;
+      await sleep(1500);
+    }
+    if (!playResult.startsWith('ok paused=false')) throw new Error(`视频未能静音播放（${playResult}）——watcher 无法累计有效观看`);
+
+    // 8) 等真实链标记：watcher 触发 → job 排队 → offscreen 执行 → 终态
     const t0 = Date.now();
     let outcome = 'timeout';
     while (Date.now() - t0 < TIMEOUT_MS) {
       await sleep(500);
-      if (lines.some((l) => l.text.includes('E2E CHAIN DONE'))) { outcome = 'done'; break; }
-      if (lines.some((l) => l.text.includes('E2E FAIL'))) { outcome = 'fail'; break; }
+      const done = lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done'));
+      const failed = lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ failed'));
+      if (done) { outcome = 'done'; break; }
+      if (failed) { outcome = 'fail'; break; }
+    }
+
+    // 8.5) DB 级终态断言：offscreen 链写入的 summaries 行（SW 与 offscreen 同源同库）
+    let dbSummary = null;
+    if (swSessionId) {
+      const dbExpr = `(async () => {
+        const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+        const rows = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
+        const jobs = await new Promise((res) => { const q = db.transaction('jobs','readonly').objectStore('jobs').getAll(); q.onsuccess = () => res(q.result); });
+        return JSON.stringify({ summaries: rows.map((r) => ({ key: r.key, status: r.status, chars: (r.summary||'').length })), jobs: jobs.map((j) => ({ status: j.status, stage: j.stage, progress: j.progress })) });
+      })()`;
+      const r = await cdp('Runtime.evaluate', { expression: dbExpr, awaitPromise: true, returnByValue: true }, swSessionId);
+      try { dbSummary = JSON.parse(r?.result?.result?.value); } catch { dbSummary = null; }
+      log('IndexedDB 终态:', JSON.stringify(dbSummary));
     }
 
     // 8) DOM 探针：豆包是否真的注入（不依赖 console 的第二证据）
@@ -214,20 +264,20 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
-    // 10) 判定
+    // 10) 判定（真实链标记：watcher 触发 → 排队 → offscreen → 终态 → DB 落库）
     const has = (s) => lines.some((l) => l.text.includes(s));
     const verdict = {
       contentInjected: has('content script injected'),
       bvid: has(`bvid = ${BVID}`),
       mascotDomInjected: mascotInjected === true,
-      view: has('E2E view ok'),
-      subtitle: has('E2E subtitle ok'),
-      llm: has('E2E llm ok'),
-      chainDone: has('E2E CHAIN DONE'),
-      noExplicitFail: !has('E2E FAIL'),
+      visitTriggered: has('summary job queued'), // watcher 5s 真实触发（含 visit 建行）
+      offscreenRun: has('offscreen run job'), // offscreen 执行体真的跑了
+      chainDone: lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done')),
+      dbSummaryDone: Array.isArray(dbSummary?.summaries) && dbSummary.summaries.some((s) => s.status === 'done'),
+      noExplicitFail: !lines.some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
     for (const [k, v] of Object.entries(verdict)) console.log(`  ${v ? '✅' : '❌'} ${k}`);
@@ -235,7 +285,7 @@ async function main() {
     console.log(pass ? '\n✅ E2E PASS' : `\n❌ E2E FAIL (outcome=${outcome})`);
     if (!pass) {
       console.log('--- chrome stderr tail ---\n' + chromeErr.slice(-600));
-      console.log('--- doubao-poc 相关 console ---\n' + (lines.filter((l) => l.text.includes('[doubao-poc]')).map((l) => `${l.type} ${l.text}`).join('\n') || '（无）'));
+      console.log('--- doubao 相关 console ---\n' + (lines.filter((l) => l.text.includes('[doubao')).map((l) => `${l.type} ${l.text}`).join('\n') || '（无）'));
     }
     process.exitCode = pass ? 0 : 1;
   } finally {

@@ -99,7 +99,8 @@ export class Pipeline {
     const ctx: JobContext = {
       update: async (patch) => {
         const cur = await this.#db.jobs.get(job.id);
-        if (!cur) return; // 执行期间被清除（F10 wipe）：不再写回
+        // 执行期间被清除（F10 wipe）不写回；终态后迟到的进度消息（如 done 落库后的 90 回包）不覆盖
+        if (!cur || cur.status !== 'running') return;
         await this.#set({ ...cur, ...patch, updatedAt: this.#now() });
       },
     };

@@ -27,6 +27,10 @@ function fakeBili(opts: FakeBiliOpts) {
   const calls: string[] = [];
   const api: BiliApi & { calls: string[] } = {
     calls,
+    async fetchWbiKeys() {
+      calls.push('wbi');
+      return 'mock-mixin-key';
+    },
     async getView() {
       calls.push('view');
       return {
@@ -96,7 +100,7 @@ describe('runSummarizeJob 全链', () => {
       ctx,
     );
     expect(outcome).toEqual({ result: 'done' });
-    expect(bili.calls).toEqual(['player', 'subtitle']); // 有 videos 行，无需 view
+    expect(bili.calls).toEqual(['wbi', 'player', 'subtitle']); // 有 videos 行，无需 view
     expect(stages).toEqual(['subtitle', 'llm_map', 'llm_reduce']);
     const srow = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
     expect(srow?.status).toBe('done');
@@ -123,7 +127,7 @@ describe('runSummarizeJob 全链', () => {
     const { ctx } = ctxLog();
     expect(await runSummarizeJob(deps, { videoKey: VIDEO_KEY }, ctx)).toEqual({ result: 'done' });
     expect(server.calls).toHaveLength(1);
-    expect(bili.calls).toEqual(['player', 'subtitle']);
+    expect(bili.calls).toEqual(['wbi', 'player', 'subtitle']);
     // 第二跑：字幕已缓存（无 player/subtitle）+ 摘要已 done（无 LLM）
     bili.calls.length = 0;
     expect(await runSummarizeJob(deps, { videoKey: VIDEO_KEY }, ctx)).toEqual({ result: 'done' });
@@ -220,6 +224,63 @@ describe('runSummarizeJob 全链', () => {
     const mapCalls = server.calls.filter((c) => c.body.messages?.[0]?.content.includes('字幕片段分析器')).length;
     expect(mapCalls).toBeGreaterThanOrEqual(2);
     expect((await db.summaries.get(summaryKey(VIDEO_KEY, 'm1')))?.status).toBe('done');
+    await db.delete();
+  });
+
+  it('换 model 重生成：key 不同→重新跑 LLM（F7 前置）', async () => {
+    const db = freshDb();
+    await db.videos.put({
+      key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: 't',
+      cover: '', owner: '', duration: 600, page: 1, fetchedAt: Date.now(),
+    });
+    const server = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    servers.push(server);
+    const bili = fakeBili({});
+    const { ctx } = ctxLog();
+    await runSummarizeJob({ db, bili, llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } }, { videoKey: VIDEO_KEY }, ctx);
+    expect(server.calls).toHaveLength(1);
+    await runSummarizeJob({ db, bili, llm: { baseUrl: server.url, model: 'm2', apiKey: 'k' } }, { videoKey: VIDEO_KEY }, ctx);
+    expect(server.calls).toHaveLength(2); // m2 是新 key → 重跑（字幕已缓存，无 player/subtitle）
+    expect(await db.summaries.get(summaryKey(VIDEO_KEY, 'm2'))).toBeDefined();
+    expect(bili.calls).toEqual(['wbi', 'player', 'subtitle']); // 字幕仅首跑抓取
+    await db.delete();
+  });
+
+  it('LLM 两轮非法 JSON → 降级纯文本落库（status=done、outline 空、summary≤600字，F5）', async () => {
+    const db = freshDb();
+    await db.videos.put({
+      key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: 't',
+      cover: '', owner: '', duration: 600, page: 1, fetchedAt: Date.now(),
+    });
+    const server = await startMockLlm(() => ({ chunks: ['这是一段纯文本回复，不是 JSON，也没有花括号。'] }));
+    servers.push(server);
+    const bili = fakeBili({});
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob({ db, bili, llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } }, { videoKey: VIDEO_KEY }, ctx);
+    expect(outcome).toEqual({ result: 'done' });
+    const srow = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
+    expect(srow?.status).toBe('done'); // 降级是兜底成功路径，不白屏
+    expect(srow?.outline).toEqual([]);
+    expect(srow?.summary).toContain('纯文本回复');
+    expect(srow!.summary.length).toBeLessThanOrEqual(600);
+    expect(server.calls).toHaveLength(2); // 修复重发 1 次
+    await db.delete();
+  });
+
+  it('字幕轨存在但 cues 为空 → failed + NO_CONTENT', async () => {
+    const db = freshDb();
+    await db.videos.put({
+      key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: 't',
+      cover: '', owner: '', duration: 600, page: 1, fetchedAt: Date.now(),
+    });
+    const server = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    servers.push(server);
+    const bili = fakeBili({ cues: [] });
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob({ db, bili, llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } }, { videoKey: VIDEO_KEY }, ctx);
+    expect(outcome.result).toBe('failed');
+    if (outcome.result === 'failed') expect(outcome.error.code).toBe('NO_CONTENT');
+    expect(server.calls).toHaveLength(0); // 零 LLM
     await db.delete();
   });
 });

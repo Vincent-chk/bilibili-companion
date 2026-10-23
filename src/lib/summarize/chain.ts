@@ -22,7 +22,7 @@ import {
 import type { JobOutcome } from '../pipeline';
 
 /** Bili 接口的最小面（BiliClient 天然满足；测试注入 fake）。 */
-export type BiliApi = Pick<BiliClient, 'getView' | 'getPlayerSubtitles' | 'fetchTranscript'>;
+export type BiliApi = Pick<BiliClient, 'fetchWbiKeys' | 'getView' | 'getPlayerSubtitles' | 'fetchTranscript'>;
 
 export interface SummarizeChainDeps {
   db: CompanionDB;
@@ -90,11 +90,12 @@ export async function runSummarizeJob(
   try {
     await ctx.update({ stage: 'subtitle', progress: 10 });
 
-    // videos 行兜底（正常路径 VIDEO_ENTER 已写入；24h 过期也在此刷新）
+    // videos 行兜底（正常路径 VIDEO_ENTER 已写入；24h 过期也在此刷新）。按 job 的 cid 选页，
+    // 多 P 时不能默认 P1（否则会用 P1 的 cid 取字幕、内容却存进该 P 的键下）
     let video = await db.videos.get(job.videoKey);
     if (!video) {
       const v = await bili.getView(bvid);
-      const pg = pickPage(v.pages, 1);
+      const pg = v.pages.find((p) => p.cid === cid) ?? pickPage(v.pages, 1);
       video = {
         key: job.videoKey,
         bvid,
@@ -113,6 +114,7 @@ export async function runSummarizeJob(
     // 字幕缓存 24h；未命中→选轨→抓取→归一落库
     let transcript = await getFreshTranscript(db, job.videoKey);
     if (!transcript) {
+      await bili.fetchWbiKeys(); // player/wbi/v2 需 WBI 签名（nav 取 img/sub key，实例内缓存）
       const { subtitles }: PlayerSubtitles = await bili.getPlayerSubtitles(bvid, video.cid);
       const track = selectTrack(subtitles);
       if (!track?.subtitle_url) {
