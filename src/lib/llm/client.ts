@@ -50,7 +50,8 @@ export async function streamChatCompletion(
   messages: LlmMessage[],
   opts: StreamOptions = {},
 ): Promise<StreamResult> {
-  const { onDelta, fetchImpl = fetch, timeoutMs = 60000 } = opts;
+  // 裸存 fetch 引用会在 ServiceWorker 里 Illegal invocation（脱离 globalThis 上下文）——必须 bind
+  const { onDelta, fetchImpl = fetch.bind(globalThis), timeoutMs = 60000 } = opts;
   const url = `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);

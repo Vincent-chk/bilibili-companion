@@ -12,3 +12,5 @@ coverage/
 
 # 系统
 .DS_Store
+.bin/
+e2e-artifacts/

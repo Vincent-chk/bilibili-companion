@@ -93,7 +93,8 @@ export class BiliClient {
   #fingerCookies: Record<string, string> = {};
 
   constructor(opts: BiliClientOptions = {}) {
-    this.#fetchImpl = opts.fetchImpl ?? fetch;
+    // 裸存 fetch 引用会在 ServiceWorker 里 Illegal invocation（脱离 globalThis 上下文）——必须 bind
+    this.#fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
     // ≥5s：57.9h 多 P 课程 view 实测 1.6s（07 报告 §6.1 耗时注），默认 6s
     this.#timeoutMs = opts.timeoutMs ?? 6000;
     this.#intervalMs = opts.intervalMs ?? 800; // 红线 ≤2 req/s
