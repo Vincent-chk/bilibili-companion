@@ -191,14 +191,20 @@ export class PanelController {
       return;
     }
     // 已总结 → 直接取缓存；生成中/未生成/失败 → SUMMARY_OPEN（无缓存时按需建 job）→ 流式详情
-    await this.#openDetail(videoKey);
+    // retry:1 = 用户显式点击——仅此路径允许对 failed 摘要重新入队（F11 重试由用户发起；
+    // 广播刷新路径不带 retry，否则 failed+详情打开 = 无限自动重试环）
+    await this.#openDetail(videoKey, { userClick: true });
   }
 
   // ---- 详情 ----
 
-  async #openDetail(videoKey: string): Promise<void> {
+  async #openDetail(videoKey: string, opts: { userClick?: boolean } = {}): Promise<void> {
     try {
-      const r = await this.deps.bridge.request<SummaryOpenResponse>({ type: 'SUMMARY_OPEN', videoKey });
+      const r = await this.deps.bridge.request<SummaryOpenResponse>({
+        type: 'SUMMARY_OPEN',
+        videoKey,
+        ...(opts.userClick ? { retry: 1 } : {}),
+      });
       if (!r?.ok || !r.item) {
         toast(this.deps.ui, '打开摘要失败，稍后再试');
         return;

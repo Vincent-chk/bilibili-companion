@@ -187,53 +187,114 @@ async function main() {
     const nav = await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
     log('navigate →', PAGE_URL, nav.result?.frameId ? 'ok' : JSON.stringify(nav.error ?? nav.result));
 
-    // 7) 驱动真实链（P1.6 起为完全真实用户路径）：
-    //    SW 只注入 settings（5s 阈值 + mock LLM 三件套，模拟已配置状态）
-    //    → reload → 点豆包气泡「▶ 开始陪看」→ SESSION_START 建会话（不再预注入 sessionPointer）
-    //    → WATCH_TICK 惰性补建 visit（先开视频后激活的真实时序）
-    //    → 页面 muted play() 让 watcher 真实累计 5s → TRIGGER_SUMMARY → pipeline → offscreen → 落库
+    // 7) 驱动真实链（P1.7 起为完全真实用户路径，含 onboarding 配置门槛）：
+    //    SW 只注入 5s 阈值（不注入 LLM 配置——走真实 onboarding 填写）
+    //    → reload → 点「▶ 开始陪看」→ NEED_ONBOARDING → onboarding 弹窗
+    //    → 空保存标红 → 填 mock LLM → 测试连接（mock server 探活）→ 保存并激活
+    //    → SESSION_START 建会话 → WATCH_TICK 惰性补建 visit → 播放 5s → 触发 → offscreen → 落库
     for (let i = 0; i < 40 && !swSessionId; i++) { await sleep(250); }
     if (!swSessionId) throw new Error('扩展 service worker 未 attach——扩展未加载？');
     const setStorageRes = await cdp('Runtime.evaluate', {
-      expression: `chrome.storage.local.set({settings:{triggerSeconds:5, llm:{baseUrl:'http://127.0.0.1:${mockPort}', modelId:'mock-seed-lite', apiKey:'e2e-mock-key'}}})`,
+      expression: `chrome.storage.local.set({settings:{triggerSeconds:5}})`,
       awaitPromise: true, returnByValue: true,
     }, swSessionId);
-    log('settings 注入:', JSON.stringify(setStorageRes?.result?.result?.value ?? setStorageRes?.result ?? 'void'));
+    log('settings 注入（仅阈值，LLM 留给 onboarding 真实填写）:', JSON.stringify(setStorageRes?.result?.result?.value ?? 'void'));
 
     await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
     await sleep(4000); // 等 content script 重注入（此时 INACTIVE：豆包应挂「开始陪看」气泡）
 
-    // 7.5) P1.6 真实激活：点「▶ 开始陪看」→ 断言 ACTIVE + happy 切图 + 气泡文案
-    const startRes = await cdp('Runtime.evaluate', {
-      expression: `(() => {
-        const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
-        const btn = sr?.getElementById('btn-start');
-        if (!btn) return 'no-btn';
-        btn.click();
-        return 'clicked';
-      })()`,
-      returnByValue: true,
-    }, landingSid);
-    const startClicked = String(startRes?.result?.result?.value ?? '') === 'clicked';
-    await sleep(1500); // SESSION_START → 广播 → 豆包 happy/气泡
+    // 7.4) P1.7 onboarding：点「▶ 开始陪看」→ 未配置 LLM → 强制弹窗
+    let onboardingProbe = {};
+    {
+      const startRes = await cdp('Runtime.evaluate', {
+        expression: `(() => {
+          const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+          const btn = sr?.getElementById('btn-start');
+          if (!btn) return 'no-btn';
+          btn.click();
+          return 'clicked';
+        })()`,
+        returnByValue: true,
+      }, landingSid);
+      if (String(startRes?.result?.result?.value ?? '') !== 'clicked') {
+        throw new Error('「开始陪看」气泡按钮未找到——豆包未进入未激活引导态？');
+      }
+      await sleep(1000); // SESSION_START → NEED_ONBOARDING → 弹窗渲染
+      const modalOpen = await cdp('Runtime.evaluate', {
+        expression: `(() => {
+          const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+          return JSON.stringify({ shown: sr?.getElementById('modal-root')?.classList.contains('show') ?? false,
+            hasSave: !!sr?.getElementById('ob-save'), hasTest: !!sr?.getElementById('ob-test'),
+            ttsDisabled: !!sr?.querySelector('.m-step.step-disabled') });
+        })()`,
+        returnByValue: true,
+      }, landingSid);
+      try { onboardingProbe.modal = JSON.parse(modalOpen?.result?.result?.value); } catch { onboardingProbe.modal = null; }
+      log('P1.7 弹窗探针:', JSON.stringify(onboardingProbe.modal));
+
+      // 空保存 → 三项标红 + 不落任何配置
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-save").click()', returnByValue: true }, landingSid);
+      await sleep(600);
+      const redRes = await cdp('Runtime.evaluate', {
+        expression: `(() => {
+          const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+          return JSON.stringify({ redCount: sr.querySelectorAll('#ob-llm .field.has-err').length,
+            redInputs: sr.querySelectorAll('#ob-llm input.err').length });
+        })()`,
+        returnByValue: true,
+      }, landingSid);
+      try { onboardingProbe.red = JSON.parse(redRes?.result?.result?.value); } catch { onboardingProbe.red = null; }
+      const noCfg = await cdp('Runtime.evaluate', {
+        expression: `(async () => { const s = await chrome.storage.local.get(['settings','onboarded']); return JSON.stringify({ llm: !!s.settings?.llm, onboarded: s.onboarded === true }); })()`,
+        awaitPromise: true, returnByValue: true,
+      }, swSessionId);
+      try { onboardingProbe.noCfg = JSON.parse(noCfg?.result?.result?.value); } catch { onboardingProbe.noCfg = null; }
+      log('P1.7 空保存标红探针:', JSON.stringify({ red: onboardingProbe.red, noCfg: onboardingProbe.noCfg }));
+
+      // 填入 mock LLM 三件套 → 测试连接（应连上 mock server）→ 保存并激活
+      await cdp('Runtime.evaluate', {
+        expression: `(() => {
+          const sr = document.getElementById('doubao-ui-root').shadowRoot;
+          const set = (k, v) => { sr.querySelector('#ob-llm input[data-k="' + k + '"]').value = v; };
+          set('baseUrl', 'http://127.0.0.1:${mockPort}');
+          set('modelId', 'mock-seed-lite');
+          set('apiKey', 'e2e-mock-key');
+          return 'filled';
+        })()`,
+        returnByValue: true,
+      }, landingSid);
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-test").click()', returnByValue: true }, landingSid);
+      await sleep(1500); // TEST_CONNECTION 往返
+      const testRes = await cdp('Runtime.evaluate', {
+        expression: `document.getElementById('doubao-ui-root').shadowRoot.getElementById('ob-test-status')?.textContent ?? ''`,
+        returnByValue: true,
+      }, landingSid);
+      onboardingProbe.testStatus = String(testRes?.result?.result?.value ?? '');
+      log('P1.7 测试连接探针:', onboardingProbe.testStatus);
+
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-save").click()', returnByValue: true }, landingSid);
+      await sleep(1500); // SETTINGS_SAVE + SESSION_START + 广播
+    }
+
+    // 7.5) P1.6/P1.7 激活终态：配置已落 + 会话 ACTIVE + happy 切图 + 气泡文案
     let sessionProbe = {};
     {
       const st = await cdp('Runtime.evaluate', {
-        expression: `(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`,
+        expression: `(async () => { const s = await chrome.storage.local.get(['sessionPointer','settings','onboarded']); return JSON.stringify({ pointer: s.sessionPointer ?? null, modelId: s.settings?.llm?.modelId ?? null, onboarded: s.onboarded === true }); })()`,
         awaitPromise: true, returnByValue: true,
       }, swSessionId);
       try { sessionProbe.pointer = JSON.parse(st?.result?.result?.value); } catch { sessionProbe.pointer = null; }
       const dom = await cdp('Runtime.evaluate', {
         expression: `(() => {
           const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
-          return JSON.stringify({ img: sr?.getElementById('mascot-img')?.getAttribute('src') ?? '', bubble: (sr?.getElementById('mascot-bubble')?.textContent ?? '').slice(0, 30) });
+          return JSON.stringify({ img: sr?.getElementById('mascot-img')?.getAttribute('src') ?? '', bubble: (sr?.getElementById('mascot-bubble')?.textContent ?? '').slice(0, 30),
+            modalClosed: !(sr?.getElementById('modal-root')?.classList.contains('show') ?? false) });
         })()`,
         returnByValue: true,
       }, landingSid);
       try { sessionProbe.dom = JSON.parse(dom?.result?.result?.value); } catch { sessionProbe.dom = null; }
-      log('P1.6 激活探针:', JSON.stringify(sessionProbe));
+      log('P1.7 激活终态探针:', JSON.stringify(sessionProbe));
     }
-    if (!startClicked) throw new Error('「开始陪看」气泡按钮未找到——豆包未进入未激活引导态？');
 
     const playExpr = `(async () => {
       const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
@@ -461,7 +522,7 @@ async function main() {
         }
 
         mascotProbe = {
-          startActive: sessionProbe?.pointer?.state === 'ACTIVE',
+          startActive: sessionProbe?.pointer?.pointer?.state === 'ACTIVE',
           startHappyImg: String(sessionProbe?.dom?.img ?? '').includes('mascot-happy'),
           dragMovedNotToggled: !!dragRes && dragRes.panelOpenAfterDrag === false && dragRes.after.left > dragRes.before.left,
           posPersisted: !!savedPos && !!dragRes && Math.abs(savedPos.x * dragRes.vw - dragRes.after.left) <= 5,
@@ -489,17 +550,25 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
-    // 10) 判定（真实链标记：watcher 触发 → 排队 → offscreen → 终态 → DB 落库 → 面板渲染 → P1.6 豆包交互）
+    // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
     const has = (s) => lines.some((l) => l.text.includes(s));
     const verdict = {
       contentInjected: has('content script injected'),
       bvid: has(`bvid = ${BVID}`),
       uiRootInjected: uiProbe !== null,
-      sessionStartActive: mascotProbe?.startActive === true, // 真实点击「开始陪看」→ ACTIVE
-      sessionStartHappy: mascotProbe?.startHappyImg === true, // 激活 → happy 切图
+      onboardingModalOpens: onboardingProbe?.modal?.shown === true && onboardingProbe?.modal?.hasSave === true && onboardingProbe?.modal?.ttsDisabled === true,
+      onboardingValidationRed: onboardingProbe?.red?.redCount === 3 && onboardingProbe?.red?.redInputs === 3 && onboardingProbe?.noCfg?.llm === false && onboardingProbe?.noCfg?.onboarded === false,
+      onboardingTestConnectionOk: String(onboardingProbe?.testStatus ?? '').includes('连接成功'),
+      onboardingSaveActivates:
+        sessionProbe?.pointer?.modelId === 'mock-seed-lite' &&
+        sessionProbe?.pointer?.onboarded === true &&
+        sessionProbe?.pointer?.pointer?.state === 'ACTIVE' &&
+        sessionProbe?.dom?.modalClosed === true &&
+        /mascot-(happy|note)\.png/.test(String(sessionProbe?.dom?.img ?? '')), // 保存→激活即反应（视频已在播时触发先到=note，同为正确行为）
+      sessionStartHappy: /mascot-(happy|note)\.png/.test(String(sessionProbe?.dom?.img ?? '')), // 激活/触发 → happy/note 切图
       visitTriggered: has('summary job queued'), // watcher 5s 真实触发（visit 由 WATCH_TICK 惰性补建）
       offscreenRun: has('offscreen run job'), // offscreen 执行体真的跑了
       chainDone: lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done')),

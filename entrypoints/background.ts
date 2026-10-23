@@ -20,6 +20,7 @@ import {
 } from '../src/lib/storage';
 import { browserKv } from '../src/lib/storage/browserKv';
 import { excerptOf } from '../src/content/panel/view-models';
+import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
 
 const db = new CompanionDB();
 
@@ -169,6 +170,9 @@ interface InMsg {
   videoKey?: string;
   watchedSeconds?: number;
   progressPct?: number;
+  retry?: number; // SUMMARY_OPEN 用户显式重试标记（1=点击进入，可对 failed 摘要重新入队）
+  llm?: ModelConfigMsg;
+  asr?: ModelConfigMsg;
 }
 
 export default defineBackground(() => {
@@ -217,6 +221,10 @@ export default defineBackground(() => {
         return handleSessionStart();
       case 'SESSION_END':
         return handleSessionEnd();
+      case 'TEST_CONNECTION':
+        return handleTestConnection(m);
+      case 'SETTINGS_SAVE':
+        return handleSettingsSave(m);
       default:
         return undefined; // 未识别消息交给其它 listener（SUMMARY_PROGRESS 由 executeViaOffscreen 处理）
     }
@@ -331,21 +339,33 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
 
 /** WATCH_TICK（1Hz 节流后到达）：刷新 visit 进度。未激活（无 sessionPointer）不产生记录（F1）。
  *  行缺失时惰性补建（P1.6）：「先开视频后点开始陪看」时序下 VIDEO_ENTER 早于激活、
- *  当时无 pointer 不建行——首个 tick 自愈，保证「会话内看过的视频一个不漏」（F4）。 */
+ *  当时无 pointer 不建行——首个 tick 自愈，保证「会话内看过的视频一个不漏」（F4）。
+ *  P1.7 补：阈值扫描兜底——content 侧 tracker 是一次性触发，若阈值在激活前已跨过
+ *  （先看后激活的 autoplay 时序，E2E 实测），触发请求在 INACTIVE 期被吞后不再重发；
+ *  这里以 DB 的 watchedSeconds 为权威做幂等补偿，F2 语义（累计≥阈值→触发）在任何时序下成立。 */
 async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey, watchedSeconds = 0, progressPct = 0 } = m;
   if (!videoKey) return { ok: false };
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, reason: 'inactive' };
-  const existing = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
+  const sessionId = pointer.sessionId;
+  const existing = await db.visits.where({ sessionId, videoKey }).first();
   if (!existing) {
     // videos 行可能也缺（VIDEO_ENTER 全程未激活）：job 链有兜底，列表标题退 videoKey
-    await upsertVisit(db, { sessionId: pointer.sessionId, videoKey, now: Date.now() });
-    await updateVisitProgress(db, { sessionId: pointer.sessionId, videoKey }, { watchedSeconds, progressPct });
-    return { ok: true, created: true };
+    await upsertVisit(db, { sessionId, videoKey, now: Date.now() });
   }
-  await updateVisitProgress(db, { sessionId: pointer.sessionId, videoKey }, { watchedSeconds, progressPct });
-  return { ok: true };
+  await updateVisitProgress(db, { sessionId, videoKey }, { watchedSeconds, progressPct });
+  const threshold = clamp((await readSettings()).triggerSeconds ?? 20, 5, 300);
+  const row = await db.visits.where({ sessionId, videoKey }).first();
+  if (row && !row.triggered && row.watchedSeconds >= threshold) {
+    await db.transaction('rw', [db.visits, db.jobs], async () => {
+      await db.visits.put({ ...row, triggered: 1, lastSeenAt: Date.now() });
+      await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId });
+    });
+    console.log(`[doubao] summary job queued (tick sweep): ${videoKey}`);
+    void pipeline.drain();
+  }
+  return { ok: true, ...(existing ? {} : { created: true }) };
 }
 
 /**
@@ -415,7 +435,12 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
 
 /**
  * SUMMARY_OPEN：按需生成/取缓存（F4 点击未生成条目、失败重试）。
- * 无摘要（或上次失败且无活动任务）→ 入队 SUMMARIZE；已有 done 摘要 → 直接返回（缓存命中零请求，F5）。
+ * 入队条件（缺一不可）：
+ *  ① 无活动 job；② 从未跑过（无 summary 且无历史 job）；或 上次失败（summary.failed **或**
+ *  最近一次 job 终态 failed——执行体级失败不写 summary 行，审查 P1 旁路）且 **retry=1（用户显式点击）**。
+ * 广播刷新（面板事件驱动的重开）不带 retry：失败后不自动重新入队——
+ * 否则失败+详情打开 = 「失败→刷新→入队→失败」无限自动重试环（2026-10-23 E2E 实测），
+ * 重试必须由用户发起（F11）。
  */
 async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
@@ -428,12 +453,132 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   const video = await db.videos.get(videoKey);
   const summary = await latestSummary(videoKey);
   let job = await activeJob(videoKey);
-  if (!job && (!summary || summary.status === 'failed')) {
+  const lastJobRow = (await db.jobs.where('videoKey').equals(videoKey).sortBy('updatedAt')).pop();
+  const untouched = !summary && !lastJobRow; // 从未生成过也从未排过队
+  const failedBefore = summary?.status === 'failed' || lastJobRow?.status === 'failed';
+  if (!job && (untouched || (failedBefore && m.retry === 1))) {
     await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
     job = await activeJob(videoKey);
     void pipeline.drain();
   }
   const transcript = excerptOf(await db.transcripts.get(videoKey));
   return { ok: true, item: { visit, video, summary, job }, transcript };
+}
+
+// ---- P1.7 · onboarding 服务（TEST_CONNECTION / SETTINGS_SAVE） ------------------
+
+interface ModelConfigMsg {
+  baseUrl?: string;
+  modelId?: string;
+  apiKey?: string;
+}
+
+/** optional_host_permissions：已含则跳过，否则申请（F9：弹窗仅含所填端点 origin）。
+ *  SW 消息上下文可能无用户手势 → 申请抛错按未授权处理，不阻塞保存（端点带 CORS 时链路仍可用）。 */
+async function ensureOriginPermission(pattern: string): Promise<boolean> {
+  try {
+    if (await browser.permissions.contains({ origins: [pattern] })) return true;
+    return await browser.permissions.request({ origins: [pattern] });
+  } catch {
+    return false;
+  }
+}
+
+/** 服务端错误 body 打码（Key 剔除 + Bearer/sk- 形态 + 截断），与 llm/client 同口径。 */
+const maskBody = (raw: string, apiKey: string): string =>
+  raw
+    .split(apiKey)
+    .join('***')
+    .replace(/(Bearer\s+)[^\s"']+/gi, '$1***')
+    .replace(/\b(?:sk|ark)-[A-Za-z0-9][A-Za-z0-9-]{8,}/g, '***')
+    .slice(0, 120);
+
+/**
+ * TEST_CONNECTION：最小 chat/completions 探活（max_tokens=1、stream:false、15s 超时）。
+ * 先按 origin 尽力申请权限（成功/失败均继续探测——CORS 端点无权限也能通）。
+ */
+async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> {
+  const cfg = m.llm ?? {};
+  const baseUrl = (cfg.baseUrl ?? '').trim();
+  const model = (cfg.modelId ?? '').trim();
+  const apiKey = (cfg.apiKey ?? '').trim();
+  if (!baseUrl || !model || !apiKey) return { ok: false, msg: '请先填写完整配置再测试' };
+  const v = validateEndpointUrl(baseUrl);
+  if (!v.ok) return { ok: false, msg: v.error ?? 'Base URL 不合法' };
+  await ensureOriginPermission(`${v.origin}/*`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('timeout'), 15_000);
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: false }),
+      signal: controller.signal,
+    });
+    if (res.ok) return { ok: true, msg: `连接成功（HTTP ${res.status}）` };
+    const body = await res.text().catch(() => '');
+    if (res.status === 401 || res.status === 403) return { ok: false, msg: 'Key 无效或无权限（HTTP ' + res.status + '）' };
+    if (res.status === 402) return { ok: false, msg: '余额不足（HTTP 402）' };
+    if (res.status === 404) return { ok: false, msg: '端点 404：请检查 Base URL（通常需含 /v1 这样的基础路径）' };
+    return { ok: false, msg: `HTTP ${res.status}: ${maskBody(body, apiKey)}` };
+  } catch (e) {
+    return {
+      ok: false,
+      msg: controller.signal.aborted ? '连接超时（>15s）' : `无法连接端点：${String(e).slice(0, 80)}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * SETTINGS_SAVE（onboarding 保存，02-数据模型 §2 settings 形状）：
+ * 后台二次校验（信任边界）→ 写 settings + onboarded → 按 origin 申请权限 → 返回授权结果。
+ * tts 预留位置灰保存；triggerSeconds/persona/bubbles 首次保存时落默认值。
+ * llm/asr 的 `ok`（已验证）标记不在此写——语义属「测试连接通过」，由 2.5 设置页消费时再定义。
+ * ASR 清空保存 = 清除旧配置（防旧 Key 残留，审查 P2）。
+ */
+async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
+  const llm = m.llm ?? {};
+  const asr = m.asr;
+  const v = validateLlm({ baseUrl: llm.baseUrl ?? '', modelId: llm.modelId ?? '', apiKey: llm.apiKey ?? '' });
+  if (!v.ok) return { ok: false, error: v.error ?? `必填项缺失：${v.missing.join(' / ')}` };
+
+  const prev =
+    ((await browser.storage.local.get('settings'))['settings'] as Record<string, unknown> | undefined) ?? {};
+  const next: Record<string, unknown> = {
+    ...prev,
+    llm: { baseUrl: llm.baseUrl!.trim(), modelId: llm.modelId!.trim(), apiKey: llm.apiKey!.trim() },
+  };
+  const patterns: string[] = [];
+  const oL = validateEndpointUrl(llm.baseUrl!);
+  if (oL.ok && oL.origin) patterns.push(`${oL.origin}/*`);
+
+  const a = asr
+    ? validateAsr({ baseUrl: asr.baseUrl ?? '', modelId: asr.modelId ?? '', apiKey: asr.apiKey ?? '' })
+    : { kind: 'skip' as const };
+  if (a.kind === 'error') return { ok: false, error: a.error };
+  if (a.kind === 'ok') {
+    next.asr = { baseUrl: asr!.baseUrl!.trim(), modelId: asr!.modelId!.trim(), apiKey: asr!.apiKey!.trim() };
+    const oA = validateEndpointUrl(asr!.baseUrl!);
+    if (oA.ok && oA.origin) patterns.push(`${oA.origin}/*`);
+  } else {
+    delete next.asr; // 清空保存 = 移除旧 ASR 配置（含旧 Key），与「部分填写报错」对称
+  }
+  if (typeof next['triggerSeconds'] !== 'number') next['triggerSeconds'] = 20;
+  if (typeof next['persona'] !== 'string') next['persona'] = 'spicy';
+  if (typeof next['bubbles'] !== 'boolean') next['bubbles'] = true;
+
+  await browser.storage.local.set({ settings: next, onboarded: true });
+
+  const granted: string[] = [];
+  const denied: string[] = [];
+  for (const p of patterns) {
+    (await ensureOriginPermission(p) ? granted : denied).push(p);
+  }
+  console.log(
+    `[doubao] settings saved (llm ok, asr ${a.kind === 'ok' ? 'provided' : 'cleared/skipped'}; origins granted=${granted.length} denied=${denied.length})`,
+  );
+  return { ok: true, granted, denied };
 }
 

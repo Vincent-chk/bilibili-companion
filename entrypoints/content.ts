@@ -1,14 +1,15 @@
-// content script：Phase 0 骨架（0.3）+ P1.2 watcher + P1.5 面板 + P1.6 豆包状态机。
+// content script：Phase 0 骨架（0.3）+ P1.2 watcher + P1.5 面板 + P1.6 豆包 + P1.7 onboarding。
 // 职责：识别当前页 bvid → Shadow DOM 挂豆包 + 面板 → SPA 路由变化重新识别
 //       → watcher 有效观看计时（20s 触发 / WATCH_TICK 节流上报，经 runtime 消息走 background）。
-// UI：单一 Shadow 宿主（doubao-ui-root）；豆包（五表情状态机/气泡/拖拽/点击开合）+ 面板（列表/详情）。
+// UI：单一 Shadow 宿主（doubao-ui-root）；豆包（五表情状态机/气泡/拖拽/点击开合）+ 面板（列表/详情）+ onboarding 弹窗。
 // 会话：开始/结束陪看走 SESSION_START/END（最小切片，完整保留期状态机是任务 2.1）；
-//       未配置 LLM → NEED_ONBOARDING（onboarding 弹窗是任务 1.7，当前 toast 提示）。
+//       未配置 LLM → NEED_ONBOARDING → onboarding 配置门槛（LLM 必填+测试连接+ASR 可选+TTS 置灰）。
 import { browser } from 'wxt/browser';
 import type { PublicPath } from 'wxt/browser';
 import { Bridge, type UiEvent } from '../src/content/bridge';
 import { MascotController } from '../src/content/mascot/mascot';
 import type { UiSessionState } from '../src/content/mascot/logic';
+import { openOnboarding } from '../src/content/onboarding/onboarding';
 import { PanelController } from '../src/content/panel/panel';
 import { mountDoubaoUi, toast } from '../src/content/ui/root';
 import { WatchSession } from '../src/content/watcher/dom';
@@ -27,8 +28,16 @@ export default defineContentScript({
         const r = await bridge.request<{ ok: boolean; reason?: string }>({ type: 'SESSION_START' });
         if (r?.ok) return; // 表情/气泡/头部按钮由 SESSION_STATE 广播统一驱动（跨标签页一致）
         if (r?.reason === 'NEED_ONBOARDING') {
-          // F1/F9：未配置 LLM 强制引导（onboarding 弹窗为任务 1.7）
-          toast(ui, '先配置模型才能开始陪看哦');
+          // F1/F9：未配置 LLM 强制引导，无法跳过（关闭弹窗=保持未激活）
+          openOnboarding({
+            ui,
+            assetUrl: (p) => browser.runtime.getURL(p as PublicPath),
+            testConnection: (cfg) =>
+              bridge.request<{ ok: boolean; msg: string }>({ type: 'TEST_CONNECTION', llm: cfg }),
+            save: (payload) => bridge.request<{ ok: boolean; error?: string }>({ type: 'SETTINGS_SAVE', ...payload }),
+            onDismiss: () => toast(ui, '配置好 LLM 后随时点我开始陪看'),
+            onSaved: () => void requestSessionStart(), // 配置已就绪，激活必成
+          });
         }
       } catch {
         toast(ui, '激活失败，稍后再试');
