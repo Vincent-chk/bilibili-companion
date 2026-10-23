@@ -6,6 +6,7 @@ import { indexedDB, IDBKeyRange } from 'fake-indexeddb';
 import { startMockLlm, validSummaryJson, type MockLlmServer } from './helpers/mock-llm';
 import { runSummarizeJob, parseVideoKey, mapLlmError, type BiliApi } from '../src/lib/summarize/chain';
 import { LlmHttpError } from '../src/lib/llm/client';
+import { BiliApiError } from '../src/lib/bilibili/client';
 import { CompanionDB, summaryKey } from '../src/lib/storage';
 import type { JobStage } from '../src/lib/storage';
 
@@ -80,6 +81,13 @@ describe('parseVideoKey / mapLlmError', () => {
     expect(mapLlmError(new LlmHttpError(401, 'Unauthorized')).code).toBe('KEY_INVALID');
     expect(mapLlmError(new LlmHttpError(429, 'rate')).code).toBe('RATE_LIMITED');
     expect(mapLlmError(new Error('x')).code).toBe('UNKNOWN');
+  });
+  it('P1.10：B 站 -101/-352 → NEED_LOGIN（F11 失败原因「需要登录」，自动恢复按此码重排）', () => {
+    const a = mapLlmError(new BiliApiError(-101, '/x/player/wbi/v2'));
+    expect(a.code).toBe('NEED_LOGIN');
+    expect(a.msg).toContain('登录');
+    expect(mapLlmError(new BiliApiError(-352, '/x/web-interface/nav')).code).toBe('NEED_LOGIN');
+    expect(mapLlmError(new BiliApiError(-412, '/x/player/wbi/v2')).code).not.toBe('NEED_LOGIN');
   });
 });
 

@@ -31,6 +31,7 @@ export function mountDoubaoUi(doc: Document = document): DoubaoUi {
         <div class="p-head-actions hidden" id="p-head-actions"></div>
       </header>
       <div class="p-body" id="p-body">
+        <div id="login-card" class="login-card hidden"></div>
         <section id="view-list"></section>
       </div>
     </aside>

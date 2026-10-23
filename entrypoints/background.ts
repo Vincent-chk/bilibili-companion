@@ -173,6 +173,7 @@ interface InMsg {
   watchedSeconds?: number;
   progressPct?: number;
   time?: number; // SEEK_TO 目标秒（P1.8）
+  force?: number; // LOGIN_CHECK 强制绕过 30s 缓存（P1.10：面板打开时机）
   retry?: number; // SUMMARY_OPEN 用户显式重试标记（1=点击进入，可对 failed 摘要重新入队）
   llm?: ModelConfigMsg;
   asr?: ModelConfigMsg;
@@ -185,6 +186,10 @@ export default defineBackground(() => {
     if (n) console.log(`[doubao] recovered ${n} stale job(s)`);
     await pipeline.drain();
   });
+  // P1.10 时机①：扩展启动即探登录态（架构 §3.9）
+  void checkLoginState(true)
+    .then((s) => applyLoginState(s))
+    .catch(() => {});
 
   // P1.5：面板 Port。连接即回放当前会话状态（新标签页初始化；P1.6 豆包消费）
   browser.runtime.onConnect.addListener((port) => {
@@ -236,6 +241,8 @@ export default defineBackground(() => {
         return handleSummaryOpen(m);
       case 'SEEK_TO':
         return handleSeekTo(m);
+      case 'LOGIN_CHECK':
+        return handleLoginCheck(m);
       case 'SESSION_START':
         return handleSessionStart();
       case 'SESSION_END':
@@ -436,6 +443,8 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
     ok: true as const,
     sessionState: pointer?.state ?? 'INACTIVE',
     triggerSeconds: clamp(settings.triggerSeconds ?? 20, 5, 300),
+    // P1.10：引导卡数据源（30s 缓存零网络；强制刷新走 LOGIN_CHECK force=1，面板打开时机）
+    loggedIn: loginCache?.loggedIn ?? null,
   };
   if (!pointer) return { ...base, items: [] };
   const visits = (await db.visits.where('sessionId').equals(pointer.sessionId).toArray()).sort(
@@ -522,6 +531,72 @@ async function handleSeekTo(m: InMsg): Promise<Record<string, unknown>> {
   await browser.tabs.create({ url });
   console.log(`[doubao] seek new-tab: ${videoKey} → ${url}`);
   return { ok: true, mode: 'new-tab', url };
+}
+
+// ---- P1.10 · 登录态检测与引导（架构 §3.9） ------------------------------------
+
+// 登录探测专用实例：-412 熔断等待压到 1.5s（默认 60s 会让面板打开的 force 复核卡一分钟）；
+// 探测失败返回 null（未知态）不写缓存，下次重探。
+const loginClient = new BiliClient({ breakerWaitMs: 1500 });
+const LOGIN_CACHE_MS = 30_000;
+let loginCache: { at: number; loggedIn: boolean | null } | null = null;
+/** 最近一次广播过的登录态（undefined=从未广播）；仅翻转时广播，防轰炸。 */
+let loginBroadcasted: boolean | null | undefined = undefined;
+/** 审查 P2-4：single-flight——启动探测/多标签重连 force/面板 open force 并发时共享在途 nav。 */
+let loginInflight: Promise<boolean | null> | null = null;
+
+async function checkLoginState(force = false): Promise<boolean | null> {
+  if (!force && loginCache && Date.now() - loginCache.at < LOGIN_CACHE_MS) return loginCache.loggedIn;
+  if (!loginInflight) {
+    loginInflight = loginClient.checkLogin().finally(() => {
+      loginInflight = null;
+    });
+  }
+  const loggedIn = await loginInflight;
+  if (loggedIn !== null) loginCache = { at: Date.now(), loggedIn }; // 未知态不写缓存，下次重探
+  return loggedIn;
+}
+
+/**
+ * 翻转时广播 LOGIN_STATE；翻正自动恢复：NEED_LOGIN 失败的 job 重排
+ * （架构 §3.9「登录成功后自动恢复陪看流程，无需用户额外操作」）。
+ * 审查 P0-1：条件用 prev !== true 而非 prev === false——SW 30s 空闲重启后 loginBroadcasted
+ * 归 undefined，若只认 false→true，用户扫码期间 SW 死亡将永久丢失自动重排（红徽章滞留）。
+ * undefined→true 首探同样扫描；无 NEED_LOGIN 失败行时天然 no-op，自愈收敛。
+ */
+async function applyLoginState(loggedIn: boolean | null): Promise<void> {
+  if (loggedIn === null || loggedIn === loginBroadcasted) return;
+  const prev = loginBroadcasted;
+  loginBroadcasted = loggedIn;
+  broadcastToUi({ type: 'LOGIN_STATE', loggedIn });
+  if (loggedIn && prev !== true) {
+    // 审查 P2-3：只重排当前会话的失败 job（历史会话的 NEED_LOGIN 不再烧 LLM 费用）
+    const pointer = await getSessionPointer(browserKv);
+    const failedSummaries = (await db.summaries.where('status').equals('failed').toArray()).filter(
+      (s) => s.error?.code === 'NEED_LOGIN',
+    );
+    let n = 0;
+    for (const s of failedSummaries) {
+      const job = (await db.jobs.where('videoKey').equals(s.videoKey).sortBy('updatedAt')).reverse().find(
+        (j) => j.status === 'failed',
+      );
+      if (job && pointer && job.sessionId === pointer.sessionId) {
+        await pipeline.retry(job.id);
+        n += 1;
+      }
+    }
+    if (n) {
+      console.log(`[doubao] login restored: requeued ${n} NEED_LOGIN job(s)`);
+      void pipeline.drain();
+    }
+  }
+}
+
+/** LOGIN_CHECK：content 首连/面板打开（force）/激活后复核。应答直给 + 翻转广播副作用。 */
+async function handleLoginCheck(m: InMsg): Promise<Record<string, unknown>> {
+  const loggedIn = await checkLoginState(m.force === 1);
+  void applyLoginState(loggedIn).catch(() => {});
+  return { ok: true, loggedIn };
 }
 
 // ---- P1.7 · onboarding 服务（TEST_CONNECTION / SETTINGS_SAVE） ------------------

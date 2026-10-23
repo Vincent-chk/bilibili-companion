@@ -82,6 +82,12 @@ export const UI_STYLES = `
   .p-body::-webkit-scrollbar { width: 6px; }
   .p-body::-webkit-scrollbar-thumb { background: #d3d6db; border-radius: 3px; }
 
+  /* ---- P1.10 未登录引导卡（面板顶部，F11） ---- */
+  .login-card { background: var(--orange-bg); border: 1px solid #ffd7ae; border-radius: var(--radius); padding: 12px 14px; margin: 0 0 12px; display: flex; flex-direction: column; gap: 6px; }
+  .login-card b { font-size: 13px; color: var(--orange); }
+  .login-card span { font-size: 11.5px; color: #7c4a1e; line-height: 1.6; }
+  .login-card .btn { align-self: flex-start; margin-top: 2px; }
+
   /* ---- 列表视图 ---- */
   .list-head { display: flex; justify-content: space-between; align-items: baseline; margin: 2px 4px 10px; }
   .list-head b { font-size: 14px; }

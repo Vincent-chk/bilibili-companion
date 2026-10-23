@@ -178,14 +178,17 @@ async function main() {
       '(() => { const cs = ' + JSON.stringify(cookiePairs.map(([n, v]) => [n, String(v)])) + ';' +
       ' for (const [n, v] of cs) document.cookie = n + "=" + v + "; domain=.bilibili.com; path=/; secure; samesite=none";' +
       ' return document.cookie.split(";").filter(s=>s.trim()).length; })()';
-    const setRes = await cdp('Runtime.evaluate', { expression: setExpr, returnByValue: true }, landingSid);
-    const cookieCount = setRes?.result?.result?.value;
-    const readback = await cdp('Runtime.evaluate', { expression: 'document.cookie', returnByValue: true }, landingSid);
-    const ok = String(readback?.result?.result?.value ?? '').includes('SESSDATA=');
-    log(`登录态注入 ${cookiePairs.length} 个 cookie（document.cookie 回读 ${cookieCount} 条，SESSDATA 可见=${ok}）`);
-    if (!ok) throw new Error('document.cookie 写入后回读不到 SESSDATA——注入失败');
+    // P1.10：先跑「未登录」全链路（激活→触发→NEED_LOGIN 失败→引导卡），触发失败后再注入 Cookie 验自动恢复
+    const injectCookies = async () => {
+      const setRes = await cdp('Runtime.evaluate', { expression: setExpr, returnByValue: true }, landingSid);
+      const cookieCount = setRes?.result?.result?.value;
+      const readback = await cdp('Runtime.evaluate', { expression: 'document.cookie', returnByValue: true }, landingSid);
+      const okRead = String(readback?.result?.result?.value ?? '').includes('SESSDATA=');
+      log(`登录态注入 ${cookiePairs.length} 个 cookie（document.cookie 回读 ${cookieCount} 条，SESSDATA 可见=${okRead}）`);
+      if (!okRead) throw new Error('document.cookie 写入后回读不到 SESSDATA——注入失败');
+    };
 
-    // 6) 同一 tab 导航到视频页（cookie 已在 jar 里）
+    // 6) 同一 tab 导航到视频页（此时未登录）
     const nav = await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
     log('navigate →', PAGE_URL, nav.result?.frameId ? 'ok' : JSON.stringify(nav.error ?? nav.result));
 
@@ -204,9 +207,16 @@ async function main() {
 
     await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
     await sleep(4000); // 等 content script 重注入（此时 INACTIVE：豆包应挂「开始陪看」气泡）
+    // P1.10：立即暂停 autoplay——否则激活前已累积的观看时长会让 tick sweep 在激活瞬间触发
+    // job，NEED_LOGIN 失败气泡 ~0.5s 内覆盖登录气泡（run C 教训）；暂停后触发时序=播放满 5s 确定
+    await cdp('Runtime.evaluate', {
+      expression: `(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (!v) return 'no-video'; v.pause(); return 'paused@' + Math.floor(v.currentTime); })()`,
+      returnByValue: true,
+    }, landingSid);
 
     // 7.4) P1.7 onboarding：点「▶ 开始陪看」→ 未配置 LLM → 强制弹窗
     let onboardingProbe = {};
+    let loginBubbleSeen = ''; // P1.10 登录气泡采样结果（7.4 保存点击后采样窗）
     {
       const startRes = await cdp('Runtime.evaluate', {
         expression: `(() => {
@@ -274,13 +284,37 @@ async function main() {
       onboardingProbe.testStatus = String(testRes?.result?.result?.value ?? '');
       log('P1.7 测试连接探针:', onboardingProbe.testStatus);
 
+      // P1.10：装气泡文本流记录器（MutationObserver）——登录气泡会被随后的 SUMMARY_FAILED
+      // 气泡覆盖，DOM 采样有竞争；记录流取证则与覆盖无关（run B/C 教训）
+      await cdp('Runtime.evaluate', {
+        expression: `(() => {
+          const sr = document.getElementById('doubao-ui-root').shadowRoot;
+          const b = sr.getElementById('mascot-bubble');
+          window.__bubbleLog = [];
+          new MutationObserver(() => { window.__bubbleLog.push(b.textContent ?? ''); }).observe(b, { childList: true, characterData: true, subtree: true });
+          return 'obs';
+        })()`,
+        returnByValue: true,
+      }, landingSid);
+
       await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-save").click()', returnByValue: true }, landingSid);
-      await sleep(1500); // SETTINGS_SAVE + SESSION_START + 广播
+      await sleep(600); // SETTINGS_SAVE + SESSION_START + 广播收尾
     }
 
     // 7.5) P1.6/P1.7 激活终态：配置已落 + 会话 ACTIVE + happy 切图 + 气泡文案
     let sessionProbe = {};
     {
+      // 登录气泡取证：轮询气泡文本流（含打字机中间态），命中即止
+      for (let i = 0; i < 12 && !loginBubbleSeen; i++) {
+        const seen = await cdp('Runtime.evaluate', {
+          expression: `(() => (window.__bubbleLog || []).join('|'))()`,
+          returnByValue: true,
+        }, landingSid);
+        const all = String(seen?.result?.result?.value ?? '');
+        if (all.includes('先登录 B 站')) loginBubbleSeen = '先登录 B 站我才能记笔记哦';
+        else await sleep(250);
+      }
+      sessionProbe.loginBubble = loginBubbleSeen;
       const st = await cdp('Runtime.evaluate', {
         expression: `(async () => { const s = await chrome.storage.local.get(['sessionPointer','settings','onboarded']); return JSON.stringify({ pointer: s.sessionPointer ?? null, modelId: s.settings?.llm?.modelId ?? null, onboarded: s.onboarded === true }); })()`,
         awaitPromise: true, returnByValue: true,
@@ -315,6 +349,7 @@ async function main() {
     if (!playResult.startsWith('ok paused=false')) throw new Error(`视频未能静音播放（${playResult}）——watcher 无法累计有效观看`);
 
     // 8) 等真实链标记：watcher 触发 → job 排队 → offscreen 执行 → 终态
+    //    P1.10 起首轮为「未登录」：预期先 failed（NEED_LOGIN），8.2 注入 Cookie 后再等 done
     const t0 = Date.now();
     let outcome = 'timeout';
     while (Date.now() - t0 < TIMEOUT_MS) {
@@ -323,6 +358,75 @@ async function main() {
       const failed = lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ failed'));
       if (done) { outcome = 'done'; break; }
       if (failed) { outcome = 'fail'; break; }
+    }
+
+    // 8.2) P1.10 未登录全链路：红徽章(NEED_LOGIN)+引导卡+详情错误文案 → 注入 Cookie →
+    //      重开面板强制复核 → 翻转广播（卡隐藏+welcome 气泡）→ NEED_LOGIN job 自动重排 → done
+    let loginProbe = null;
+    let cookieLineIdx = 0;
+    if (outcome === 'fail') {
+      const evL = async (expression) => {
+        const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, landingSid);
+        try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
+      };
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("mascot").click()', returnByValue: true }, landingSid);
+      await sleep(1500); // LOGIN_CHECK force 往返 + 引导卡渲染 + LIST_QUERY
+      // 等自动重试轮跑完（徽章落「解析失败」再探，避免探到 retry 中的「生成中」）
+      let card1 = null;
+      for (let i = 0; i < 40 && !String(card1?.badge ?? '').includes('解析失败'); i++) {
+        card1 = await evL(`(() => {
+          const sr = document.getElementById('doubao-ui-root').shadowRoot;
+          const card = sr.getElementById('login-card');
+          return JSON.stringify({ shown: !!card && !card.classList.contains('hidden'),
+            title: card?.querySelector('b')?.textContent ?? '', hasBtn: !!card?.querySelector('#btn-login'),
+            badge: sr.querySelector('.v-item .badge')?.textContent ?? '' });
+        })()`);
+        if (!String(card1?.badge ?? '').includes('解析失败')) await sleep(500);
+      }
+      await evL(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.v-item')?.click()`);
+      // 详情错误文案轮询（retry 在途时详情可能还是流式阶段文案）
+      let failDetail = null;
+      for (let i = 0; i < 30 && !String(failDetail?.errText ?? '').includes('需要登录'); i++) {
+        failDetail = await evL(`(() => {
+          const sr = document.getElementById('doubao-ui-root').shadowRoot;
+          return JSON.stringify({ errText: sr.getElementById('d-summary')?.textContent ?? '' });
+        })()`);
+        if (!String(failDetail?.errText ?? '').includes('需要登录')) await sleep(500);
+      }
+      await evL(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('d-back')?.click()`);
+      await sleep(400);
+      await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, landingSid);
+      await sleep(400);
+
+      await injectCookies();
+      cookieLineIdx = lines.length; // 此前的 '→ failed' 属预期（未登录轮），noExplicitFail 从其后算
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("mascot").click()', returnByValue: true }, landingSid);
+      await sleep(1500); // 面板打开 force 复核 → 翻转广播 + 自动重排
+      const card2 = await evL(`(() => {
+        const sr = document.getElementById('doubao-ui-root').shadowRoot;
+        const card = sr.getElementById('login-card');
+        const b = sr.getElementById('mascot-bubble');
+        return JSON.stringify({ hidden: !card || card.classList.contains('hidden'),
+          welcome: (b?.textContent ?? '').includes('登录好啦') });
+      })()`);
+      const t1 = Date.now();
+      let recovered = false;
+      while (Date.now() - t1 < TIMEOUT_MS) {
+        await sleep(500);
+        if (lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done'))) { recovered = true; break; }
+      }
+      // 徽章轮询到「已总结」（SUMMARY_DONE → 300ms 节流刷新 + LIST_QUERY 往返有延迟）
+      let badge2 = null;
+      for (let i = 0; i < 20 && !String(badge2?.badge ?? '').includes('已总结'); i++) {
+        badge2 = await evL(`(() => { const sr = document.getElementById('doubao-ui-root').shadowRoot; return JSON.stringify({ badge: sr.querySelector('.v-item .badge')?.textContent ?? '' }); })()`);
+        if (!String(badge2?.badge ?? '').includes('已总结')) await sleep(300);
+      }
+      await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, landingSid);
+      await sleep(400);
+      loginProbe = { card1, failDetail, card2, badge2, recovered,
+        hasRequeueLog: lines.some((l) => l.text.includes('login restored: requeued')) };
+      log('P1.10 未登录→自动恢复探针:', JSON.stringify(loginProbe));
+      outcome = recovered ? 'done' : 'timeout';
     }
 
     // 8.5) DB 级终态断言：offscreen 链写入的 summaries 行（SW 与 offscreen 同源同库）
@@ -806,7 +910,7 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, p19: p19Probe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, p19: p19Probe, loginProbe, sessionProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -825,6 +929,20 @@ async function main() {
         sessionProbe?.dom?.modalClosed === true &&
         /mascot-(happy|note)\.png/.test(String(sessionProbe?.dom?.img ?? '')), // 保存→激活即反应（视频已在播时触发先到=note，同为正确行为）
       sessionStartHappy: /mascot-(happy|note)\.png/.test(String(sessionProbe?.dom?.img ?? '')), // 激活/触发 → happy/note 切图
+      // P1.10 未登录引导与自动恢复（F11）：登录气泡 / 引导卡+红徽章 / 详情错误文案 / 登录后卡隐藏+重排+转绿+welcome
+      loginBubbleNotLogged: String(sessionProbe?.loginBubble ?? '').includes('先登录 B 站'),
+      loginCardAndFailBadge:
+        loginProbe?.card1?.shown === true &&
+        loginProbe?.card1?.hasBtn === true &&
+        String(loginProbe?.card1?.title ?? '').includes('请在本浏览器登录') &&
+        String(loginProbe?.card1?.badge ?? '').includes('解析失败'),
+      loginFailReason: String(loginProbe?.failDetail?.errText ?? '').includes('需要登录'),
+      loginAutoRecover:
+        loginProbe?.card2?.hidden === true &&
+        loginProbe?.card2?.welcome === true &&
+        loginProbe?.recovered === true &&
+        loginProbe?.hasRequeueLog === true &&
+        String(loginProbe?.badge2?.badge ?? '').includes('已总结'),
       visitTriggered: has('summary job queued'), // watcher 5s 真实触发（visit 由 WATCH_TICK 惰性补建）
       offscreenRun: has('offscreen run job'), // offscreen 执行体真的跑了
       chainDone: lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done')),
@@ -878,7 +996,7 @@ async function main() {
         String(p19Probe?.follow?.firstKey ?? '').startsWith('BV1DUnB61ErU:') &&
         p19Probe?.follow?.open === true &&
         (p19Probe?.follow?.count ?? 0) >= 2,
-      noExplicitFail: !lines.some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
+      noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
     for (const [k, v] of Object.entries(verdict)) console.log(`  ${v ? '✅' : '❌'} ${k}`);

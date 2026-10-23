@@ -13,6 +13,7 @@ import type { UiSessionState } from '../src/content/mascot/logic';
 import { openOnboarding } from '../src/content/onboarding/onboarding';
 import { PanelController } from '../src/content/panel/panel';
 import { fmtSec } from '../src/content/panel/view-models';
+import { LOGIN_BUBBLE_TEXT, loginBubble } from '../src/content/login';
 import { shouldConsumeSeek } from '../src/content/seek';
 import { setupFullscreenMigration } from '../src/content/ui/fullscreen';
 import { mountDoubaoUi, toast } from '../src/content/ui/root';
@@ -63,7 +64,13 @@ export default defineContentScript({
         return;
       }
       panel?.handleEvent(e);
-      if (e.type === 'SESSION_STATE' && e.state) mascot?.setSessionState(e.state as UiSessionState);
+      if (e.type === 'SESSION_STATE' && e.state) {
+        mascot?.setSessionState(e.state as UiSessionState);
+        // P1.10 时机：激活/恢复后复核登录态（force 绕缓存）
+        if (e.state === 'ACTIVE') void requestLoginCheck(1);
+      }
+      // P1.10：登录态翻转 → 气泡（未登录激活=login 限频 kind；翻正=welcome）；引导卡由面板自管
+      if (e.type === 'LOGIN_STATE') applyLoginState(e.loggedIn ?? null);
       // 记完/失败的表情反馈只在激活期（睡觉时不吵醒，F3 克制语义）；
       // kind 供 P1.9 准则#4 同类气泡 10min 限频（连看多视频不轰炸）
       if (mascot?.session === 'ACTIVE') {
@@ -75,6 +82,26 @@ export default defineContentScript({
         }
       }
     });
+
+    // P1.10：登录态应用（纯决策见 login.loginBubble）；prev 只记确定态，未知不覆盖翻转判定
+    let prevLoggedIn: boolean | null = null;
+    const applyLoginState = (loggedIn: boolean | null): void => {
+      const b = loginBubble(loggedIn, prevLoggedIn, mascot?.session === 'ACTIVE');
+      if (b === 'login') void mascot?.say(LOGIN_BUBBLE_TEXT.login, 5000, 'login');
+      if (b === 'welcome') void mascot?.say(LOGIN_BUBBLE_TEXT.welcome, 4200);
+      if (loggedIn !== null) prevLoggedIn = loggedIn;
+    };
+    const requestLoginCheck = async (force?: number): Promise<void> => {
+      try {
+        const r = await bridge.request<{ ok: boolean; loggedIn: boolean | null }>({
+          type: 'LOGIN_CHECK',
+          ...(force === 1 ? { force: 1 } : {}),
+        });
+        if (r && r.ok) applyLoginState(r.loggedIn);
+      } catch {
+        /* SW 未就绪：忽略，面板打开/激活时会再探 */
+      }
+    };
 
     // P1.8：本页 <video> 落 seek（选择器多路兜底见 watcher/dom.findVideoElement），toast 口径同原型。
     const applyLocalSeek = (timeSec: number): void => {
@@ -137,6 +164,7 @@ export default defineContentScript({
     onVideoKeyResolved = (videoKey) => panel?.followVideo(videoKey);
 
     bridge.connect(); // 连接后 SW 回放 SESSION_STATE → 豆包按当前会话态初始化表情/气泡
+    void requestLoginCheck(); // P1.10 时机③：content 首连探登录态（引导卡/气泡数据源）
 
     report(detectBvid(location.href));
 

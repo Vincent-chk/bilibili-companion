@@ -169,3 +169,31 @@ describe('BiliClient（fake fetch）', () => {
     expect(calls[0]!.init!.credentials).toBe('omit');
   });
 });
+
+describe('BiliClient.checkLogin（P1.10 登录态唯一判据=nav）', () => {
+  it('code 0 + isLogin true → true', async () => {
+    const { client } = makeClient(() => jsonResponse({ code: 0, data: { isLogin: true } }));
+    await expect(client.checkLogin()).resolves.toBe(true);
+  });
+  it('code 0 + isLogin false → false', async () => {
+    const { client } = makeClient(() => jsonResponse({ code: 0, data: { isLogin: false } }));
+    await expect(client.checkLogin()).resolves.toBe(false);
+  });
+  it('code -101 / -352 → false（未登录/Cookie 失效，不抛）', async () => {
+    const a = makeClient(() => jsonResponse({ code: -101 }));
+    await expect(a.client.checkLogin()).resolves.toBe(false);
+    const b = makeClient(() => jsonResponse({ code: -352 }));
+    await expect(b.client.checkLogin()).resolves.toBe(false);
+  });
+  it('网络异常 → null（未知态，不得误报未登录轰炸用户）', async () => {
+    const { client } = makeClient(() => {
+      throw new TypeError('Failed to fetch');
+    });
+    await expect(client.checkLogin()).resolves.toBeNull();
+  });
+  it('风控 -412/HTTP 412 两轮 → null（审查 P2-5：未知态，不映射为未登录）', async () => {
+    const { client, calls } = makeClient(() => jsonResponse({ code: -412 }, 412));
+    await expect(client.checkLogin()).resolves.toBeNull();
+    expect(calls.length).toBe(2); // 熔断重试 1 次后放弃（breakerWaitMs=0）
+  });
+});

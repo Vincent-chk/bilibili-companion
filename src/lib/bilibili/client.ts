@@ -39,7 +39,7 @@ export interface BiliClientOptions {
 
 interface NavResp {
   code?: number;
-  data?: { wbi_img?: { img_url?: string; sub_url?: string } };
+  data?: { wbi_img?: { img_url?: string; sub_url?: string }; isLogin?: boolean };
 }
 interface ViewPage {
   cid: number;
@@ -186,6 +186,21 @@ export class BiliClient {
   }
 
   // -- 业务接口 -------------------------------------------------------------
+  /**
+   * P1.10 登录态探测（架构 §3.9）：nav 是唯一判据（need_login_subtitle 恒为 None 不可用，
+   * 07 报告 F-4 三次复证）。true=已登录；false=未登录（code -101/-352 或 isLogin=false）；
+   * null=未知（网络/-412 等瞬时错误——不得误报未登录轰炸用户）。
+   */
+  async checkLogin(): Promise<boolean | null> {
+    try {
+      const j = await this.#getJson<NavResp>('/x/web-interface/nav');
+      return j.data?.isLogin === true;
+    } catch (e) {
+      if (e instanceof BiliApiError && (e.code === -101 || e.code === -352)) return false;
+      return null;
+    }
+  }
+
   async fetchWbiKeys(): Promise<string> {
     const j = await this.#getJson<NavResp>('/x/web-interface/nav');
     const wbi = j.data?.wbi_img ?? {};

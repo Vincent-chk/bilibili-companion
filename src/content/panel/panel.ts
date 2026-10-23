@@ -5,6 +5,7 @@
 // 大纲/转写行点击 seek 已于 1.8 接入（SEEK_TO，onSeek 依赖）；【重新生成】随 REGENERATE 任务后续接入。
 import { browser } from 'wxt/browser';
 import type { Bridge, UiEvent } from '../bridge';
+import { LOGIN_CARD_TEXT, shouldShowLoginCard } from '../login';
 import { esc, toast, type DoubaoUi } from '../ui/root';
 import {
   BADGE_HTML,
@@ -29,6 +30,7 @@ export interface ListQueryResponse {
   items: ListQueryItem[];
   sessionState: string;
   triggerSeconds: number;
+  loggedIn: boolean | null; // P1.10 引导卡数据源（SW 30s 缓存）
 }
 
 export interface PanelDeps {
@@ -55,6 +57,8 @@ export class PanelController {
   #refreshTimer: unknown = null;
   /** 路由代数：followVideo 递增，作废在途 #openDetail 应答（审查 P2-5）。 */
   #routeGen = 0;
+  /** P1.10 登录态（null=未知）：引导卡显隐依据。 */
+  #loggedIn: boolean | null = null;
 
   readonly #setTimeout: (cb: () => void, ms?: number) => unknown;
 
@@ -83,12 +87,44 @@ export class PanelController {
   open(): void {
     this.#open = true;
     this.deps.ui.root.getElementById('panel')?.classList.add('open');
+    // P1.10 时机②：面板打开强制复核登录态（绕 SW 30s 缓存；翻转经 LOGIN_STATE 广播回卡）
+    void this.deps.bridge
+      .request<{ ok: boolean; loggedIn: boolean | null }>({ type: 'LOGIN_CHECK', force: 1 })
+      .then((r) => {
+        if (r?.ok) this.setLoginState(r.loggedIn);
+      })
+      .catch(() => {});
     void this.refresh();
   }
 
   close(): void {
     this.#open = false;
     this.deps.ui.root.getElementById('panel')?.classList.remove('open');
+  }
+
+  /** P1.10：登录态 → 面板顶部引导卡显隐。null=未知态：保持上一确定态（审查 P1-2——
+   *  SW 重启缓存清空/风控窗口回 null 不得吃掉已确认的未登录态而隐藏引导卡）。 */
+  setLoginState(loggedIn: boolean | null | undefined): void {
+    const v = loggedIn ?? null;
+    if (v === null) return;
+    if (v === this.#loggedIn) return;
+    this.#loggedIn = v;
+    this.#renderLoginCard();
+  }
+
+  #renderLoginCard(): void {
+    const card = this.deps.ui.root.getElementById('login-card');
+    if (!card) return;
+    if (!shouldShowLoginCard(this.#loggedIn)) {
+      card.classList.add('hidden');
+      card.innerHTML = '';
+      return;
+    }
+    card.classList.remove('hidden');
+    card.innerHTML = `<b>⚠ ${esc(LOGIN_CARD_TEXT.title)}</b><span>${esc(LOGIN_CARD_TEXT.desc)}</span><button class="btn btn-primary" id="btn-login">${esc(LOGIN_CARD_TEXT.button)}</button>`;
+    card.querySelector('#btn-login')?.addEventListener('click', () => {
+      window.open(LOGIN_CARD_TEXT.url, '_blank'); // 用户手势内新开标签页到 B 站登录页
+    });
   }
 
   /**
@@ -114,6 +150,7 @@ export class PanelController {
       this.#items = sortListItems((r.items ?? []).map(toListItemVM));
       this.#sessionState = r.sessionState ?? 'INACTIVE';
       this.#triggerSeconds = r.triggerSeconds ?? 20;
+      this.setLoginState(r.loggedIn ?? null); // P1.10 引导卡（SW 缓存值；强制复核在 open()）
       this.#renderStatus();
       if (this.#view === 'list') this.#renderList();
     } catch {
@@ -330,6 +367,10 @@ export class PanelController {
   // ---- 桥事件 ----
 
   handleEvent(e: UiEvent): void {
+    if (e.type === 'LOGIN_STATE') {
+      this.setLoginState(e.loggedIn ?? null); // P1.10 引导卡实时翻转
+      return;
+    }
     if (e.type === 'SUMMARY_PROGRESS') {
       // stage 更新与 delta 解耦：stage 变化常在 LLM 流式窗口之外单独成包（审查 P1-1）
       if (this.#stream && e.videoKey === this.#stream.videoKey) {

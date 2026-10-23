@@ -4,7 +4,7 @@
 // 执行体为 Offscreen Document（见 entrypoints/offscreen）；本模块不碰 chrome API，依赖全注入可测。
 import type { BiliClient, PlayerSubtitles, TranscriptCue, VideoView } from '../bilibili/client';
 import { selectTrack } from '../bilibili/track';
-import { pickPage } from '../bilibili/client';
+import { BiliApiError, pickPage } from '../bilibili/client';
 import { LlmHttpError, LlmNetworkError } from '../llm/client';
 import { summarize, type SummarizeOutcome } from '../llm/summary';
 import type { LlmConfig, StreamEvent } from '../llm/types';
@@ -38,8 +38,12 @@ export interface ChainCtx {
   update: (patch: { stage?: JobStage; progress?: number }) => Promise<void>;
 }
 
-/** LLM 传输/HTTP 错误 → 可读错误码（F9/F11：401→Key 无效+去设置；429→限流重试；断网→挂起续跑）。 */
+/** LLM 传输/HTTP 错误 → 可读错误码（F9/F11：401→Key 无效+去设置；429→限流重试；断网→挂起续跑）。
+ *  P1.10：B 站 -101/-352 → NEED_LOGIN（F11 失败原因「需要登录」；登录后自动恢复按此码重排）。 */
 export function mapLlmError(e: unknown): { code: string; msg: string } {
+  if (e instanceof BiliApiError && (e.code === -101 || e.code === -352)) {
+    return { code: 'NEED_LOGIN', msg: '需要登录 B 站才能取字幕，请先在本浏览器登录' };
+  }
   if (e instanceof LlmHttpError) {
     if (e.status === 401 || e.status === 403) return { code: 'KEY_INVALID', msg: 'LLM Key 无效或无权限，请到设置检查' };
     if (e.status === 402) return { code: 'NO_BALANCE', msg: 'LLM 余额不足' };
