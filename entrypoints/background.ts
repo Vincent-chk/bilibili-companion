@@ -1,23 +1,91 @@
-// background service worker：Phase 0 PoC 链 + P1.2 watcher 服务端（消息协议见 02-数据模型 §3）。
-// PoC 链（E2E 标记协议，scripts/e2e-poc.mjs 依赖）：VIDEO_SEEN(bvid) → view → 字幕 → LLM → console。
-// E2E 标记：E2E view ok / E2E subtitle ok / E2E llm ok / E2E CHAIN DONE / E2E FAIL。
-// shortcut: VIDEO_SEEN 进页即跑的 PoC 触发在任务 1.4（真实链路）落地后移除，届时 e2e-poc 改走 TRIGGER_SUMMARY。
+// background service worker：轻量编排（架构 §8：长任务一律 offscreen，SW 不执行 LLM SSE）。
+// - P1.2 watcher 服务端（VIDEO_ENTER/WATCH_TICK/TRIGGER_SUMMARY）
+// - P1.4 pipeline 编排：job 派发给 offscreen 执行体，进度回流落库；SW 启动 recover+drain
+// - Phase 0 PoC 链保留为 E2E 载波（VIDEO_SEEN → console 标记，scripts/e2e-poc.mjs 依赖；
+//   真实触发链为 TRIGGER_SUMMARY → pipeline → offscreen → chain）
 import { BiliClient, pickPage } from '../src/lib/bilibili/client';
 import { selectTrack } from '../src/lib/bilibili/track';
 import { resolveConfig, summarize } from '../src/lib/llm/summary';
 import type { StoredLlmConfig } from '../src/lib/llm/summary';
+import { Pipeline, type JobContext, type JobOutcome } from '../src/lib/pipeline';
 import {
   CompanionDB,
   getSessionPointer,
   isCacheFresh,
   updateVisitProgress,
   upsertVisit,
+  type JobRow,
+  type JobStage,
   type VideoRow,
 } from '../src/lib/storage';
 import { browserKv } from '../src/lib/storage/browserKv';
 
 const seen = new Set<string>();
 const db = new CompanionDB();
+
+// ---- P1.4 · pipeline：执行体=offscreen（LLM SSE 长任务不在 SW 跑） -----------------
+
+let offscreenReady = false;
+
+async function ensureOffscreen(): Promise<void> {
+  if (offscreenReady) return;
+  const existing = await browser.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT' as never],
+  });
+  if (existing.length > 0) {
+    offscreenReady = true;
+    return;
+  }
+  try {
+    await browser.offscreen.createDocument({
+      url: 'offscreen.html', // WXT 构建产物路径（entrypoints/offscreen/index.html → 根 offscreen.html）
+      reasons: ['DOM_PARSER' as never],
+      justification: 'LLM SSE 长任务执行体：规避 service worker 30s 空闲休眠',
+    });
+    offscreenReady = true;
+  } catch (e) {
+    // 并发创建时"已存在"类报错按就绪处理；其余抛给 pipeline 记失败重试
+    if (String(e).includes('Only a single offscreen')) offscreenReady = true;
+    else throw e;
+  }
+}
+
+/**
+ * job 执行器：发 offscreen 跑全链路，SUMMARY_PROGRESS 消息转 pipeline ctx 落库。
+ * shortcut: 600s 看门狗兜 offscreen 挂死（不回包）阻塞队列；SW 中途死亡由 recover() 重排幂等重跑。
+ */
+async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOutcome> {
+  await ensureOffscreen();
+  const onProgress = (msg: unknown) => {
+    const m = msg as { type?: string; jobId?: string; stage?: JobStage; progress?: number };
+    if (m?.type === 'SUMMARY_PROGRESS' && m.jobId === job.id) {
+      const patch: { stage?: JobStage; progress?: number } = {};
+      if (m.stage !== undefined) patch.stage = m.stage;
+      if (m.progress !== undefined) patch.progress = m.progress;
+      if (patch.stage !== undefined || patch.progress !== undefined) void ctx.update(patch);
+    }
+  };
+  browser.runtime.onMessage.addListener(onProgress);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const reply = await Promise.race([
+      browser.runtime.sendMessage({ type: 'OFFSCREEN_RUN_JOB', job: { id: job.id, videoKey: job.videoKey } }),
+      new Promise<never>((_, rej) => {
+        watchdog = setTimeout(() => rej(new Error('offscreen 执行超时(600s)')), 600_000);
+      }),
+    ]);
+    return reply as JobOutcome;
+  } finally {
+    browser.runtime.onMessage.removeListener(onProgress);
+    if (watchdog !== undefined) clearTimeout(watchdog);
+  }
+}
+
+const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
+  onTransition: (j) => {
+    if (j.status !== 'pending') console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
+  },
+});
 
 interface InMsg {
   type?: string;
@@ -30,6 +98,11 @@ interface InMsg {
 
 export default defineBackground(() => {
   console.log('[doubao-poc] background ready');
+  // SW 启动：恢复 stale running → 清空 pending（断网挂起/重启后续跑，F11）
+  void pipeline.recover().then(async (n) => {
+    if (n) console.log(`[doubao] recovered ${n} stale job(s)`);
+    await pipeline.drain();
+  });
 
   browser.runtime.onMessage.addListener((msg: unknown) => {
     const m = msg as InMsg;
@@ -46,7 +119,7 @@ export default defineBackground(() => {
       case 'TRIGGER_SUMMARY':
         return handleTriggerSummary(m);
       default:
-        return undefined; // 未识别消息交给其它 listener
+        return undefined; // 未识别消息交给其它 listener（SUMMARY_PROGRESS 由 executeViaOffscreen 处理）
     }
   });
 });
@@ -54,7 +127,6 @@ export default defineBackground(() => {
 // ---- P1.2 · watcher 服务端 ---------------------------------------------------
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-const rand4 = () => Math.random().toString(36).slice(2, 6);
 
 /** VIDEO_ENTER：view 元信息（videos 24h 缓存）+ 多 P 选 cid + 建/刷 visit，回 watcher 所需参数。 */
 async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
@@ -117,9 +189,8 @@ async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
 }
 
 /**
- * TRIGGER_SUMMARY（20s 阈值）：会话级幂等（visits.triggered），置位后排队 SUMMARIZE job。
- * shortcut: job 行此处手写，消费方为任务 1.3 pipeline；同视频双标签页并发触发的极窄竞态
- * 由 1.3 的 active-job 幂等键兜底，届时补去重。
+ * TRIGGER_SUMMARY（20s 阈值）：会话级幂等（visits.triggered）+ pipeline.enqueue 活动任务去重
+ * （双标签页/触发与按需并发在此收口），入队后 kick drain。
  */
 async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
@@ -129,23 +200,13 @@ async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> 
   const visit = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
   if (!visit) return { ok: false, reason: 'no-visit' };
   if (visit.triggered) return { ok: true, deduped: true };
-  const now = Date.now();
   // 单事务：置位 triggered 与建 job 同生共死，jobs 写失败可重试触发而不永久丢失
   await db.transaction('rw', [db.visits, db.jobs], async () => {
-    await db.visits.put({ ...visit, triggered: 1, lastSeenAt: now });
-    await db.jobs.put({
-      id: `j_${now}_${rand4()}`,
-      type: 'SUMMARIZE',
-      videoKey,
-      sessionId: pointer.sessionId,
-      status: 'pending',
-      progress: 0,
-      retries: 0,
-      createdAt: now,
-      updatedAt: now,
-    });
+    await db.visits.put({ ...visit, triggered: 1, lastSeenAt: Date.now() });
+    await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
   });
   console.log(`[doubao] summary job queued: ${videoKey}`);
+  void pipeline.drain();
   return { ok: true };
 }
 

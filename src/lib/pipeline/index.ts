@@ -52,30 +52,32 @@ export class Pipeline {
 
   /**
    * 入队。幂等：同 videoKey+type 已有活动任务（pending/running/need_confirm）时返回现有行，
-   * 不重复建（20s 触发与按需打开并发、双标签页并发触发均在此收口）。
+   * 不重复建（20s 触发与按需打开并发、双标签页并发触发均在此收口）。'rw' 事务封查后写竞态。
    */
   async enqueue(input: { type: JobType; videoKey: string; sessionId: string }): Promise<JobRow> {
-    const active = await this.#db.jobs
-      .where('videoKey')
-      .equals(input.videoKey)
-      .filter((j) => j.type === input.type && ACTIVE_STATUSES.includes(j.status))
-      .first();
-    if (active) return active;
-    const now = this.#now();
-    const row: JobRow = {
-      id: `j_${now}_${rand4()}`,
-      type: input.type,
-      videoKey: input.videoKey,
-      sessionId: input.sessionId,
-      status: 'pending',
-      progress: 0,
-      retries: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await this.#db.jobs.put(row);
-    this.#emit(row);
-    return row;
+    return this.#db.transaction('rw', this.#db.jobs, async () => {
+      const active = await this.#db.jobs
+        .where('videoKey')
+        .equals(input.videoKey)
+        .filter((j) => j.type === input.type && ACTIVE_STATUSES.includes(j.status))
+        .first();
+      if (active) return active;
+      const now = this.#now();
+      const row: JobRow = {
+        id: `j_${now}_${rand4()}`,
+        type: input.type,
+        videoKey: input.videoKey,
+        sessionId: input.sessionId,
+        status: 'pending',
+        progress: 0,
+        retries: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await this.#db.jobs.put(row);
+      this.#emit(row);
+      return row;
+    });
   }
 
   /** SW 启动时调用：stale running（上次 SW 中途死亡）重排 pending。返回重排数。 */

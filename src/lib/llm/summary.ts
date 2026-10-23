@@ -4,19 +4,30 @@ import { streamChatCompletion } from './client';
 // Key 安全红线（三条）：Key 不落盘（不写任何文件/存储）、不入库（不进 Dexie 或任何数据库）、
 // 不打印（不进日志与错误信息——错误只含 status 与打码后的 body 前 200 字符）。
 
-export const SUMMARY_SYSTEM_PROMPT = `你是「豆包」，一只陪用户看 B 站视频的毒舌吉祥物助手。任务：把视频字幕整理成结构化笔记。
+/** 人设只改点评口吻（F8/决策 D12：摘要本体保持客观）。v1.0 三预设。 */
+export const PERSONA_EVALUATION_STYLE: Record<string, string> = {
+  spicy: '40-80字的豆包点评，毒舌包人设，可用豆系梗（如本豆/豆沙/出笼/豆子）',
+  gentle: '40-80字的豆包点评，温柔包人设，语气亲和、以鼓励为主',
+  academic: '40-80字的豆包点评，学术包人设，冷静克制、重论证与信息密度',
+};
+
+const BASE_SYSTEM_PROMPT = `你是「豆包」，一只陪用户看 B 站视频的吉祥物助手。任务：把视频内容整理成结构化笔记。
 
 只输出一个 JSON 对象，不要 Markdown 代码块、不要任何解释文字。结构如下：
 {"summary": "150-300字的客观摘要（简体中文，陈述事实，不带人设口吻）",
  "outline": [{"time": 秒数, "text": "该段要点，不超过30字"}],
- "evaluation": "40-80字的豆包点评，毒舌包人设，可用豆系梗（如本豆/豆沙/出笼/豆子）",
+ "evaluation": "{EVAL_STYLE}",
  "rating": 1到5的整数}
 
 约束：
-1. outline 6-12 条，按时间升序，time 必须是整数秒且来自字幕时间戳；
+1. outline 6-12 条，按时间升序，time 必须是整数秒且来自所给内容的时间戳；
 2. summary 保持客观、不评价；人设口吻只允许出现在 evaluation；
 3. rating 为 1-5 的整数（1=最难以下咽，5=神作，理解成 1-5 颗 🫘）；
 4. 严禁输出 JSON 以外的任何字符。`;
+
+export function summarySystemPrompt(persona = 'spicy'): string {
+  return BASE_SYSTEM_PROMPT.replace('{EVAL_STYLE}', PERSONA_EVALUATION_STYLE[persona] ?? PERSONA_EVALUATION_STYLE['spicy']!);
+}
 
 export interface SummaryVideoMeta {
   title: string;
@@ -24,14 +35,22 @@ export interface SummaryVideoMeta {
   cueCount: number;
 }
 
-/** 紧凑字幕（[mm:ss]文本）由调用方拼好传入，lib 层不碰 bilibili 数据源。 */
+export interface SummaryMessagesOptions {
+  persona?: string;
+  /** user 正文里内容的标签（单趟=紧凑字幕；Map-Reduce Reduce=各段要点）。 */
+  bodyLabel?: string;
+}
+
+/** 紧凑内容（[mm:ss]文本行）由调用方拼好传入，lib 层不碰 bilibili 数据源。 */
 export function buildSummaryMessages(
   videoMeta: SummaryVideoMeta,
   transcriptText: string,
+  mo: SummaryMessagesOptions = {},
 ): LlmMessage[] {
-  const user = `视频标题：${videoMeta.title}\n时长：${videoMeta.duration}秒\n字幕条数：${videoMeta.cueCount}\n\n紧凑字幕（[mm:ss]文本）：\n${transcriptText}`;
+  const label = mo.bodyLabel ?? '紧凑字幕（[mm:ss]文本）';
+  const user = `视频标题：${videoMeta.title}\n时长：${videoMeta.duration}秒\n字幕条数：${videoMeta.cueCount}\n\n${label}：\n${transcriptText}`;
   return [
-    { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+    { role: 'system', content: summarySystemPrompt(mo.persona) },
     { role: 'user', content: user },
   ];
 }
@@ -118,16 +137,14 @@ export interface SummarizeOutcome {
 }
 
 /**
- * 完整链：stream → parse → 校验失败带错误信息重发 1 次 → 再失败降级纯文本。最多 2 次请求。
- * 传输类错误（LlmHttpError / LlmNetworkError）直接抛给调用方做错误映射，不做降级。
+ * 结构化完成链（可复用执行体）：stream → parse → 校验失败带错误信息重发 1 次 → 再失败降级纯文本。
+ * 最多 2 次请求。传输类错误（LlmHttpError / LlmNetworkError）直接抛给调用方做错误映射，不做降级。
  */
-export async function summarize(
+export async function completeStructured(
   cfg: LlmConfig,
-  videoMeta: SummaryVideoMeta,
-  transcriptText: string,
+  baseMessages: LlmMessage[],
   opts: SummarizeOptions = {},
 ): Promise<SummarizeOutcome> {
-  const base = buildSummaryMessages(videoMeta, transcriptText);
   const run = (messages: LlmMessage[]) =>
     streamChatCompletion(cfg, messages, {
       fetchImpl: opts.fetchImpl,
@@ -135,7 +152,7 @@ export async function summarize(
       onDelta: opts.onDelta,
     });
 
-  let messages = base;
+  let messages = baseMessages;
   for (let attempt = 1; ; attempt++) {
     const r = await run(messages);
     const { value, error } = parseSummary(r.text);
@@ -161,13 +178,24 @@ export async function summarize(
       };
     }
     messages = [
-      ...base,
+      ...baseMessages,
       {
         role: 'user',
         content: `上一轮输出未通过校验：${errs.join('；')}。请严格只输出一个符合 Schema 的 JSON 对象，不要 Markdown 代码块与任何多余字符。`,
       },
     ];
   }
+}
+
+/** 单趟摘要（短字幕直用；长字幕走 mapReduceSummarize）。 */
+export async function summarize(
+  cfg: LlmConfig,
+  videoMeta: SummaryVideoMeta,
+  transcriptText: string,
+  opts: SummarizeOptions & SummaryMessagesOptions = {},
+): Promise<SummarizeOutcome> {
+  const { persona, bodyLabel, ...streamOpts } = opts;
+  return completeStructured(cfg, buildSummaryMessages(videoMeta, transcriptText, { persona, bodyLabel }), streamOpts);
 }
 
 export interface StoredLlmConfig {
@@ -201,4 +229,18 @@ export function resolveConfig(stored?: StoredLlmConfig): ResolvedConfig {
     source: 'none',
     error: '未配置 LLM：请在设置中填写 baseUrl / model / apiKey，或经 POC_LLM_BASE_URL / POC_LLM_MODEL / POC_LLM_API_KEY 环境变量在构建期注入',
   };
+}
+
+/** storage 里读用户 LLM 配置：settings.llm（modelId 字段，onboarding 后的标准位）优先，回退 Phase 0 的顶层 llm 三件套。 */
+export async function readStoredLlmConfig(
+  kv: { get<T>(key: string): Promise<T | undefined> },
+): Promise<StoredLlmConfig | undefined> {
+  const settings = await kv.get<{ llm?: { baseUrl?: string; modelId?: string; model?: string; apiKey?: string } }>('settings');
+  const s = settings?.llm;
+  if (s?.baseUrl && (s.modelId || s.model) && s.apiKey) {
+    return { baseUrl: s.baseUrl, model: s.modelId ?? s.model, apiKey: s.apiKey };
+  }
+  const legacy = await kv.get<StoredLlmConfig>('llm');
+  if (legacy?.baseUrl && legacy.model && legacy.apiKey) return legacy;
+  return undefined;
 }
