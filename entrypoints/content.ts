@@ -1,13 +1,26 @@
-// content script：Phase 0 骨架（0.3）+ P1.2 watcher 接线。
-// 职责：识别当前页 bvid → Shadow DOM 挂豆包立绘 → SPA 路由变化重新识别
+// content script：Phase 0 骨架（0.3）+ P1.2 watcher + P1.5 面板/共享 UI 层。
+// 职责：识别当前页 bvid → Shadow DOM 挂豆包 + 面板 → SPA 路由变化重新识别
 //       → watcher 有效观看计时（20s 触发 / WATCH_TICK 节流上报，经 runtime 消息走 background）。
+// P1.5：单一 Shadow 宿主（doubao-ui-root）承载 mascot/panel/modal/toast；豆包点击开合面板；
+//       Port（doubao-port）接收 SUMMARY_* 推送驱动面板流式/刷新。
+// P1.6 将把此处占位豆包升级为完整状态机模块（src/content/mascot）。
+import { browser } from 'wxt/browser';
+import { Bridge } from '../src/content/bridge';
+import { PanelController } from '../src/content/panel/panel';
+import { mountDoubaoUi } from '../src/content/ui/root';
 import { WatchSession } from '../src/content/watcher/dom';
 
 export default defineContentScript({
   matches: ['*://www.bilibili.com/*'],
   runAt: 'document_idle',
   main() {
-    mountMascot();
+    const ui = mountDoubaoUi();
+    let panel: PanelController | null = null;
+    const bridge = new Bridge((e) => panel?.handleEvent(e));
+    bridge.connect();
+    panel = new PanelController({ ui, bridge });
+    mountMascotPlaceholder(ui, () => panel?.toggle());
+
     report(detectBvid(location.href));
 
     // B 站是 SPA：路由变化不重载页面，监听 history API + popstate 重新识别。
@@ -77,26 +90,19 @@ async function startWatcher(bvid: string | null): Promise<void> {
   }
 }
 
-/** Shadow DOM 挂载豆包立绘：position:fixed 不参与文档流，避免页面重排（对标准则 #7）。 */
-function mountMascot() {
-  const HOST_ID = 'doubao-poc-host';
-  if (document.getElementById(HOST_ID)) return;
-  const host = document.createElement('div');
-  host.id = HOST_ID;
-  document.documentElement.appendChild(host);
-  const root = host.attachShadow({ mode: 'open' });
-  root.innerHTML = `
-    <style>
-      :host { all: initial; }
-      img { position: fixed; right: 24px; bottom: 24px; width: 72px; height: 72px;
-            z-index: 2147483647; opacity: .92; cursor: pointer;
-            animation: doubao-float 3s ease-in-out infinite; }
-      @keyframes doubao-float { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-6px) } }
-    </style>
-    <img src="${browser.runtime.getURL('/mascot/mascot-idle.png')}" alt="豆包" />`;
-  root.querySelector('img')?.addEventListener('click', () => {
-    console.log('[doubao-poc] mascot clicked');
-  });
+/**
+ * P1.5 豆包占位（进 ui root；点击开合面板）。position:fixed 不参与文档流（浮层准则 #7）。
+ * 默认位参考原型：右下区域、避开播放器控件；气泡头顶空间预留。P1.6 换完整模块（状态机/气泡/拖拽）。
+ */
+function mountMascotPlaceholder(ui: ReturnType<typeof mountDoubaoUi>, onClick: () => void): void {
+  const wrap = ui.root.getElementById('mascot-wrap');
+  const img = ui.root.querySelector<HTMLImageElement>('#mascot-img');
+  if (!wrap || !img) return;
+  wrap.classList.remove('hidden');
+  wrap.style.left = `${Math.max(20, window.innerWidth - 380)}px`;
+  wrap.style.top = `${Math.max(170, window.innerHeight - 280)}px`;
+  img.src = browser.runtime.getURL('/mascot/mascot-idle.png');
+  ui.root.getElementById('mascot')?.addEventListener('click', () => onClick());
 }
 
 function patchHistoryPushState(onChange: () => void) {

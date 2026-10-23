@@ -14,11 +14,31 @@ import {
   upsertVisit,
   type JobRow,
   type JobStage,
+  type SummaryRow,
   type VideoRow,
 } from '../src/lib/storage';
 import { browserKv } from '../src/lib/storage/browserKv';
+import { excerptOf } from '../src/content/panel/view-models';
 
 const db = new CompanionDB();
+
+// ---- P1.5 · Port（doubao-port）与面板推送 ----------------------------------------
+// runtime.sendMessage 到不了 content script（扩展内部专用），B→C 推送一律走 Port 广播。
+
+interface UiPort {
+  postMessage: (msg: unknown) => void;
+}
+const uiPorts = new Set<UiPort>();
+
+function broadcastToUi(msg: Record<string, unknown>): void {
+  for (const p of uiPorts) {
+    try {
+      p.postMessage(msg);
+    } catch {
+      /* 断口由 onDisconnect 清理 */
+    }
+  }
+}
 
 // ---- P1.4 · pipeline：执行体=offscreen（LLM SSE 长任务不在 SW 跑） -----------------
 
@@ -73,12 +93,20 @@ async function sendToOffscreen(payload: Record<string, unknown>): Promise<unknow
 
 async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOutcome> {
   const onProgress = (msg: unknown) => {
-    const m = msg as { type?: string; jobId?: string; stage?: JobStage; progress?: number };
+    const m = msg as {
+      type?: string;
+      jobId?: string;
+      stage?: JobStage;
+      progress?: number;
+      deltaText?: string;
+    };
     if (m?.type === 'SUMMARY_PROGRESS' && m.jobId === job.id) {
       const patch: { stage?: JobStage; progress?: number } = {};
       if (m.stage !== undefined) patch.stage = m.stage;
       if (m.progress !== undefined) patch.progress = m.progress;
       if (patch.stage !== undefined || patch.progress !== undefined) void ctx.update(patch);
+      // 面板推送：补 videoKey（offscreen 只知道 jobId），deltaText 驱动详情流式打字
+      broadcastToUi({ ...m, type: 'SUMMARY_PROGRESS', videoKey: job.videoKey });
     }
   };
   browser.runtime.onMessage.addListener(onProgress);
@@ -115,10 +143,20 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
 const lastLoggedStatus = new Map<string, string>();
 const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   onTransition: (j) => {
-    // 进度写回也会触发本回调：只在状态真正变化时打日志
+    // 进度写回也会触发本回调：状态变化才打日志（pending 不打，保持原行为）
     if (j.status !== 'pending' && lastLoggedStatus.get(j.id) !== j.status) {
-      lastLoggedStatus.set(j.id, j.status);
       console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
+    }
+    // P1.5：状态变化即广播（含 pending 入队——其他标签页/未开面板的列表要看到「生成中」）；
+    // 纯进度写回状态不变不广播（进度走 SUMMARY_PROGRESS 通道）
+    if (lastLoggedStatus.get(j.id) !== j.status) {
+      lastLoggedStatus.set(j.id, j.status);
+      const t =
+        j.status === 'done' ? 'SUMMARY_DONE'
+        : j.status === 'failed' ? 'SUMMARY_FAILED'
+        : j.status === 'need_confirm' ? 'SUMMARY_NEED_ASR'
+        : 'SUMMARY_UPDATED';
+      broadcastToUi({ type: t, videoKey: j.videoKey });
     }
   },
 });
@@ -140,6 +178,25 @@ export default defineBackground(() => {
     await pipeline.drain();
   });
 
+  // P1.5：面板 Port。连接即回放当前会话状态（新标签页初始化；P1.6 豆包消费）
+  browser.runtime.onConnect.addListener((port) => {
+    if ((port as { name?: string }).name !== 'doubao-port') return;
+    const p = port as unknown as UiPort;
+    uiPorts.add(p);
+    (port as unknown as { onDisconnect: { addListener: (cb: () => void) => void } }).onDisconnect.addListener(() =>
+      uiPorts.delete(p),
+    );
+    void getSessionPointer(browserKv)
+      .then((pointer) => {
+        try {
+          p.postMessage({ type: 'SESSION_STATE', state: pointer?.state ?? 'INACTIVE' });
+        } catch {
+          /* 端口即断 */
+        }
+      })
+      .catch(() => {});
+  });
+
   browser.runtime.onMessage.addListener((msg: unknown) => {
     const m = msg as InMsg;
     switch (m?.type) {
@@ -151,6 +208,10 @@ export default defineBackground(() => {
         return handleWatchTick(m);
       case 'TRIGGER_SUMMARY':
         return handleTriggerSummary(m);
+      case 'LIST_QUERY':
+        return handleListQuery();
+      case 'SUMMARY_OPEN':
+        return handleSummaryOpen(m);
       default:
         return undefined; // 未识别消息交给其它 listener（SUMMARY_PROGRESS 由 executeViaOffscreen 处理）
     }
@@ -241,5 +302,72 @@ async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> 
   console.log(`[doubao] summary job queued: ${videoKey}`);
   void pipeline.drain();
   return { ok: true };
+}
+
+// ---- P1.5 · 面板数据服务（LIST_QUERY / SUMMARY_OPEN） --------------------------
+
+const ACTIVE_JOB_STATUSES: JobRow['status'][] = ['pending', 'running', 'need_confirm'];
+
+/** videoKey 的最新 summary 行（换模型会产生多行，面板展示最新一次结果）。 */
+async function latestSummary(videoKey: string): Promise<SummaryRow | undefined> {
+  const rows = await db.summaries.where('videoKey').equals(videoKey).sortBy('createdAt');
+  return rows.length ? rows[rows.length - 1] : undefined;
+}
+
+async function activeJob(videoKey: string): Promise<JobRow | undefined> {
+  const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
+  return rows.find((j) => ACTIVE_JOB_STATUSES.includes(j.status));
+}
+
+async function readSettings(): Promise<{ triggerSeconds?: number; persona?: string }> {
+  return ((await browser.storage.local.get('settings'))['settings'] as { triggerSeconds?: number; persona?: string }) ?? {};
+}
+
+/** LIST_QUERY：visits+videos+summaries+jobs 联查快照（02-数据模型 §3，列表数据源）。 */
+async function handleListQuery(): Promise<Record<string, unknown>> {
+  const pointer = await getSessionPointer(browserKv);
+  const settings = await readSettings();
+  const base = {
+    ok: true as const,
+    sessionState: pointer?.state ?? 'INACTIVE',
+    triggerSeconds: clamp(settings.triggerSeconds ?? 20, 5, 300),
+  };
+  if (!pointer) return { ...base, items: [] };
+  const visits = (await db.visits.where('sessionId').equals(pointer.sessionId).toArray()).sort(
+    (a, b) => b.lastSeenAt - a.lastSeenAt,
+  );
+  const items = await Promise.all(
+    visits.map(async (visit) => ({
+      visit,
+      video: await db.videos.get(visit.videoKey),
+      summary: await latestSummary(visit.videoKey),
+      job: await activeJob(visit.videoKey),
+    })),
+  );
+  return { ...base, items };
+}
+
+/**
+ * SUMMARY_OPEN：按需生成/取缓存（F4 点击未生成条目、失败重试）。
+ * 无摘要（或上次失败且无活动任务）→ 入队 SUMMARIZE；已有 done 摘要 → 直接返回（缓存命中零请求，F5）。
+ */
+async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
+  const { videoKey } = m;
+  if (!videoKey) return { ok: false, error: 'SUMMARY_OPEN 缺 videoKey' };
+  const pointer = await getSessionPointer(browserKv);
+  const visit = pointer
+    ? await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first()
+    : undefined;
+  if (!visit || !pointer) return { ok: false, error: 'no-visit' };
+  const video = await db.videos.get(videoKey);
+  const summary = await latestSummary(videoKey);
+  let job = await activeJob(videoKey);
+  if (!job && (!summary || summary.status === 'failed')) {
+    await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
+    job = await activeJob(videoKey);
+    void pipeline.drain();
+  }
+  const transcript = excerptOf(await db.transcripts.get(videoKey));
+  return { ok: true, item: { visit, video, summary, job }, transcript };
 }
 

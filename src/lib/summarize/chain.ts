@@ -30,7 +30,7 @@ export interface SummarizeChainDeps {
   llm: LlmConfig;
   persona?: string;
   fetchImpl?: typeof fetch;
-  /** 流式增量（offscreen 转发面板打字机；1.5 接线）。 */
+  /** 流式增量（offscreen 转发面板打字机；P1.5 接线）。 */
   onDelta?: (text: string) => void;
 }
 

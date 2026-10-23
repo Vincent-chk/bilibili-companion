@@ -242,13 +242,68 @@ async function main() {
       log('IndexedDB 终态:', JSON.stringify(dbSummary));
     }
 
-    // 8) DOM 探针：豆包是否真的注入（不依赖 console 的第二证据）
-    let mascotInjected = null;
+    // 8) DOM 探针：共享 UI root 是否注入 + 面板全链（P1.5：豆包点击 → 列表 → 详情）
+    let uiProbe = null;
     const probeSid = [...pageSessions].pop();
     if (probeSid) {
-      const r = await cdp('Runtime.evaluate', { expression: '!!document.getElementById("doubao-poc-host")', returnByValue: true }, probeSid);
-      mascotInjected = r?.result?.result?.value ?? null;
-      log('DOM 探针 doubao-poc-host 存在 =', mascotInjected);
+      let r = await cdp('Runtime.evaluate', { expression: '!!document.getElementById("doubao-ui-root")', returnByValue: true }, probeSid);
+      const uiRootInjected = r?.result?.result?.value === true;
+      log('DOM 探针 doubao-ui-root 存在 =', uiRootInjected);
+
+      if (uiRootInjected) {
+        // 点击豆包 → 面板开（shadow root 内真实 click 事件）
+        await cdp('Runtime.evaluate', {
+          expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("mascot").click()',
+          returnByValue: true,
+        }, probeSid);
+        await sleep(1200); // LIST_QUERY 往返 + 渲染
+        r = await cdp('Runtime.evaluate', {
+          expression: `(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const items = [...sr.querySelectorAll('.v-item')];
+            return JSON.stringify({
+              open: sr.getElementById('panel')?.classList.contains('open') ?? false,
+              count: items.length,
+              badge: items[0]?.querySelector('.badge')?.textContent ?? '',
+              title: (items[0]?.querySelector('.v-name')?.textContent ?? '').slice(0, 40),
+              pct: items[0]?.querySelector('.v-pct')?.textContent ?? '',
+              src: (items[0]?.textContent ?? '').includes('来源：'),
+            });
+          })()`,
+          returnByValue: true,
+        }, probeSid);
+        let list = {};
+        try { list = JSON.parse(r?.result?.result?.value); } catch { /* 保持空 */ }
+        log('面板列表探针:', JSON.stringify(list));
+
+        if (list.count >= 1) {
+          await cdp('Runtime.evaluate', {
+            expression: 'document.getElementById("doubao-ui-root").shadowRoot.querySelector(".v-item").click()',
+            returnByValue: true,
+          }, probeSid);
+          await sleep(1200); // SUMMARY_OPEN 往返 + 详情渲染
+          r = await cdp('Runtime.evaluate', {
+            expression: `(() => {
+              const sr = document.getElementById('doubao-ui-root').shadowRoot;
+              const summaryLen = (sr.getElementById('d-summary')?.textContent ?? '').trim().length;
+              return JSON.stringify({
+                summaryLen,
+                outlineRows: sr.querySelectorAll('.d-outline li').length,
+                mascotSay: sr.querySelector('.mascot-say-text')?.textContent?.slice(0, 30) ?? '',
+                stars: sr.querySelector('.mascot-stars')?.textContent ?? '',
+                transcriptRows: sr.querySelectorAll('.tr-line').length,
+                transcriptLabel: sr.querySelector('.d-transcript summary')?.textContent ?? '',
+                srcBadge: sr.querySelector('.src-badge')?.textContent ?? '',
+              });
+            })()`,
+            returnByValue: true,
+          }, probeSid);
+          try { uiProbe = { list, detail: JSON.parse(r?.result?.result?.value) }; } catch { uiProbe = { list }; }
+          log('面板详情探针:', JSON.stringify(uiProbe.detail ?? null));
+        } else {
+          uiProbe = { list };
+        }
+      }
     }
 
     // 9) 截图与 console 留证
@@ -264,19 +319,26 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
-    // 10) 判定（真实链标记：watcher 触发 → 排队 → offscreen → 终态 → DB 落库）
+    // 10) 判定（真实链标记：watcher 触发 → 排队 → offscreen → 终态 → DB 落库 → 面板渲染）
     const has = (s) => lines.some((l) => l.text.includes(s));
     const verdict = {
       contentInjected: has('content script injected'),
       bvid: has(`bvid = ${BVID}`),
-      mascotDomInjected: mascotInjected === true,
+      uiRootInjected: uiProbe !== null,
       visitTriggered: has('summary job queued'), // watcher 5s 真实触发（含 visit 建行）
       offscreenRun: has('offscreen run job'), // offscreen 执行体真的跑了
       chainDone: lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done')),
       dbSummaryDone: Array.isArray(dbSummary?.summaries) && dbSummary.summaries.some((s) => s.status === 'done'),
+      panelListRendered: (uiProbe?.list?.count ?? 0) >= 1 && String(uiProbe?.list?.badge ?? '').includes('已总结'),
+      panelDetailRendered:
+        (uiProbe?.detail?.summaryLen ?? 0) > 0 &&
+        (uiProbe?.detail?.outlineRows ?? 0) >= 1 &&
+        !!uiProbe?.detail?.mascotSay &&
+        (uiProbe?.detail?.transcriptRows ?? 0) >= 1 &&
+        String(uiProbe?.detail?.srcBadge ?? '').length > 0,
       noExplicitFail: !lines.some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

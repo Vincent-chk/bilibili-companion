@@ -18,10 +18,10 @@ interface RunJobMsg {
   persona?: string;
 }
 
-/** 进度回传节流：token 级 delta 高频，200ms 合并一次防消息风暴。 */
+/** 进度回传节流：token 级 delta 高频，200ms 合并一次防消息风暴（stage/progress/deltaText 共用）。 */
 function makeCtx(jobId: string) {
   let lastSentAt = 0;
-  let pending: { stage?: string; progress?: number } | null = null;
+  let pending: { stage?: string; progress?: number; deltaText?: string } | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const flush = () => {
     timer = null;
@@ -30,16 +30,24 @@ function makeCtx(jobId: string) {
     pending = null;
     void browser.runtime.sendMessage({ type: 'SUMMARY_PROGRESS', ...payload }).catch(() => {});
   };
+  const schedule = () => {
+    const now = Date.now();
+    if (now - lastSentAt >= 200) {
+      lastSentAt = now;
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(flush, 200);
+    }
+  };
   return {
     update: async (patch: { stage?: string; progress?: number }) => {
       pending = { ...(pending ?? {}), ...patch };
-      const now = Date.now();
-      if (now - lastSentAt >= 200) {
-        lastSentAt = now;
-        flush();
-      } else if (!timer) {
-        timer = setTimeout(flush, 200);
-      }
+      schedule();
+    },
+    /** P1.5：LLM 流式增量缓冲（deltaText 累计到下次 flush 一并发出）。 */
+    pushDelta: (text: string) => {
+      pending = { ...(pending ?? {}), deltaText: (pending?.deltaText ?? '') + text };
+      schedule();
     },
   };
 }
@@ -55,10 +63,11 @@ browser.runtime.onMessage.addListener((msg: unknown) => {
 
 async function handleRun(job: { id: string; videoKey: string }, llm: LlmConfig, persona?: string) {
   console.log(`[doubao] offscreen run job=${job.id} videoKey=${job.videoKey}`);
+  const ctx = makeCtx(job.id);
   const outcome = await runSummarizeJob(
-    { db, bili: new BiliClient(), llm, persona },
+    { db, bili: new BiliClient(), llm, persona, onDelta: (t) => ctx.pushDelta(t) },
     job,
-    makeCtx(job.id),
+    ctx,
   );
   console.log(`[doubao] offscreen job=${job.id} → ${outcome.result}`);
   return outcome;

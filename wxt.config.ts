@@ -22,6 +22,8 @@ export default defineConfig({
       '*://*.bilivideo.com/*',
       '*://*.bilivideo.cn/*',
     ],
+    // P1.5：mascot 立绘/头像在 content script 的 Shadow DOM <img> 中加载，须 web 可访问
+    web_accessible_resources: [{ resources: ['mascot/*'], matches: ['*://www.bilibili.com/*'] }],
     // content_scripts 不在此声明：WXT 由 entrypoints/content.ts 的 defineContentScript 生成注册。
   },
 });
