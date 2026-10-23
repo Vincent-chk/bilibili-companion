@@ -1,0 +1,14 @@
+# 密钥与本地配置永不入库（红线，见 02-开发方案/04-风险合规与安全.md）
+.env
+.env.*
+*.local
+
+# 构建产物与依赖
+node_modules/
+.output/
+.wxt/
+dist/
+coverage/
+
+# 系统
+.DS_Store

@@ -1,0 +1,27 @@
+{
+  "name": "bilibili-companion",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "「豆包」B 站陪看助手 · Phase 0 PoC（视频识别 + 字幕直取 + 摘要 console 打印）",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "compile": "tsc --noEmit",
+    "test": "vitest run",
+    "typegen": "wxt prepare"
+  },
+  "dependencies": {
+    "dexie": "^4.4.6",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "wxt": "^0.21.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
