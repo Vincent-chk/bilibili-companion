@@ -2,7 +2,7 @@
 // 列表（封面/进度/五态徽章）· 详情（摘要流式/大纲/豆包说/转写节选）· 空态。
 // 数据：LIST_QUERY（列表快照）/ SUMMARY_OPEN（按需生成或取缓存 + 详情载荷）；
 // 推送：SUMMARY_PROGRESS(deltaText 流式打字) / SUMMARY_DONE|FAILED|NEED_ASR|UPDATED（终态刷新）。
-// 大纲点击 seek 是任务 1.8（SEEK_TO），本版时间戳仅展示；【重新生成】随 REGENERATE 任务后续接入。
+// 大纲/转写行点击 seek 已于 1.8 接入（SEEK_TO，onSeek 依赖）；【重新生成】随 REGENERATE 任务后续接入。
 import { browser } from 'wxt/browser';
 import type { Bridge, UiEvent } from '../bridge';
 import { esc, toast, type DoubaoUi } from '../ui/root';
@@ -37,6 +37,8 @@ export interface PanelDeps {
   /** 会话操作（P1.6）：开始/恢复 与 结束——流程由 content 侧持有（含 onboarding 门槛）。 */
   onSessionStart: () => void;
   onSessionEnd: () => void;
+  /** 大纲/转写条目点击 → 播放器 seek（P1.8；同页/跨标签页路由在 content 侧）。 */
+  onSeek: (videoKey: string, timeSec: number) => void;
   /** 测试可注入的定时器。 */
   setTimeout?: typeof setTimeout;
 }
@@ -257,7 +259,10 @@ export class PanelController {
     }
 
     const outlineHtml = (s?.outline ?? [])
-      .map((o) => `<li><span class="ot">${fmtSec(o.time)}</span><span>${esc(o.text)}</span></li>`)
+      .map(
+        (o) =>
+          `<li data-sec="${Math.max(0, Math.floor(o.time))}"><span class="ot">${fmtSec(o.time)}</span><span>${esc(o.text)}</span></li>`,
+      )
       .join('');
     const sayHtml =
       s?.status === 'done' && s.evaluation
@@ -268,7 +273,7 @@ export class PanelController {
         : '';
     const trHtml = transcript
       ? `<details class="d-sec d-transcript"><summary>📄 转写节选（共 ${transcript.total} 条${transcript.total > transcript.cues.length ? `，前 ${transcript.cues.length} 条` : ''}）</summary>${transcript.cues
-          .map((c) => `<div class="tr-line"><span class="tt">[${fmtSec(c.from)}]</span><span>${esc(c.text)}</span></div>`)
+          .map((c) => `<div class="tr-line" data-sec="${Math.max(0, Math.floor(c.from))}"><span class="tt">[${fmtSec(c.from)}]</span><span>${esc(c.text)}</span></div>`)
           .join('')}</details>`
       : '';
 
@@ -284,6 +289,11 @@ export class PanelController {
       `<div class="d-foot"><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`;
 
     root.getElementById('d-back')?.addEventListener('click', () => this.#backToList());
+    // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）
+    const seekKey = item.visit.videoKey;
+    box.querySelectorAll<HTMLElement>('.d-outline li, .tr-line').forEach((el) => {
+      el.addEventListener('click', () => this.deps.onSeek(seekKey, Number(el.getAttribute('data-sec')) || 0));
+    });
     root.getElementById('d-copy')?.addEventListener('click', () => {
       const text = s?.summary ?? '';
       if (!text) return;

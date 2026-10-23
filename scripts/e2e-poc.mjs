@@ -101,6 +101,7 @@ async function main() {
     const lines = [];
     const pageSessions = new Set(); // page session（截图/探针用）
     const sessionByTarget = new Map(); // targetId → sessionId（导航/Cookie 注入用）
+    const attachedTargets = []; // P1.8：记录所有 attach 的 target URL（新标签页分支探针用）
     let swSessionId = null; // 扩展 background SW 的 session（storage 注入用，SW 重启自动更新）
     const ws = new WebSocket(ver.webSocketDebuggerUrl);
     await onceEvent(ws, 'open');
@@ -119,6 +120,7 @@ async function main() {
       if (m.method === 'Target.attachedToTarget') {
         const { sessionId, targetInfo: t } = m.params;
         sessionByTarget.set(t.targetId, sessionId);
+        attachedTargets.push({ type: t.type, url: t.url, at: Date.now() });
         if (t.type === 'service_worker' && t.url.includes('background')) swSessionId = sessionId; // SW 可能重启，始终取最新
         cdp('Runtime.enable', {}, sessionId).catch(() => {});
         if (t.type === 'page') {
@@ -340,8 +342,19 @@ async function main() {
     // 8) DOM 探针：共享 UI root 是否注入 + 面板全链（P1.5：豆包点击 → 列表 → 详情）+ P1.6 豆包交互
     let uiProbe = null;
     let mascotProbe = null;
-    const probeSid = [...pageSessions].pop();
+    let seekProbe = null; // P1.8：同页/跨页/新标签 seek 探针
+    const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
+    // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
+    const evalIn = async (sid, expression) => {
+      const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sid);
+      try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
+    };
     if (probeSid) {
+      const pageEval = (expression) => evalIn(probeSid, expression);
+      const swEval = async (expression) => {
+        const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, swSessionId);
+        try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
+      };
       let r = await cdp('Runtime.evaluate', { expression: '!!document.getElementById("doubao-ui-root")', returnByValue: true }, probeSid);
       const uiRootInjected = r?.result?.result?.value === true;
       log('DOM 探针 doubao-ui-root 存在 =', uiRootInjected);
@@ -396,19 +409,48 @@ async function main() {
           }, probeSid);
           try { uiProbe = { list, detail: JSON.parse(r?.result?.result?.value) }; } catch { uiProbe = { list }; }
           log('面板详情探针:', JSON.stringify(uiProbe.detail ?? null));
+
+          // 8.65) P1.8 同页 seek：点大纲条目 → 本页 <video>.currentTime 跳转 + toast；转写行同行为（F5/F7）
+          const seekClick = await pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            const lis = [...sr.querySelectorAll('.d-outline li[data-sec]')];
+            if (!v || !lis.length) return JSON.stringify({ err: 'no-video-or-outline' });
+            const target = lis.filter((li) => +li.getAttribute('data-sec') <= v.duration - 2).pop() ?? lis[0];
+            const sec = +target.getAttribute('data-sec');
+            target.click();
+            return JSON.stringify({ sec });
+          })()`);
+          await sleep(900);
+          const seekAfter = await pageEval(`(() => {
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify({ t: v ? +v.currentTime.toFixed(1) : -1,
+              toasts: [...sr.querySelectorAll('#toast-root .toast')].map((x) => x.textContent ?? ''),
+              panelOpen: sr.getElementById('panel')?.classList.contains('open') ?? false });
+          })()`);
+          const trClick = await pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const line = sr.querySelector('.tr-line[data-sec]');
+            if (!line) return JSON.stringify({ err: 'no-tr-line' });
+            const sec = +line.getAttribute('data-sec');
+            line.click();
+            return JSON.stringify({ sec });
+          })()`);
+          await sleep(900);
+          const trAfter = await pageEval(`(() => {
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify({ t: v ? +v.currentTime.toFixed(1) : -1,
+              toasts: [...sr.querySelectorAll('#toast-root .toast')].map((x) => x.textContent ?? '') });
+          })()`);
+          seekProbe = { outline: seekClick, after: seekAfter, tr: trClick, trAfter };
+          log('P1.8 同页 seek 探针:', JSON.stringify(seekProbe));
         } else {
           uiProbe = { list };
         }
 
         // 8.7) P1.6 豆包交互：Esc 关面板 → 拖拽（不误触面板）→ 位置持久化 → reload 还原 → 结束陪看
-        const pageEval = async (expression) => {
-          const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, probeSid);
-          try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
-        };
-        const swEval = async (expression) => {
-          const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, swSessionId);
-          try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
-        };
 
         // 关面板（Esc），模拟 60px 拖拽：pointerdown(mascot) → pointermove/up(document)
         await cdp('Runtime.evaluate', {
@@ -534,6 +576,95 @@ async function main() {
           realMouseDragNoToggle: realMouseDrag === true,
         };
         log('P1.6 豆包判定项:', JSON.stringify(mascotProbe));
+
+        // 8.9) P1.8 跨标签页：tab2（首页）开面板进详情点大纲 → background 聚焦 tab1 + 广播 SEEK_TO → tab1 播放器跳转
+        {
+          const t2 = await cdp('Target.createTarget', { url: 'https://www.bilibili.com/' });
+          const tab2TargetId = t2.result?.targetId;
+          let tab2Sid = null;
+          for (let i = 0; i < 40 && !tab2Sid; i++) { await sleep(250); tab2Sid = sessionByTarget.get(tab2TargetId) ?? null; }
+          if (!tab2Sid) throw new Error('tab2 未 attach——跨标签页 seek 无法验证');
+          await sleep(3500); // content 注入 + bridge 连接 + SESSION_STATE 回放
+          const eval2 = (expression) => evalIn(tab2Sid, expression);
+
+          // 自愈式驱动：轮询等面板开/列表渲染/详情就绪；首轮点击若落在 SESSION_STATE 回放前
+          // （走 onStartClick 分支不开面板）则回放到达后补点一次——消时序 flake（run2 教训）
+          const tab2State = () => eval2(`(() => {
+            const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+            return JSON.stringify({ open: sr?.getElementById('panel')?.classList.contains('open') ?? false,
+              items: sr?.querySelectorAll('.v-item').length ?? 0,
+              dBack: !!sr?.getElementById('d-back'),
+              secs: [...(sr?.querySelectorAll('.d-outline li') ?? [])].map((x) => x.getAttribute('data-sec')),
+              status: sr?.getElementById('p-status')?.textContent ?? '' });
+          })()`);
+          const waitState = async (pred, ms) => {
+            const t0 = Date.now();
+            let st = null;
+            for (;;) {
+              st = await tab2State();
+              if (st && pred(st)) return st;
+              if (Date.now() - t0 > ms) return st;
+              await sleep(300);
+            }
+          };
+          await eval2(`document.getElementById('doubao-ui-root')?.shadowRoot?.getElementById('mascot')?.click()`);
+          let stOpen = await waitState((s) => s.open, 2500);
+          if (!stOpen?.open) {
+            await eval2(`document.getElementById('doubao-ui-root')?.shadowRoot?.getElementById('mascot')?.click()`);
+            stOpen = await waitState((s) => s.open, 3000);
+          }
+          const stList = await waitState((s) => s.items > 0, 3000);
+          const tab2AfterOpen = { open: stOpen?.open ?? false, items: stList?.items ?? 0, status: stList?.status ?? '' };
+          await eval2(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.v-item')?.click()`);
+          const tab2AfterItem = await waitState((s) => s.dBack, 3000);
+          const li60 = await eval2(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const li = sr.querySelector('.d-outline li[data-sec="60"]');
+            if (!li) return JSON.stringify({ err: 'no-li-60', secs: [...sr.querySelectorAll('.d-outline li')].map((x) => x.getAttribute('data-sec')) });
+            li.click();
+            return JSON.stringify({ clicked: true });
+          })()`);
+          if (li60?.err) log('P1.8 tab2 诊断:', JSON.stringify({ tab2AfterOpen, tab2AfterItem }));
+          await sleep(1500); // SEEK_TO 往返 + 聚焦切换 + 目标页 seek
+          const tab1After = await pageEval(`(() => {
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify({ t: v ? +v.currentTime.toFixed(1) : -1, vis: document.visibilityState,
+              toasts: [...sr.querySelectorAll('#toast-root .toast')].map((x) => x.textContent ?? '') });
+          })()`);
+          const tab2After = await eval2(`JSON.stringify({ vis: document.visibilityState })`);
+          seekProbe = { ...(seekProbe ?? {}), crossTab: { li60, tab1After, tab2After, tab2AfterOpen, tab2AfterItem } };
+          log('P1.8 跨标签页聚焦探针:', JSON.stringify(seekProbe.crossTab));
+
+          // 8.95) P1.8 新标签页分支：tab1 离开视频页 → 无匹配标签页 → tabs.create 带 t= 参数直达
+          await cdp('Page.navigate', { url: 'https://www.bilibili.com/' }, probeSid);
+          // 轮询等 tab1 导航 commit（审查 P2-4a：固定 sleep 慢了会让 tabs.query 仍见视频页 → 误走 focus-tab）
+          for (let i = 0; i < 24; i++) {
+            const urls = await swEval(`(async () => JSON.stringify((await chrome.tabs.query({})).map((t) => t.url ?? '')))()`);
+            if (Array.isArray(urls) && !urls.some((u) => u.includes(`/video/${BVID}`))) break;
+            await sleep(250);
+          }
+          const attachedBefore = attachedTargets.length;
+          await eval2(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            sr.querySelector('.d-outline li[data-sec="120"]')?.click();
+          })()`);
+          await sleep(1500);
+          const tab2Toast = await eval2(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify([...sr.querySelectorAll('#toast-root .toast')].map((x) => x.textContent ?? ''));
+          })()`);
+          // 轮询等新 target attach（审查 P2-4b：attach 时刻 url 快照 + 固定 sleep 改带超时轮询）
+          let created = null;
+          for (let i = 0; i < 24 && !created; i++) {
+            await sleep(250);
+            created = attachedTargets.slice(attachedBefore).find(
+              (t) => t.type === 'page' && t.url.includes(`/video/${BVID}`) && t.url.includes('t=120'),
+            ) ?? null;
+          }
+          seekProbe = { ...seekProbe, newTab: { createdUrl: created?.url ?? null, tab2Toast } };
+          log('P1.8 新标签页探针:', JSON.stringify(seekProbe.newTab));
+        }
       }
     }
 
@@ -550,7 +681,7 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -585,6 +716,23 @@ async function main() {
       sessionEndGrace: mascotProbe?.endGrace === true && mascotProbe?.endSleepImg === true && mascotProbe?.endResumeBtn === true,
       bubbleSurvivesResume: mascotProbe?.bubbleSurvivesResume === true, // 旧 hide 计时器不掐死新气泡（审查 P1-1 回归）
       realMouseDragNoToggle: mascotProbe?.realMouseDragNoToggle === true, // 真鼠标拖拽含原生 click 不双触发（审查 P1-2 回归）
+      // P1.8：同页大纲 seek（±3s + toast + 面板不关）/ 转写行 seek / 跨标签页聚焦 seek / 新标签页 t= 直达
+      seekOutlineSameTab:
+        typeof seekProbe?.outline?.sec === 'number' &&
+        Math.abs((seekProbe?.after?.t ?? -99) - seekProbe.outline.sec) <= 3 &&
+        (seekProbe?.after?.toasts ?? []).some((x) => x.includes('已跳转到')) &&
+        seekProbe?.after?.panelOpen === true,
+      seekTranscriptLine:
+        typeof seekProbe?.tr?.sec === 'number' &&
+        Math.abs((seekProbe?.trAfter?.t ?? -99) - seekProbe.tr.sec) <= 3,
+      seekCrossTabFocus:
+        seekProbe?.crossTab?.li60?.clicked === true &&
+        Math.abs((seekProbe?.crossTab?.tab1After?.t ?? -99) - 60) <= 3 &&
+        seekProbe?.crossTab?.tab1After?.vis === 'visible' &&
+        seekProbe?.crossTab?.tab2After?.vis === 'hidden',
+      seekNewTab:
+        String(seekProbe?.newTab?.createdUrl ?? '').includes('t=120') &&
+        (seekProbe?.newTab?.tab2Toast ?? []).some((x) => x.includes('新标签页')),
       noExplicitFail: !lines.some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

@@ -126,8 +126,10 @@ export const UI_STYLES = `
   .d-summary .caret { display: inline-block; width: 2px; height: 12px; background: var(--blue); vertical-align: -1px; animation: caretBlink .8s step-end infinite; }
   .d-summary-empty { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text2); }
   .d-outline { list-style: none; }
-  .d-outline li { display: flex; gap: 10px; padding: 7px 8px; border-radius: 8px; font-size: 12.8px; line-height: 1.5; }
+  .d-outline li { display: flex; gap: 10px; padding: 7px 8px; border-radius: 8px; cursor: pointer; font-size: 12.8px; line-height: 1.5; transition: background .15s; }
+  .d-outline li:hover { background: #fff0f5; }
   .d-outline .ot { flex: none; color: var(--blue); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .d-outline li:hover .ot { color: var(--pink); }
   .mascot-card { background: linear-gradient(135deg,#fff9ec,#fff2f6); border: 1px solid #ffe3c2; }
   .empty-mascot { width: 72px; height: 72px; object-fit: contain; display: block; margin: 0 auto 10px; }
   .mascot-say { display: flex; gap: 10px; }
@@ -139,7 +141,8 @@ export const UI_STYLES = `
   .mascot-say-text { font-size: 12.8px; line-height: 1.75; color: #57432b; }
   .d-transcript summary { font-size: 13.5px; font-weight: 600; cursor: pointer; color: var(--text2); outline: none; }
   .d-transcript[open] summary { margin-bottom: 8px; }
-  .tr-line { display: flex; gap: 10px; font-size: 12.3px; line-height: 1.65; padding: 4px 0; color: var(--text2); }
+  .tr-line { display: flex; gap: 10px; font-size: 12.3px; line-height: 1.65; padding: 4px 0; color: var(--text2); cursor: pointer; border-radius: 6px; transition: background .15s; }
+  .tr-line:hover { background: #f6f7f9; }
   .tr-line .tt { flex: none; color: var(--text3); font-variant-numeric: tabular-nums; }
   .d-foot { display: flex; gap: 10px; margin: 14px 2px 6px; }
   .d-foot .btn { flex: 1; text-align: center; }

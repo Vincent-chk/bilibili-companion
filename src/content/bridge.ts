@@ -10,13 +10,15 @@ export type SummaryEventType =
   | 'SUMMARY_UPDATED';
 
 export interface UiEvent {
-  type: SummaryEventType | 'SESSION_STATE';
+  type: SummaryEventType | 'SESSION_STATE' | 'SEEK_TO';
   videoKey?: string;
   jobId?: string;
   stage?: string;
   progress?: number;
   deltaText?: string;
   state?: string;
+  time?: number; // SEEK_TO 目标秒（P1.8）
+  page?: number; // SEEK_TO 分P（P1.8 审查 P1-1：URL 兜底匹配须带分P，防同 bvid 异 P 误 seek）
 }
 
 export interface BridgeDeps {

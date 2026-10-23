@@ -21,6 +21,8 @@ import {
 import { browserKv } from '../src/lib/storage/browserKv';
 import { excerptOf } from '../src/content/panel/view-models';
 import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
+import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/content/seek';
+import { parseVideoKey } from '../src/lib/summarize/chain';
 
 const db = new CompanionDB();
 
@@ -170,6 +172,7 @@ interface InMsg {
   videoKey?: string;
   watchedSeconds?: number;
   progressPct?: number;
+  time?: number; // SEEK_TO 目标秒（P1.8）
   retry?: number; // SUMMARY_OPEN 用户显式重试标记（1=点击进入，可对 failed 摘要重新入队）
   llm?: ModelConfigMsg;
   asr?: ModelConfigMsg;
@@ -217,6 +220,8 @@ export default defineBackground(() => {
         return handleListQuery();
       case 'SUMMARY_OPEN':
         return handleSummaryOpen(m);
+      case 'SEEK_TO':
+        return handleSeekTo(m);
       case 'SESSION_START':
         return handleSessionStart();
       case 'SESSION_END':
@@ -463,6 +468,46 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   }
   const transcript = excerptOf(await db.transcripts.get(videoKey));
   return { ok: true, item: { visit, video, summary, job }, transcript };
+}
+
+// ---- P1.8 · 大纲 seek（SEEK_TO） ------------------------------------------------
+
+/**
+ * SEEK_TO：面板点在别的视频上（当前标签页不是目标视频）时的跨标签页路由。
+ * 同页 seek 由 content 本地完成，不会到这里。两分支：
+ *  ① 已有目标视频页标签 → 聚焦该窗口+标签，Port 广播 SEEK_TO（目标页 content 对自己的 <video> 落 seek）；
+ *  ② 没有 → 新开标签页，URL 带 B 站原生 t= 秒参数直接起播到时间点（多 P 带 p=）。
+ * tabs.query 不加 'tabs' 权限：host_permissions 已覆盖 bilibili.com，其标签页 url 可见（架构 §5 权限最小化）。
+ */
+async function handleSeekTo(m: InMsg): Promise<Record<string, unknown>> {
+  const { videoKey, time } = m;
+  if (!videoKey || typeof time !== 'number' || !Number.isFinite(time)) {
+    return { ok: false, error: 'SEEK_TO 缺 videoKey/time' };
+  }
+  let bvid: string;
+  try {
+    bvid = parseVideoKey(videoKey).bvid;
+  } catch {
+    return { ok: false, error: `videoKey 格式非法：${videoKey}` };
+  }
+  const page = (await db.videos.get(videoKey))?.page ?? 1;
+  const tabs = (await browser.tabs.query({})) as SeekTabCandidate[];
+  const tab = pickSeekTab(tabs, bvid, page);
+  if (tab?.id !== undefined) {
+    if (tab.windowId !== undefined) await browser.windows.update(tab.windowId, { focused: true });
+    await browser.tabs.update(tab.id, { active: true });
+    // 目标页自己收广播执行 seek（发起页 currentVideoKey 不匹配会忽略）；page 随广播带上——
+    // 各标签页的 URL 兜底匹配须按 bvid+分P 判定（审查 P1-1：仅比 bvid 会让同 bvid 异 P 页误 seek）
+    broadcastToUi({ type: 'SEEK_TO', videoKey, time: Math.max(0, Math.floor(time)), page });
+    // shortcut: 扩展 reload 后旧标签 content 成孤儿（URL 仍匹配）→ 聚焦成功但广播进空端口、
+    // 发起页按设计不 toast，用户见切页却无跳转；完整修需 port↔tab 映射+ack，PoC 阶段不值（审查 P2-1）
+    console.log(`[doubao] seek focus-tab: ${videoKey} → t=${Math.floor(time)}s`);
+    return { ok: true, mode: 'focus-tab' };
+  }
+  const url = buildVideoUrl(bvid, page, time);
+  await browser.tabs.create({ url });
+  console.log(`[doubao] seek new-tab: ${videoKey} → ${url}`);
+  return { ok: true, mode: 'new-tab', url };
 }
 
 // ---- P1.7 · onboarding 服务（TEST_CONNECTION / SETTINGS_SAVE） ------------------
