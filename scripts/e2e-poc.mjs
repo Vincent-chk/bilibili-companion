@@ -120,7 +120,7 @@ async function main() {
       if (m.method === 'Target.attachedToTarget') {
         const { sessionId, targetInfo: t } = m.params;
         sessionByTarget.set(t.targetId, sessionId);
-        attachedTargets.push({ type: t.type, url: t.url, at: Date.now() });
+        attachedTargets.push({ type: t.type, url: t.url, targetId: t.targetId, at: Date.now() });
         if (t.type === 'service_worker' && t.url.includes('background')) swSessionId = sessionId; // SW 可能重启，始终取最新
         cdp('Runtime.enable', {}, sessionId).catch(() => {});
         if (t.type === 'page') {
@@ -343,6 +343,7 @@ async function main() {
     let uiProbe = null;
     let mascotProbe = null;
     let seekProbe = null; // P1.8：同页/跨页/新标签 seek 探针
+    let p19Probe = null; // P1.9：浮层七准则探针（overlay/全屏/闲时/输入聚焦/跟随）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -459,7 +460,7 @@ async function main() {
         }, probeSid).catch(() => {});
         await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, probeSid).catch(() => {});
         await sleep(400);
-        const dragRes = await pageEval(`(() => {
+        const dragBefore = await pageEval(`(() => {
           const sr = document.getElementById('doubao-ui-root').shadowRoot;
           const m = sr.getElementById('mascot');
           const wrap = sr.getElementById('mascot-wrap');
@@ -469,10 +470,16 @@ async function main() {
           m.dispatchEvent(new PointerEvent('pointerdown', { clientX: x0, clientY: y0, bubbles: true }));
           document.dispatchEvent(new PointerEvent('pointermove', { clientX: x0 + 60, clientY: y0 + 20, bubbles: true }));
           document.dispatchEvent(new PointerEvent('pointerup', { clientX: x0 + 60, clientY: y0 + 20, bubbles: true }));
-          return JSON.stringify({ before, after: { left: wrap.offsetLeft, top: wrap.offsetTop },
-            vw: window.innerWidth, vh: window.innerHeight,
+          return JSON.stringify({ before, vw: window.innerWidth, vh: window.innerHeight });
+        })()`);
+        await sleep(450); // P1.9 贴边 200ms 过渡收敛后再读位置
+        const dragAfter = await pageEval(`(() => {
+          const sr = document.getElementById('doubao-ui-root').shadowRoot;
+          const wrap = sr.getElementById('mascot-wrap');
+          return JSON.stringify({ after: { left: wrap.offsetLeft, top: wrap.offsetTop },
             panelOpenAfterDrag: sr.getElementById('panel').classList.contains('open') });
         })()`);
+        const dragRes = { ...dragBefore, ...dragAfter };
         await sleep(500); // storage.set 异步落盘
         const savedPos = await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('mascotPos')).mascotPos ?? null))()`);
         log('P1.6 拖拽探针:', JSON.stringify({ dragRes, savedPos }));
@@ -539,6 +546,7 @@ async function main() {
 
         // b) 真鼠标拖拽：Input 域原生事件（含 click 派发）→ 面板不得开（P1-2 回归）
         let realMouseDrag = null;
+        let realMouseSnap = null; // P1.9 准则#1：真鼠标拖拽松手后贴右边
         {
           await cdp('Input.enable', {}, probeSid).catch(() => {});
           await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, probeSid).catch(() => {});
@@ -546,20 +554,25 @@ async function main() {
           const geo = await pageEval(`(() => {
             const sr = document.getElementById('doubao-ui-root').shadowRoot;
             const r = sr.getElementById('mascot').getBoundingClientRect();
-            return JSON.stringify({ x: r.left + 75, y: r.top + 75, left0: sr.getElementById('mascot-wrap').offsetLeft });
+            return JSON.stringify({ x: r.left + 75, y: r.top + 75, left0: sr.getElementById('mascot-wrap').offsetLeft,
+              vw: window.innerWidth });
           })()`);
           if (geo) {
+            // P1.9 起拖拽会贴边：目标按视口宽计算（vw/4，审查 P2-6①：固定 -400 只在窄视口过中线），
+            // 自右边缘向左拖过中线 → 应吸左边缘（x=4），位移断言为「换边」
+            const tx = Math.round(geo.vw * 0.25);
             await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: geo.x, y: geo.y, button: 'left', clickCount: 1 }, probeSid);
-            await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: geo.x + 70, y: geo.y + 30, button: 'left' }, probeSid);
-            await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: geo.x + 70, y: geo.y + 30, button: 'left', clickCount: 1 }, probeSid);
+            await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: tx, y: geo.y + 30, button: 'left' }, probeSid);
+            await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: tx, y: geo.y + 30, button: 'left', clickCount: 1 }, probeSid);
             await sleep(800);
             const after = await pageEval(`(() => {
               const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
               return JSON.stringify({ panelOpen: sr?.getElementById('panel')?.classList.contains('open') ?? null,
-                left: sr?.getElementById('mascot-wrap')?.offsetLeft ?? null });
+                left: sr?.getElementById('mascot-wrap')?.offsetLeft ?? null, vw: window.innerWidth });
             })()`);
-            realMouseDrag = after?.panelOpen === false && after?.left > geo.left0;
-            log('P1.6 真鼠标拖拽探针:', JSON.stringify({ geo, after, realMouseDrag }));
+            realMouseDrag = after?.panelOpen === false && after?.left !== geo.left0;
+            realMouseSnap = after?.left !== null && Math.abs(after.left - 4) <= 2; // 吸左边缘
+            log('P1.6 真鼠标拖拽探针:', JSON.stringify({ geo, after, realMouseDrag, realMouseSnap }));
           }
         }
 
@@ -574,6 +587,12 @@ async function main() {
           endResumeBtn: endProbe?.dom?.resumeBtn === true,
           bubbleSurvivesResume: bubbleSurvivesResume === true,
           realMouseDragNoToggle: realMouseDrag === true,
+          // P1.9 准则#1：合成拖拽与真鼠标拖拽松手后均吸附右边缘（x = vw-178），纵坐标保持拖拽值
+          snapEdgeDrag:
+            !!dragRes &&
+            Math.abs(dragRes.after.left - (dragRes.vw - 178)) <= 2 &&
+            dragRes.after.top === dragRes.before.top + 20 &&
+            realMouseSnap === true,
         };
         log('P1.6 豆包判定项:', JSON.stringify(mascotProbe));
 
@@ -664,6 +683,112 @@ async function main() {
           }
           seekProbe = { ...seekProbe, newTab: { createdUrl: created?.url ?? null, tab2Toast } };
           log('P1.8 新标签页探针:', JSON.stringify(seekProbe.newTab));
+
+          // 8.97) P1.9 浮层七准则探针：overlay 不推挤 / 全屏迁移 / 闲时半透明 / 输入聚焦抑制 / 上下文跟随
+          let p19 = {};
+          {
+            // tab3 = 新标签页分支直达的视频页（overlay + 全屏探针载体）
+            const tab3Sid = created?.targetId ? (sessionByTarget.get(created.targetId) ?? null) : null;
+            if (tab3Sid) {
+              const eval3 = (expression) => evalIn(tab3Sid, expression);
+              await sleep(2500); // 等 tab3 页面与播放器容器就绪
+              // (a) 准则#2 overlay 不推挤：面板开合前后页面布局度量一致
+              const metrics = `(() => JSON.stringify({ sw: document.body.scrollWidth, bw: document.body.clientWidth,
+                px: Math.round(document.querySelector('.bpx-player-container')?.getBoundingClientRect().x ?? -1) }))()`;
+              const mClosed = await eval3(metrics);
+              await eval3(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot').click()`);
+              await sleep(900);
+              const mOpen = await eval3(metrics);
+              p19 = { ...p19, overlayNoPush: { mClosed, mOpen } };
+              log('P1.9 overlay 不推挤探针:', JSON.stringify(p19.overlayNoPush));
+
+              // (b) 准则#3 全屏避让：播放器容器全屏 → Shadow 宿主迁入其子树；退出 → 迁回 documentElement
+              const rect = await eval3(`(() => {
+                const r = document.querySelector('.bpx-player-container')?.getBoundingClientRect();
+                return JSON.stringify(r ? { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) } : null);
+              })()`);
+              if (rect) {
+                await cdp('Input.enable', {}, tab3Sid).catch(() => {});
+                // 真手势（requestFullscreen 需 transient activation）；点播放器中心=播放/暂停切换，无副作用
+                await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: rect.x, y: rect.y, button: 'left', clickCount: 1 }, tab3Sid);
+                await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rect.x, y: rect.y, button: 'left', clickCount: 1 }, tab3Sid);
+                const fsReq = await eval3(`(async () => {
+                  const el = document.querySelector('.bpx-player-container');
+                  if (!el) return JSON.stringify({ err: 'no-player' });
+                  try { await el.requestFullscreen(); return JSON.stringify({ ok: true }); }
+                  catch (e) { return JSON.stringify({ err: String((e && e.name) ?? e) }); }
+                })()`);
+                await sleep(800);
+                const fsState = await eval3(`(() => {
+                  const host = document.getElementById('doubao-ui-root');
+                  return JSON.stringify({ fs: !!document.fullscreenElement,
+                    parentCls: String(host.parentElement?.className ?? host.parentElement?.tagName ?? ''),
+                    mascotVisible: !!host.shadowRoot.getElementById('mascot-wrap').getBoundingClientRect().width });
+                })()`);
+                await eval3(`(async () => { if (document.fullscreenElement) await document.exitFullscreen(); })()`);
+                await sleep(800);
+                const fsBack = await eval3(`(() => {
+                  const host = document.getElementById('doubao-ui-root');
+                  return JSON.stringify({ fs: !!document.fullscreenElement, back: host.parentElement === document.documentElement });
+                })()`);
+                p19 = { ...p19, fullscreen: { fsReq, fsState, fsBack } };
+                log('P1.9 全屏避让探针:', JSON.stringify(p19.fullscreen));
+              }
+            } else {
+              log('P1.9 探针：tab3 session 未得，overlay/全屏跳过');
+            }
+
+            // (c) 准则#1 闲时半透明：tab2 超 5s 无交互 → idle-dim；pointerenter 唤醒
+            let dim = null;
+            for (let i = 0; i < 24 && !dim?.dim; i++) {
+              dim = await eval2(`(() => JSON.stringify({ dim: document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot-wrap').classList.contains('idle-dim') }))()`);
+              if (!dim?.dim) await sleep(300);
+            }
+            await eval2(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot-wrap').dispatchEvent(new PointerEvent('pointerenter'))`);
+            await sleep(200);
+            const woke = await eval2(`(() => JSON.stringify({ dim: document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot-wrap').classList.contains('idle-dim') }))()`);
+            p19 = { ...p19, idleDim: { dimmed: dim?.dim === true, wokeAfterHover: woke?.dim === false } };
+            log('P1.9 闲时半透明探针:', JSON.stringify(p19.idleDim));
+
+            // (d) 准则#3 输入聚焦不弹：聚焦搜索框 → 结束陪看的气泡被抑制；blur 后恢复陪看气泡正常
+            const focused = await eval2(`(() => {
+              const inp = document.querySelector('.nav-search-input') || document.querySelector('#nav-searchform input') || document.querySelector('input');
+              if (!inp) return JSON.stringify({ err: 'no-input' });
+              inp.focus();
+              return JSON.stringify({ focused: document.activeElement === inp });
+            })()`);
+            await eval2(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('btn-end')?.click()`);
+            await sleep(1200); // SESSION_END 广播 + setSessionState(GRACE) 的 say 应被抑制
+            const suppressed = await eval2(`(() => JSON.stringify({ bubbleHidden: document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot-bubble').classList.contains('hidden') }))()`);
+            await eval2(`(() => { const a = document.activeElement; if (a && a.blur) a.blur(); })()`);
+            await eval2(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('btn-resume')?.click()`);
+            await sleep(1200);
+            const resumedBubble = await eval2(`(() => {
+              const b = document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot-bubble');
+              return JSON.stringify({ hidden: b.classList.contains('hidden'), text: (b.textContent ?? '').slice(0, 12) });
+            })()`);
+            p19 = { ...p19, inputFocus: { focused, suppressed, resumedBubble } };
+            log('P1.9 输入聚焦抑制探针:', JSON.stringify(p19.inputFocus));
+
+            // (e) 准则#5 上下文自动跟随：tab1 面板开着时 SPA 切另一视频 → 列表刷新新视频置顶（零生成副作用）
+            await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot').click()`);
+            await sleep(900); // tab1 面板开（列表态）
+            await pageEval(`history.pushState({}, '', '/video/BV1DUnB61ErU/')`);
+            // 轮询等跟随刷新（审查 P2-6②：固定 sleep 覆盖不了慢网下 view 真取 + LIST_QUERY 往返）
+            let follow = null;
+            for (let i = 0; i < 24 && !String(follow?.firstKey ?? '').startsWith('BV1DUnB61ErU:'); i++) {
+              await sleep(300);
+              follow = await pageEval(`(() => {
+                const sr = document.getElementById('doubao-ui-root').shadowRoot;
+                const first = sr.querySelector('.v-item');
+                return JSON.stringify({ open: sr.getElementById('panel').classList.contains('open'),
+                  firstKey: first?.getAttribute('data-video-key') ?? '', count: sr.querySelectorAll('.v-item').length });
+              })()`);
+            }
+            p19 = { ...p19, follow };
+            log('P1.9 上下文跟随探针:', JSON.stringify(p19.follow));
+          }
+          p19Probe = p19;
         }
       }
     }
@@ -681,7 +806,7 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, p19: p19Probe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -733,6 +858,26 @@ async function main() {
       seekNewTab:
         String(seekProbe?.newTab?.createdUrl ?? '').includes('t=120') &&
         (seekProbe?.newTab?.tab2Toast ?? []).some((x) => x.includes('新标签页')),
+      // P1.9 七准则：贴边收起（合成+真鼠标拖拽均吸右边）/ overlay 不推挤 / 全屏迁移 / 闲时半透明+唤醒 / 输入聚焦抑制 / 上下文跟随
+      snapEdgeDrag: mascotProbe?.snapEdgeDrag === true,
+      overlayNoPush:
+        !!p19Probe?.overlayNoPush &&
+        JSON.stringify(p19Probe.overlayNoPush.mClosed) === JSON.stringify(p19Probe.overlayNoPush.mOpen),
+      fullscreenMigration:
+        p19Probe?.fullscreen?.fsReq?.ok === true &&
+        p19Probe?.fullscreen?.fsState?.fs === true &&
+        String(p19Probe?.fullscreen?.fsState?.parentCls ?? '').includes('bpx-player-container') &&
+        p19Probe?.fullscreen?.fsState?.mascotVisible === true &&
+        p19Probe?.fullscreen?.fsBack?.back === true,
+      idleDimAndWake: p19Probe?.idleDim?.dimmed === true && p19Probe?.idleDim?.wokeAfterHover === true,
+      inputFocusSuppress:
+        p19Probe?.inputFocus?.focused?.focused === true &&
+        p19Probe?.inputFocus?.suppressed?.bubbleHidden === true &&
+        p19Probe?.inputFocus?.resumedBubble?.hidden === false,
+      contextFollowList:
+        String(p19Probe?.follow?.firstKey ?? '').startsWith('BV1DUnB61ErU:') &&
+        p19Probe?.follow?.open === true &&
+        (p19Probe?.follow?.count ?? 0) >= 2,
       noExplicitFail: !lines.some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

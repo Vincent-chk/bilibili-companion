@@ -26,8 +26,11 @@ export const UI_STYLES = `
   .hidden { display: none !important; }
   ::selection { background: #ffd9e4; }
 
-  /* ============ 豆包吉祥物（1.6：状态机切图 + CSS 动画） ============ */
-  #mascot-wrap { position: fixed; z-index: 5000; width: 170px; user-select: none; -webkit-user-select: none; }
+  /* ============ 豆包吉祥物（1.6：状态机切图 + CSS 动画；1.9：贴边/闲时半透明/全屏层级） ============ */
+  /* z-index 取 2147483000 段位（架构 §2.1）：B 站网页全屏为 CSS 全屏，靠层级保持浮层在上 */
+  #mascot-wrap { position: fixed; z-index: 2147483000; width: 170px; user-select: none; -webkit-user-select: none; transition: opacity .4s ease; }
+  #mascot-wrap.idle-dim { opacity: .6; } /* 准则#1：5s 无交互降 60% 透明 */
+  #mascot-wrap.snapping { transition: opacity .4s ease, left .2s ease, top .2s ease; } /* 准则#1：松手贴边过渡 */
   #mascot { position: relative; width: 150px; height: 150px; cursor: grab; transition: filter .2s; }
   #mascot:active { cursor: grabbing; }
   #mascot:hover { filter: drop-shadow(0 6px 16px rgba(251,114,153,.35)); }
@@ -50,7 +53,7 @@ export const UI_STYLES = `
   @keyframes caretBlink { 50% { opacity: 0; } }
 
   /* ============ 右侧面板（overlay，不推挤页面布局） ============ */
-  #panel { position: fixed; top: 0; right: 0; bottom: 0; width: 400px; background: var(--bg); z-index: 6000; display: flex; flex-direction: column; transform: translateX(105%); transition: transform .28s cubic-bezier(.22,.8,.36,1); box-shadow: -8px 0 32px rgba(0,0,0,.12); }
+  #panel { position: fixed; top: 0; right: 0; bottom: 0; width: 400px; background: var(--bg); z-index: 2147483100; display: flex; flex-direction: column; transform: translateX(105%); transition: transform .28s cubic-bezier(.22,.8,.36,1); box-shadow: -8px 0 32px rgba(0,0,0,.12); }
   #panel.open { transform: translateX(0); }
   .p-head { background: #fff; padding: 14px 16px 12px; border-bottom: 1px solid var(--line); flex: none; }
   .p-head-row { display: flex; align-items: center; gap: 10px; }
@@ -172,7 +175,7 @@ export const UI_STYLES = `
   .rule-box b { color: var(--text); }
 
   /* ============ 弹窗 ============ */
-  #modal-root { position: fixed; inset: 0; z-index: 7000; display: none; align-items: center; justify-content: center; background: rgba(15,17,26,.5); backdrop-filter: blur(2px); animation: fadeIn .2s ease; }
+  #modal-root { position: fixed; inset: 0; z-index: 2147483200; display: none; align-items: center; justify-content: center; background: rgba(15,17,26,.5); backdrop-filter: blur(2px); animation: fadeIn .2s ease; }
   #modal-root.show { display: flex; }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   .modal { width: 480px; max-width: calc(100vw - 48px); max-height: calc(100vh - 80px); background: #fff; border-radius: 16px; box-shadow: var(--shadow-lg); overflow-y: auto; animation: modalIn .25s cubic-bezier(.22,.8,.36,1); }
@@ -196,7 +199,7 @@ export const UI_STYLES = `
   .test-status.err { color: #ef4444; }
 
   /* ============ Toast ============ */
-  #toast-root { position: fixed; left: 50%; bottom: 42px; transform: translateX(-50%); z-index: 9999; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
+  #toast-root { position: fixed; left: 50%; bottom: 42px; transform: translateX(-50%); z-index: 2147483300; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
   .toast { background: rgba(24,25,28,.88); color: #fff; font-size: 13px; padding: 9px 18px; border-radius: 99px; box-shadow: var(--shadow-lg); animation: toastIn .25s ease; max-width: 70vw; text-align: center; backdrop-filter: blur(4px); }
   .toast.out { animation: toastOut .3s ease forwards; }
   @keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }

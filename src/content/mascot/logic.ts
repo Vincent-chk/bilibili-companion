@@ -55,3 +55,70 @@ export function typeDelay(text: string, totalMs: number): number {
 
 /** 气泡默认驻留（F3：打字机 + 5s 自动消失）。 */
 export const BUBBLE_MS = 5000;
+
+// ---- P1.9 · 浮层七准则纯逻辑（对标调研 05 §1.2，单测覆盖） ----
+
+/** 准则 #1 闲时半透明：无交互 N 毫秒后降透明度。 */
+export const IDLE_DIM_MS = 5000;
+
+/** 准则 #4 克制提醒：同 kind 气泡限频窗口（≤1 次/10min）。 */
+export const BUBBLE_RATE_WINDOW_MS = 10 * 60 * 1000;
+
+/** 同 kind 气泡在限频窗口内已出现过 → 本次跳过（lastAt 为 undefined=从未出现，不跳）。 */
+export function bubbleThrottled(lastAt: number | undefined, now: number, windowMs = BUBBLE_RATE_WINDOW_MS): boolean {
+  return lastAt !== undefined && now - lastAt < windowMs;
+}
+
+/**
+ * 准则 #1 拖拽贴边收起：松手后吸附到最近横边（左=4 / 右=钳位上界），纵坐标保持。
+ * 以立绘中心与视口中线比较选边。
+ */
+export function snapToEdge(x: number, y: number, vw: number, vh: number): { x: number; y: number } {
+  const right = Math.max(4, vw - MASCOT_WRAP_W - 8);
+  const left = 4;
+  const centerX = x + MASCOT_WRAP_W / 2;
+  return { x: centerX < vw / 2 ? left : right, y: clampMascotPos(x, y, vw, vh).y };
+}
+
+/** 最小可交互 activeElement 面（document/shadowRoot 同构），便于单测注入。 */
+export interface ActiveElementLike {
+  tagName?: string;
+  isContentEditable?: boolean;
+  shadowRoot?: { activeElement?: ActiveElementLike | null } | null;
+}
+
+/**
+ * 准则 #3 输入聚焦不弹气泡：焦点在输入框/可编辑区（含 Shadow DOM 内——本扩展自己的
+ * onboarding/设置输入也计入）时抑制气泡。逐层 shadowRoot 下钻。
+ */
+export function isTypingTarget(active: ActiveElementLike | null | undefined): boolean {
+  let cur = active ?? null;
+  for (let depth = 0; cur && depth < 8; depth++) {
+    const tag = (cur.tagName ?? '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || cur.isContentEditable) return true;
+    cur = cur.shadowRoot?.activeElement ?? null;
+  }
+  return false;
+}
+
+/**
+ * 准则 #3 全屏避让：浏览器全屏时 Shadow 宿主需迁入全屏元素子树（否则被全屏层遮挡）；
+ * 退出全屏迁回 documentElement。返回应挂载的父节点；null=无需迁移。
+ * 网页全屏（B 站 CSS 全屏）不走 Fullscreen API，靠 z-index 2147483000 段位保持在上层。
+ */
+export function fullscreenHostParent(
+  fullscreenElement: Element | null,
+  host: Element,
+  documentElement: Element,
+): Element | null {
+  if (fullscreenElement) {
+    // 原生 <video> 全屏：宿主挂进 video 子树会成为 fallback content 不渲染（审查 P2-2）→ 改挂其父
+    const target =
+      (fullscreenElement as Element & { tagName?: string }).tagName === 'VIDEO'
+        ? fullscreenElement.parentElement
+        : fullscreenElement;
+    if (!target) return null;
+    return target.contains(host) ? null : target;
+  }
+  return host.parentElement === documentElement || host.parentElement === null ? null : documentElement;
+}

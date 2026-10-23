@@ -205,6 +205,20 @@ export default defineBackground(() => {
       .catch(() => {});
   });
 
+  // P1.9 · SPA 路由探测主路（架构 §3.1）：B 站真 SPA 切换走主世界 pushState，content 孤立世界的
+  // history 补丁拦不到（E2E 实测 follow 失效揪出）→ webNavigation.onHistoryStateUpdated 由 SW 侧
+  // 感知并经 tabs.sendMessage 通知该标签页 content 重新识别（popstate/补丁仅作兜底）。
+  // 不按 /video/ 过滤 URL（审查 P1-1）：「离开视频页」的路由同样必须送达——content 的
+  // startWatcher(null) 负责 dispose 旧会话并作废在途 VIDEO_ENTER 应答，否则代数令牌不失效、
+  // 首页 feed 预览 <video> 会被绑进旧视频的观看计时（真实 LLM 费用+脏数据）。
+  browser.webNavigation.onHistoryStateUpdated.addListener((d) => {
+    if (d.frameId !== 0) return;
+    const url = (d as { url?: string }).url ?? '';
+    void browser.tabs
+      .sendMessage(d.tabId, { type: 'ROUTE_CHANGED', url })
+      .catch(() => {}); // 标签页无 content（非匹配页/未注入）静默
+  });
+
   browser.runtime.onMessage.addListener((msg: unknown) => {
     const m = msg as InMsg;
     switch (m?.type) {

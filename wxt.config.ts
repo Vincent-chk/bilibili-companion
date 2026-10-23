@@ -15,7 +15,7 @@ export default defineConfig({
   manifest: {
     name: '豆包陪看助手（PoC）',
     description: 'Phase 0 PoC：B 站视频识别 + 字幕直取 + LLM 摘要 console 打印',
-    permissions: ['storage', 'offscreen'],
+    permissions: ['storage', 'offscreen', 'webNavigation'], // webNavigation：P1.9 起 SPA 路由探测（onHistoryStateUpdated，架构 §3.1 主路）
     host_permissions: [
       '*://*.bilibili.com/*',
       '*://*.hdslb.com/*',

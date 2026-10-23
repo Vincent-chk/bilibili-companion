@@ -14,6 +14,7 @@ import { openOnboarding } from '../src/content/onboarding/onboarding';
 import { PanelController } from '../src/content/panel/panel';
 import { fmtSec } from '../src/content/panel/view-models';
 import { shouldConsumeSeek } from '../src/content/seek';
+import { setupFullscreenMigration } from '../src/content/ui/fullscreen';
 import { mountDoubaoUi, toast } from '../src/content/ui/root';
 import { WatchSession, findVideoElement } from '../src/content/watcher/dom';
 
@@ -63,13 +64,14 @@ export default defineContentScript({
       }
       panel?.handleEvent(e);
       if (e.type === 'SESSION_STATE' && e.state) mascot?.setSessionState(e.state as UiSessionState);
-      // 记完/失败的表情反馈只在激活期（睡觉时不吵醒，F3 克制语义）
+      // 记完/失败的表情反馈只在激活期（睡觉时不吵醒，F3 克制语义）；
+      // kind 供 P1.9 准则#4 同类气泡 10min 限频（连看多视频不轰炸）
       if (mascot?.session === 'ACTIVE') {
         if (e.type === 'SUMMARY_DONE') {
           mascot.pulse('happy', 9000);
-          void mascot.say('写完啦！点我看笔记 📖', 9000);
+          void mascot.say('写完啦！点我看笔记 📖', 9000, 'done');
         } else if (e.type === 'SUMMARY_FAILED') {
-          void mascot.say('有个视频没记完…点开看看');
+          void mascot.say('有个视频没记完…点开看看', 5000, 'failed');
         }
       }
     });
@@ -129,20 +131,45 @@ export default defineContentScript({
       onSeek: (videoKey, timeSec) => void handleSeekRequest(videoKey, timeSec),
     });
 
+    // P1.9 准则#3：浏览器全屏时把 Shadow 宿主迁入全屏元素子树（退出迁回）
+    setupFullscreenMigration(document, ui.host);
+    // P1.9 准则#5：VIDEO_ENTER 解析出当前视频后通知面板跟随（startWatcher 在模块层回调）
+    onVideoKeyResolved = (videoKey) => panel?.followVideo(videoKey);
+
     bridge.connect(); // 连接后 SW 回放 SESSION_STATE → 豆包按当前会话态初始化表情/气泡
 
     report(detectBvid(location.href));
 
-    // B 站是 SPA：路由变化不重载页面，监听 history API + popstate 重新识别。
-    let last = location.href;
-    const onRoute = () => {
-      if (location.href !== last) {
-        last = location.href;
-        report(detectBvid(location.href));
+    // B 站是 SPA：路由变化不重载页面。主路=SW webNavigation.onHistoryStateUpdated → ROUTE_CHANGED
+    // （B 站真 SPA 的 pushState 发生在主世界，content 孤立世界的 history 补丁拦不到——P1.9 E2E 实测）；
+    // popstate 与 history 补丁仅作兜底（后退/前进、孤立世界内的调用）。
+    // 去重键= bvid+分P（审查 P2-1）：同视频 ?t=/?spm 类 replaceState 不重建 watcher
+    // （否则内存 watchedMs 归零、20s 触发被无限推迟）；非视频页按整 URL。
+    const routeKey = (href: string): string => {
+      const bvid = detectBvid(href);
+      if (!bvid) return href;
+      try {
+        return `${bvid}:p${new URL(href).searchParams.get('p') ?? 1}`;
+      } catch {
+        return href;
       }
     };
-    window.addEventListener('popstate', onRoute);
-    patchHistoryPushState(onRoute);
+    let lastKey = routeKey(location.href);
+    const onRoute = (url?: string) => {
+      const href = url ?? location.href;
+      const key = routeKey(href);
+      if (key === lastKey) return;
+      lastKey = key;
+      report(detectBvid(href));
+    };
+    window.addEventListener('popstate', () => onRoute());
+    patchHistoryPushState(() => onRoute());
+    browser.runtime.onMessage.addListener((m: unknown) => {
+      const msg = m as { type?: string; url?: string };
+      if (msg?.type !== 'ROUTE_CHANGED' || !msg.url) return undefined;
+      onRoute(msg.url);
+      return undefined;
+    });
 
     console.log('[doubao-poc] content script injected:', location.href);
   },
@@ -166,6 +193,8 @@ let watchSession: WatchSession | null = null;
 let watchGen = 0;
 /** 本页当前视频的 videoKey（VIDEO_ENTER 成功才有值；P1.8 seek 同页判定与广播匹配用）。 */
 let currentVideoKey: string | null = null;
+/** P1.9 准则#5：main() 注入——VIDEO_ENTER 解析成功后通知面板上下文跟随。 */
+let onVideoKeyResolved: ((videoKey: string) => void) | null = null;
 
 async function startWatcher(bvid: string | null): Promise<void> {
   const gen = ++watchGen;
@@ -188,6 +217,7 @@ async function startWatcher(bvid: string | null): Promise<void> {
     if (!r?.ok || !r.videoKey) return;
     const { videoKey, duration = 0, triggerSeconds = 20 } = r;
     currentVideoKey = videoKey;
+    onVideoKeyResolved?.(videoKey); // 准则#5：面板开着则跟随当前视频卡片
     watchSession = new WatchSession({
       videoKey,
       durationSec: duration,
@@ -203,7 +233,7 @@ async function startWatcher(bvid: string | null): Promise<void> {
             const res = r2 as { ok?: boolean; deduped?: boolean } | undefined;
             if (res?.ok && !res.deduped && mascot?.session === 'ACTIVE') {
               mascot.setState('note');
-              void mascot.say('开始偷偷记笔记啦～', 4200);
+              void mascot.say('开始偷偷记笔记啦～', 4200, 'note'); // kind=note：准则#4 限频
             }
           })
           .catch(() => {});

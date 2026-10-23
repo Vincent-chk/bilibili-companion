@@ -4,11 +4,15 @@
 import type { DoubaoUi } from '../ui/root';
 import {
   BUBBLE_MS,
+  IDLE_DIM_MS,
+  bubbleThrottled,
   clampMascotPos,
   defaultMascotPos,
   fromRelative,
   isDragMoved,
+  isTypingTarget,
   mascotStateForSession,
+  snapToEdge,
   toRelative,
   typeDelay,
   type MascotState,
@@ -42,6 +46,10 @@ export class MascotController {
   #typeTimer: ReturnType<typeof setInterval> | null = null;
   #hideTimer: unknown = null;
   #pulseTimer: unknown = null;
+  /** P1.9 准则#1：闲时半透明计时；#4：同 kind 气泡限频记录。 */
+  #idleTimer: unknown = null;
+  #snapTimer: unknown = null;
+  readonly #lastKindAt = new Map<string, number>();
   readonly #el: {
     wrap: HTMLElement;
     mascot: HTMLElement;
@@ -78,6 +86,31 @@ export class MascotController {
     this.#applyPos(defaultMascotPos(this.#viewport().vw, this.#viewport().vh));
     void this.#restorePos();
     this.#bindDrag();
+    // P1.9 准则#1：hover/按压即恢复全透明并重计闲时
+    wrap.addEventListener('pointerenter', () => this.#wake());
+    wrap.addEventListener('pointerdown', () => this.#wake());
+    this.#armIdle();
+  }
+
+  /** 准则#1：任何「豆包在活动/被交互」的信号都唤醒（去半透明）并重计闲时计时。 */
+  #wake(): void {
+    this.#el.wrap.classList.remove('idle-dim');
+    this.#armIdle();
+    // 审查 P2-3：常驻开始 CTA 曾被输入聚焦抑制且未再触发 → 唤醒时补一次（INACTIVE 且气泡空）
+    if (this.#session === 'INACTIVE' && this.#el.bubble.classList.contains('hidden')) this.showStartBubble();
+  }
+
+  #armIdle(): void {
+    if (this.#idleTimer !== null) this.#timers.clearTimeout(this.#idleTimer);
+    this.#idleTimer = this.#timers.setTimeout(() => {
+      this.#idleTimer = null;
+      // 审查 P2-4：气泡展示中不降透明（用户正在读的通知不该自己变淡），改重计等气泡消失
+      if (!this.#el.bubble.classList.contains('hidden')) {
+        this.#armIdle();
+        return;
+      }
+      this.#el.wrap.classList.add('idle-dim');
+    }, IDLE_DIM_MS);
   }
 
   #viewport(): { vw: number; vh: number } {
@@ -120,6 +153,7 @@ export class MascotController {
   pulse(st: MascotState, ms = 4200): void {
     if (this.#pulseTimer !== null) this.#timers.clearTimeout(this.#pulseTimer);
     this.setState(st);
+    this.#wake(); // 准则#1：豆包有动作=非闲时
     this.#pulseTimer = this.#timers.setTimeout(() => {
       this.#pulseTimer = null;
       if (this.#state === st) this.setState('idle');
@@ -129,9 +163,18 @@ export class MascotController {
   /**
    * 气泡（打字机 + 自动消失）。队列语义=后到覆盖（原型 mascotSay：新消息打断旧消息），
    * 常驻气泡（开始陪看）与普通气泡互斥。settings.bubbles=false 时静默跳过（F3）。
+   * P1.9 准则#3：页面输入框聚焦时不弹；准则#4：同 kind（事件类气泡）10min 限频——
+   * kind 缺省=用户动作直接后果（开始/结束/恢复），不限频。
    */
-  async say(text: string, ms = BUBBLE_MS): Promise<void> {
+  async say(text: string, ms = BUBBLE_MS, kind?: string): Promise<void> {
     if (!(await this.deps.bubblesEnabled())) return;
+    if (isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
+    if (kind) {
+      const now = Date.now();
+      if (bubbleThrottled(this.#lastKindAt.get(kind), now)) return;
+      this.#lastKindAt.set(kind, now);
+    }
+    this.#wake();
     this.#stopTimers();
     const b = this.#el.bubble;
     b.classList.remove('hidden');
@@ -156,8 +199,13 @@ export class MascotController {
     }, ms);
   }
 
-  /** 常驻「开始陪看」按钮气泡（未激活态，F1）。 */
+  /** 常驻「开始陪看」按钮气泡（未激活态，F1）。准则#3 输入聚焦不弹；准则#4 以 kind='start' 限频（重连回放不轰炸）。 */
   showStartBubble(): void {
+    if (isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
+    const now = Date.now();
+    if (bubbleThrottled(this.#lastKindAt.get('start'), now)) return;
+    this.#lastKindAt.set('start', now);
+    this.#wake();
     this.#stopTimers();
     const b = this.#el.bubble;
     b.classList.remove('hidden');
@@ -234,7 +282,17 @@ export class MascotController {
       lastPointerClickAt = Date.now();
       if (moved) {
         const { vw, vh } = this.#viewport();
-        void this.deps.storage.set('mascotPos', toRelative(this.#el.wrap.offsetLeft, this.#el.wrap.offsetTop, vw, vh));
+        // 准则#1 贴边收起：松手吸附最近横边（.snapping 给 200ms 过渡），落盘吸附后坐标
+        const snapped = snapToEdge(this.#el.wrap.offsetLeft, this.#el.wrap.offsetTop, vw, vh);
+        this.#el.wrap.classList.add('snapping');
+        this.#applyPos(snapped);
+        if (this.#snapTimer !== null) this.#timers.clearTimeout(this.#snapTimer);
+        this.#snapTimer = this.#timers.setTimeout(() => {
+          this.#snapTimer = null;
+          this.#el.wrap.classList.remove('snapping');
+        }, 250);
+        void this.deps.storage.set('mascotPos', toRelative(snapped.x, snapped.y, vw, vh));
+        this.#wake();
       } else {
         this.#onClick();
       }

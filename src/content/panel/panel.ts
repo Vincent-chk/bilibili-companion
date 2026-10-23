@@ -53,6 +53,8 @@ export class PanelController {
   /** 当前详情的流式累计（LLM 原始 JSON token 流）。 */
   #stream: { videoKey: string; acc: string; stage?: string } | null = null;
   #refreshTimer: unknown = null;
+  /** 路由代数：followVideo 递增，作废在途 #openDetail 应答（审查 P2-5）。 */
+  #routeGen = 0;
 
   readonly #setTimeout: (cb: () => void, ms?: number) => unknown;
 
@@ -87,6 +89,21 @@ export class PanelController {
   close(): void {
     this.#open = false;
     this.deps.ui.root.getElementById('panel')?.classList.remove('open');
+  }
+
+  /**
+   * P1.9 准则#5 上下文自动跟随：SPA 切视频后若面板开着，刷新为当前视频卡片。
+   * 详情态且目标变化 → 回列表刷新（新视频置顶）；不自动开详情/不触发生成（零副作用跟随）。
+   */
+  followVideo(videoKey: string): void {
+    if (!this.#open || !videoKey) return;
+    this.#routeGen += 1; // 作废在途 #openDetail 应答（审查 P2-5 竞态）
+    if (this.#view === 'detail' && this.#detailKey !== videoKey) {
+      this.#view = 'list';
+      this.#detailKey = null;
+      this.#stream = null;
+    }
+    void this.refresh();
   }
 
   /** LIST_QUERY → 渲染当前视图。 */
@@ -201,12 +218,15 @@ export class PanelController {
   // ---- 详情 ----
 
   async #openDetail(videoKey: string, opts: { userClick?: boolean } = {}): Promise<void> {
+    const gen = this.#routeGen;
     try {
       const r = await this.deps.bridge.request<SummaryOpenResponse>({
         type: 'SUMMARY_OPEN',
         videoKey,
         ...(opts.userClick ? { retry: 1 } : {}),
       });
+      // 在途应答落地前路由已切（followVideo 递增代数）→ 作废，避免视图被旧视频详情抢回（审查 P2-5）
+      if (gen !== this.#routeGen) return;
       if (!r?.ok || !r.item) {
         toast(this.deps.ui, '打开摘要失败，稍后再试');
         return;
@@ -217,6 +237,7 @@ export class PanelController {
       this.#stream = isJobActive(r.item.job) && r.item.job?.status !== 'need_confirm' ? { videoKey, acc: '' } : null;
       this.#renderDetail(r.item, r.transcript);
     } catch {
+      if (gen !== this.#routeGen) return;
       toast(this.deps.ui, '打开摘要失败，稍后再试');
     }
   }
