@@ -114,6 +114,13 @@ async function main() {
         ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
         setTimeout(() => { if (pending.has(id)) { pending.delete(id); res({ error: { message: `${method} timeout` } }); } }, 30_000);
       });
+    // 视觉验收命名截图（终验留证：关键屏幕逐张归档到 e2e-artifacts/visual-*.png）
+    const shotNamed = async (sid, name) => {
+      try {
+        const r = await cdp('Page.captureScreenshot', { format: 'png' }, sid);
+        if (r?.result?.data) fs.writeFileSync(path.join(ROOT, 'e2e-artifacts', name), Buffer.from(r.result.data, 'base64'));
+      } catch { /* 截图失败不阻断流程 */ }
+    };
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
       if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
@@ -243,6 +250,7 @@ async function main() {
       }, landingSid);
       try { onboardingProbe.modal = JSON.parse(modalOpen?.result?.result?.value); } catch { onboardingProbe.modal = null; }
       log('P1.7 弹窗探针:', JSON.stringify(onboardingProbe.modal));
+      await shotNamed(landingSid, 'visual-onboarding-modal.png'); // 视觉验收：onboarding 弹窗（S1）
 
       // 空保存 → 三项标红 + 不落任何配置
       await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-save").click()', returnByValue: true }, landingSid);
@@ -393,6 +401,7 @@ async function main() {
         })()`);
         if (!String(failDetail?.errText ?? '').includes('需要登录')) await sleep(500);
       }
+      await shotNamed(landingSid, 'visual-login-card.png'); // 视觉验收：未登录引导卡+红徽章+详情错误文案（F11）
       await evL(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('d-back')?.click()`);
       await sleep(400);
       await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, landingSid);
@@ -489,6 +498,7 @@ async function main() {
         let list = {};
         try { list = JSON.parse(r?.result?.result?.value); } catch { /* 保持空 */ }
         log('面板列表探针:', JSON.stringify(list));
+        await shotNamed(probeSid, 'visual-panel-list.png'); // 视觉验收：陪看列表（S4）
 
         if (list.count >= 1) {
           await cdp('Runtime.evaluate', {
@@ -514,6 +524,7 @@ async function main() {
           }, probeSid);
           try { uiProbe = { list, detail: JSON.parse(r?.result?.result?.value) }; } catch { uiProbe = { list }; }
           log('面板详情探针:', JSON.stringify(uiProbe.detail ?? null));
+          await shotNamed(probeSid, 'visual-panel-detail.png'); // 视觉验收：摘要详情（S5）
 
           // 8.65) P1.8 同页 seek：点大纲条目 → 本页 <video>.currentTime 跳转 + toast；转写行同行为（F5/F7）
           const seekClick = await pageEval(`(() => {
@@ -590,6 +601,10 @@ async function main() {
           })()`);
           seekProbe = { ...seekProbe, segment: { segBefore, segNote, segAfter, segCollapsed, segReopened, offscreenSegBefore, offscreenSegAfter, segDb } };
           log('P1.11 分段解读探针:', JSON.stringify(seekProbe.segment));
+          // 视觉验收：分段解读内联注记卡展开态（S10）——注记卡滚到视口中央后截图
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]')?.scrollIntoView({ block: 'center' })`);
+          await sleep(300);
+          await shotNamed(probeSid, 'visual-segment-note.png');
         } else {
           uiProbe = { list };
         }
@@ -868,6 +883,7 @@ async function main() {
                     parentCls: String(host.parentElement?.className ?? host.parentElement?.tagName ?? ''),
                     mascotVisible: !!host.shadowRoot.getElementById('mascot-wrap').getBoundingClientRect().width });
                 })()`);
+                await shotNamed(tab3Sid, 'visual-fullscreen.png'); // 视觉验收：全屏态豆包/面板迁入播放器层
                 await eval3(`(async () => { if (document.fullscreenElement) await document.exitFullscreen(); })()`);
                 await sleep(800);
                 const fsBack = await eval3(`(() => {
