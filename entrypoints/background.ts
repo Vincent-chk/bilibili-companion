@@ -112,6 +112,15 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
       // 面板推送：补 videoKey（offscreen 只知道 jobId），deltaText 驱动详情流式打字
       broadcastToUi({ ...m, type: 'SUMMARY_PROGRESS', videoKey: job.videoKey });
     }
+    // P1.11：分段解读流式增量 → SEGMENT_NOTE_STREAM（补 videoKey/segIndex，面板内联卡片打字机）
+    if (m?.type === 'SEGMENT_PROGRESS' && m.jobId === job.id && m.deltaText) {
+      broadcastToUi({
+        type: 'SEGMENT_NOTE_STREAM',
+        videoKey: job.videoKey,
+        segIndex: job.segIndex,
+        deltaText: m.deltaText,
+      });
+    }
   };
   browser.runtime.onMessage.addListener(onProgress);
   let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -123,7 +132,12 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
     const persona = ((await browser.storage.local.get('settings'))['settings'] as { persona?: string } | undefined)
       ?.persona;
     const reply = (await Promise.race([
-      sendToOffscreen({ type: 'OFFSCREEN_RUN_JOB', job: { id: job.id, videoKey: job.videoKey }, llm: config, persona }),
+      sendToOffscreen({
+        type: 'OFFSCREEN_RUN_JOB',
+        job: { id: job.id, videoKey: job.videoKey, type: job.type, segIndex: job.segIndex },
+        llm: config,
+        persona,
+      }),
       new Promise<never>((_, rej) => {
         watchdog = setTimeout(() => rej(new Error('offscreen 执行超时(600s)')), 600_000);
       }),
@@ -155,6 +169,11 @@ const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
     // 纯进度写回状态不变不广播（进度走 SUMMARY_PROGRESS 通道）
     if (lastLoggedStatus.get(j.id) !== j.status) {
       lastLoggedStatus.set(j.id, j.status);
+      // P1.11：分段解读任务走独立终态通道（不得触发 SUMMARY_DONE 的 happy 气泡/列表刷新语义）
+      if (j.type === 'SEGMENT_ANALYZE') {
+        if (j.status === 'done' || j.status === 'failed') void broadcastSegmentTerminal(j);
+        return;
+      }
       const t =
         j.status === 'done' ? 'SUMMARY_DONE'
         : j.status === 'failed' ? 'SUMMARY_FAILED'
@@ -165,6 +184,24 @@ const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   },
 });
 
+/** SEGMENT_NOTE_DONE/FAILED：终态注记文本/错误从 summaries.segmentNotes 读回随广播下发（面板免再请求）。 */
+async function broadcastSegmentTerminal(j: JobRow): Promise<void> {
+  try {
+    const row = await latestSummary(j.videoKey);
+    const note = j.segIndex !== undefined ? row?.segmentNotes?.[j.segIndex] : undefined;
+    broadcastToUi({
+      type: j.status === 'done' ? 'SEGMENT_NOTE_DONE' : 'SEGMENT_NOTE_FAILED',
+      videoKey: j.videoKey,
+      segIndex: j.segIndex,
+      text: note?.text ?? '',
+      error: note?.error,
+      truncated: note?.truncated,
+    });
+  } catch {
+    /* 广播失败不影响队列 */
+  }
+}
+
 interface InMsg {
   type?: string;
   bvid?: string | null;
@@ -173,6 +210,7 @@ interface InMsg {
   watchedSeconds?: number;
   progressPct?: number;
   time?: number; // SEEK_TO 目标秒（P1.8）
+  segIndex?: number; // SEGMENT_NOTE_OPEN 段下标（P1.11）
   force?: number; // LOGIN_CHECK 强制绕过 30s 缓存（P1.10：面板打开时机）
   retry?: number; // SUMMARY_OPEN 用户显式重试标记（1=点击进入，可对 failed 摘要重新入队）
   llm?: ModelConfigMsg;
@@ -241,6 +279,8 @@ export default defineBackground(() => {
         return handleSummaryOpen(m);
       case 'SEEK_TO':
         return handleSeekTo(m);
+      case 'SEGMENT_NOTE_OPEN':
+        return handleSegmentNoteOpen(m);
       case 'LOGIN_CHECK':
         return handleLoginCheck(m);
       case 'SESSION_START':
@@ -531,6 +571,59 @@ async function handleSeekTo(m: InMsg): Promise<Record<string, unknown>> {
   await browser.tabs.create({ url });
   console.log(`[doubao] seek new-tab: ${videoKey} → ${url}`);
   return { ok: true, mode: 'new-tab', url };
+}
+
+// ---- P1.11 · F13 分段解读（SEGMENT_NOTE_OPEN） ---------------------------------
+
+/** 活动中的分段解读任务（同 videoKey+segIndex）。 */
+async function activeSegmentJob(videoKey: string, segIndex: number): Promise<JobRow | undefined> {
+  const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
+  return rows.find(
+    (j) => j.type === 'SEGMENT_ANALYZE' && j.segIndex === segIndex && ACTIVE_JOB_STATUSES.includes(j.status),
+  );
+}
+
+/**
+ * SEGMENT_NOTE_OPEN（架构 §4.4）：命中 segmentNotes done 缓存 → 直接返回（零 LLM 请求）；
+ * 未命中 → 建 SEGMENT_ANALYZE job（pipeline 串行）→ 流式经 SEGMENT_NOTE_STREAM/DONE/FAILED 回流。
+ * 重试口径同 SUMMARY_OPEN（F11）：failed 注记仅 retry=1（用户显式点击）重排；
+ * streaming 注记但无活动 job（SW 中途死亡残留）→ 点击即重建自愈。
+ */
+async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>> {
+  const { videoKey, segIndex, retry } = m;
+  if (!videoKey || typeof segIndex !== 'number' || !Number.isInteger(segIndex) || segIndex < 0) {
+    return { ok: false, error: 'SEGMENT_NOTE_OPEN 缺 videoKey/segIndex' };
+  }
+  const summary = await latestSummary(videoKey);
+  if (!summary || summary.status !== 'done' || !summary.outline?.length || segIndex >= summary.outline.length) {
+    return { ok: false, error: 'NO_OUTLINE' }; // 无大纲（含无字幕未确认）→ 入口本不应出现
+  }
+  const cached = summary.segmentNotes?.[segIndex];
+  const active = await activeSegmentJob(videoKey, segIndex);
+  if (cached?.status === 'done' && !active) {
+    console.log(`[doubao] segment note cache hit: ${videoKey}#${segIndex}`);
+    return { ok: true, note: cached, cacheHit: true };
+  }
+  if (!active) {
+    const allow =
+      cached === undefined ||
+      cached.status === 'streaming' || // 残留 streaming（SW 死亡）→ 点击重建
+      (cached.status === 'failed' && retry === 1); // 用户显式重试
+    if (allow) {
+      const pointer = await getSessionPointer(browserKv);
+      await pipeline.enqueue({
+        type: 'SEGMENT_ANALYZE',
+        videoKey,
+        sessionId: pointer?.sessionId ?? 'no-session',
+        segIndex,
+      });
+      void pipeline.drain();
+      // 审查 P1-1：本次入了队就回合成 streaming 占位（started 标记让面板清空旧增量残留）——
+      // 若回旧 failed 注记，面板会把重试的流式占位覆盖回失败卡并丢弃全部增量（「重试秒败」假象）
+      return { ok: true, note: { text: '', status: 'streaming', createdAt: Date.now() }, started: true };
+    }
+  }
+  return { ok: true, note: cached ?? { text: '', status: 'streaming', createdAt: Date.now() } };
 }
 
 // ---- P1.10 · 登录态检测与引导（架构 §3.9） ------------------------------------

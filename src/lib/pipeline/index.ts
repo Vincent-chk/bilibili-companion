@@ -51,15 +51,21 @@ export class Pipeline {
   }
 
   /**
-   * 入队。幂等：同 videoKey+type 已有活动任务（pending/running/need_confirm）时返回现有行，
-   * 不重复建（20s 触发与按需打开并发、双标签页并发触发均在此收口）。'rw' 事务封查后写竞态。
+   * 入队。幂等：同 videoKey+type(+segIndex) 已有活动任务（pending/running/need_confirm）时返回现有行，
+   * 不重复建（20s 触发与按需打开并发、双标签页并发触发均在此收口；F13 同视频不同段互不去重）。
+   * 'rw' 事务封查后写竞态。
    */
-  async enqueue(input: { type: JobType; videoKey: string; sessionId: string }): Promise<JobRow> {
+  async enqueue(input: { type: JobType; videoKey: string; sessionId: string; segIndex?: number }): Promise<JobRow> {
     return this.#db.transaction('rw', this.#db.jobs, async () => {
       const active = await this.#db.jobs
         .where('videoKey')
         .equals(input.videoKey)
-        .filter((j) => j.type === input.type && ACTIVE_STATUSES.includes(j.status))
+        .filter(
+          (j) =>
+            j.type === input.type &&
+            (j.segIndex ?? null) === (input.segIndex ?? null) &&
+            ACTIVE_STATUSES.includes(j.status),
+        )
         .first();
       if (active) return active;
       const now = this.#now();
@@ -68,6 +74,7 @@ export class Pipeline {
         type: input.type,
         videoKey: input.videoKey,
         sessionId: input.sessionId,
+        ...(input.segIndex !== undefined ? { segIndex: input.segIndex } : {}),
         status: 'pending',
         progress: 0,
         retries: 0,

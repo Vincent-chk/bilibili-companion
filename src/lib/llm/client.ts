@@ -30,6 +30,8 @@ export interface StreamOptions {
   onDelta?: (ev: StreamEvent) => void;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** 输出 token 上限（成本护栏：F13 分段解读 / F14 对话用；缺省=不限制）。 */
+  maxTokens?: number;
 }
 
 // 服务端错误 body 里可能回显 Key：先剔除本次 Key，再兜底打码 Bearer/sk-/ark- 形态 token，只留前 200 字符。
@@ -73,6 +75,7 @@ export async function streamChatCompletion(
         stream: true,
         stream_options: { include_usage: true },
         temperature: 0.7,
+        ...(opts.maxTokens !== undefined ? { max_tokens: opts.maxTokens } : {}),
       }),
       signal: controller.signal,
     });

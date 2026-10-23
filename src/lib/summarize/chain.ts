@@ -16,6 +16,7 @@ import {
   type JobStage,
   type StoredCue,
   type SummaryRow,
+  type TranscriptRow,
   type TranscriptSource,
   type VideoRow,
 } from '../storage';
@@ -62,6 +63,44 @@ export function parseVideoKey(videoKey: string): { bvid: string; cid: number } {
   const cid = Number(videoKey.slice(i + 1));
   if (!bvid || !Number.isFinite(cid)) throw new Error(`videoKey 格式非法：${videoKey}`);
   return { bvid, cid };
+}
+
+export type EnsureTranscriptResult =
+  | { kind: 'ok'; transcript: TranscriptRow }
+  | { kind: 'no-track' } // 无字幕轨（F6 待确认 / 分段解读不可用）
+  | { kind: 'empty' }; // 有轨但内容为空
+
+/**
+ * 字幕缓存 24h；未命中 → WBI keys → 选轨 → 抓取 → 归一落库（P1.11 起 SUMMARIZE 与
+ * SEGMENT_ANALYZE 共用，根因单点）。不写 summaries 行——调用方按 kind 自行定语义。
+ */
+export async function ensureTranscript(
+  db: CompanionDB,
+  bili: BiliApi,
+  videoKey: string,
+  video: VideoRow,
+): Promise<EnsureTranscriptResult> {
+  const cached = await getFreshTranscript(db, videoKey);
+  if (cached) return { kind: 'ok', transcript: cached };
+  const { bvid } = parseVideoKey(videoKey);
+  await bili.fetchWbiKeys(); // player/wbi/v2 需 WBI 签名（nav 取 img/sub key，实例内缓存；T-5）
+  const { subtitles }: PlayerSubtitles = await bili.getPlayerSubtitles(bvid, video.cid);
+  const track = selectTrack(subtitles);
+  if (!track?.subtitle_url) return { kind: 'no-track' };
+  const raw: TranscriptCue[] = await bili.fetchTranscript(track.subtitle_url);
+  const cues: StoredCue[] = raw.map((c) => ({ from: c.from, to: c.to, text: c.content }));
+  if (cues.length === 0) return { kind: 'empty' };
+  const source: TranscriptSource = track.lan?.startsWith('ai') ? 'ai_sub' : 'manual_sub';
+  const transcript: TranscriptRow = {
+    key: videoKey,
+    source,
+    lan: track.lan ?? '',
+    cues,
+    charCount: cues.reduce((n, c) => n + c.text.length + 1, 0),
+    cachedAt: Date.now(),
+  };
+  await db.transcripts.put(transcript);
+  return { kind: 'ok', transcript };
 }
 
 export async function runSummarizeJob(
@@ -115,38 +154,19 @@ export async function runSummarizeJob(
       await db.videos.put(video);
     }
 
-    // 字幕缓存 24h；未命中→选轨→抓取→归一落库
-    let transcript = await getFreshTranscript(db, job.videoKey);
-    if (!transcript) {
-      await bili.fetchWbiKeys(); // player/wbi/v2 需 WBI 签名（nav 取 img/sub key，实例内缓存）
-      const { subtitles }: PlayerSubtitles = await bili.getPlayerSubtitles(bvid, video.cid);
-      const track = selectTrack(subtitles);
-      if (!track?.subtitle_url) {
-        // F6：无字幕轨 → 橙色待确认。source 暂记 'asr'（用户确认后实际来源即 asr）
-        await db.summaries.put({ ...baseSummary, source: 'asr', status: 'need_asr' });
-        return { result: 'need_confirm' };
-      }
-      const raw: TranscriptCue[] = await bili.fetchTranscript(track.subtitle_url);
-      const cues: StoredCue[] = raw.map((c) => ({ from: c.from, to: c.to, text: c.content }));
-      if (cues.length === 0) {
-        await db.summaries.put({
-          ...baseSummary,
-          status: 'failed',
-          error: { code: 'NO_CONTENT', msg: '字幕轨内容为空' },
-        });
-        return { result: 'failed', error: { code: 'NO_CONTENT', msg: '字幕轨内容为空' } };
-      }
-      const source: TranscriptSource = track.lan?.startsWith('ai') ? 'ai_sub' : 'manual_sub';
-      transcript = {
-        key: job.videoKey,
-        source,
-        lan: track.lan ?? '',
-        cues,
-        charCount: cues.reduce((n, c) => n + c.text.length + 1, 0),
-        cachedAt: now,
-      };
-      await db.transcripts.put(transcript);
+    // 字幕缓存 24h；未命中→选轨→抓取→归一落库（P1.11 起与分段解读共用 ensureTranscript）
+    const tr = await ensureTranscript(db, bili, job.videoKey, video);
+    if (tr.kind === 'no-track') {
+      // F6：无字幕轨 → 橙色待确认。source 暂记 'asr'（用户确认后实际来源即 asr）
+      await db.summaries.put({ ...baseSummary, source: 'asr', status: 'need_asr' });
+      return { result: 'need_confirm' };
     }
+    if (tr.kind === 'empty') {
+      const err = { code: 'NO_CONTENT', msg: '字幕轨内容为空' };
+      await db.summaries.put({ ...baseSummary, status: 'failed', error: err });
+      return { result: 'failed', error: err };
+    }
+    const transcript = tr.transcript;
     await ctx.update({ stage: 'llm_map', progress: 45 });
 
     const meta = { title: video.title, duration: video.duration, cueCount: transcript.cues.length };

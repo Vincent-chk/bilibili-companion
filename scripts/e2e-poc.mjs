@@ -551,6 +551,45 @@ async function main() {
           })()`);
           seekProbe = { outline: seekClick, after: seekAfter, tr: trClick, trAfter };
           log('P1.8 同页 seek 探针:', JSON.stringify(seekProbe));
+
+          // 8.66) P1.11 F13 分段解读：【AI 解读】内联流式→done；收起再展开=缓存零请求；按钮点击不 seek
+          await pageEval(`(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (v) v.pause(); })()`);
+          const segBefore = await pageEval(`(() => {
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify({ t: v ? +v.currentTime.toFixed(1) : -1, btns: sr.querySelectorAll('.seg-btn').length });
+          })()`);
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.seg-btn[data-seg="1"]')?.click()`);
+          let segNote = null;
+          for (let i = 0; i < 40 && !(segNote && !segNote.hidden && !segNote.spinner && (segNote.text ?? '').length > 10); i++) {
+            await sleep(300);
+            segNote = await pageEval(`(() => {
+              const sr = document.getElementById('doubao-ui-root').shadowRoot;
+              const n = sr.querySelector('[data-segnote="1"]');
+              return JSON.stringify({ hidden: n?.classList.contains('hidden') ?? true, text: n?.textContent ?? '',
+                spinner: !!n?.querySelector('.spinner') });
+            })()`);
+          }
+          const segAfter = await pageEval(`(() => {
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            return JSON.stringify({ t: v ? +v.currentTime.toFixed(1) : -1 });
+          })()`);
+          const offscreenSegBefore = lines.filter((l) => l.text.includes('offscreen run job') && l.text.includes('seg=')).length;
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.seg-btn[data-seg="1"]')?.click()`);
+          await sleep(400);
+          const segCollapsed = await pageEval(`(() => { const n = document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]'); return JSON.stringify({ hidden: n?.classList.contains('hidden') ?? true }); })()`);
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.seg-btn[data-seg="1"]')?.click()`);
+          await sleep(800);
+          const segReopened = await pageEval(`(() => { const n = document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]'); return JSON.stringify({ hidden: n?.classList.contains('hidden') ?? true, text: n?.textContent ?? '' }); })()`);
+          const offscreenSegAfter = lines.filter((l) => l.text.includes('offscreen run job') && l.text.includes('seg=')).length;
+          const segDb = await swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const rows = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
+            const row = rows.find((x) => String(x.key || '').includes('${BVID}'));
+            return JSON.stringify(row?.segmentNotes ?? null);
+          })()`);
+          seekProbe = { ...seekProbe, segment: { segBefore, segNote, segAfter, segCollapsed, segReopened, offscreenSegBefore, offscreenSegAfter, segDb } };
+          log('P1.11 分段解读探针:', JSON.stringify(seekProbe.segment));
         } else {
           uiProbe = { list };
         }
@@ -959,6 +998,20 @@ async function main() {
       sessionEndGrace: mascotProbe?.endGrace === true && mascotProbe?.endSleepImg === true && mascotProbe?.endResumeBtn === true,
       bubbleSurvivesResume: mascotProbe?.bubbleSurvivesResume === true, // 旧 hide 计时器不掐死新气泡（审查 P1-1 回归）
       realMouseDragNoToggle: mascotProbe?.realMouseDragNoToggle === true, // 真鼠标拖拽含原生 click 不双触发（审查 P1-2 回归）
+      // P1.11 F13：内联流式→done 文本 / 收起再展开缓存零请求（offscreen seg job 数不增）/ 按钮点击不 seek / DB 注记 done
+      segmentNoteStreamDone:
+        seekProbe?.segment?.segNote?.hidden === false &&
+        String(seekProbe?.segment?.segNote?.text ?? '').includes('本段为分段解读的模拟纯文本输出'),
+      segmentCacheZeroRequest:
+        seekProbe?.segment?.segCollapsed?.hidden === true &&
+        seekProbe?.segment?.segReopened?.hidden === false &&
+        String(seekProbe?.segment?.segReopened?.text ?? '').includes('本段为分段解读的模拟纯文本输出') &&
+        seekProbe?.segment?.offscreenSegBefore === 1 &&
+        seekProbe?.segment?.offscreenSegAfter === 1,
+      segmentSeekIndependent:
+        Math.abs((seekProbe?.segment?.segAfter?.t ?? -99) - (seekProbe?.segment?.segBefore?.t ?? -99)) <= 1 &&
+        (seekProbe?.segment?.segBefore?.btns ?? 0) >= 6,
+      segmentDbNote: seekProbe?.segment?.segDb?.['1']?.status === 'done',
       // P1.8：同页大纲 seek（±3s + toast + 面板不关）/ 转写行 seek / 跨标签页聚焦 seek / 新标签页 t= 直达
       seekOutlineSameTab:
         typeof seekProbe?.outline?.sec === 'number' &&

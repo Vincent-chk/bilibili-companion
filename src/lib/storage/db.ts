@@ -68,6 +68,8 @@ export interface SegmentNote {
   text: string;
   status: 'streaming' | 'done' | 'failed';
   createdAt: number;
+  error?: SummaryError; // 失败原因（脱敏后；F13 失败可见可重试）
+  truncated?: boolean; // 超长段按字符上限截断解读（UI 标注）
 }
 
 export interface SummaryRow {
@@ -95,6 +97,7 @@ export interface JobRow {
   type: JobType;
   videoKey: string;
   sessionId: string;
+  segIndex?: number; // SEGMENT_ANALYZE 的段下标（幂等键一部分，F13）
   status: JobStatus;
   stage?: JobStage;
   progress: number; // 0–100

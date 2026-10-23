@@ -33,6 +33,14 @@ export interface ListQueryResponse {
   loggedIn: boolean | null; // P1.10 引导卡数据源（SW 30s 缓存）
 }
 
+/** P1.11 F13 分段解读注记视图模型（与 storage.SegmentNote 同形）。 */
+export interface SegNoteVM {
+  text: string;
+  status: 'streaming' | 'done' | 'failed';
+  error?: { code: string; msg: string };
+  truncated?: boolean;
+}
+
 export interface PanelDeps {
   ui: DoubaoUi;
   bridge: Bridge;
@@ -59,6 +67,9 @@ export class PanelController {
   #routeGen = 0;
   /** P1.10 登录态（null=未知）：引导卡显隐依据。 */
   #loggedIn: boolean | null = null;
+  /** P1.11 F13：分段解读注记视图状态（segIndex → 流式/成品/失败）与展开集合。 */
+  #segNotes = new Map<number, SegNoteVM>();
+  #segOpen = new Set<number>();
 
   readonly #setTimeout: (cb: () => void, ms?: number) => unknown;
 
@@ -269,9 +280,15 @@ export class PanelController {
         return;
       }
       this.#view = 'detail';
-      this.#detailKey = videoKey;
       // 任务在跑 → 进入流式模式（重置累计）；否则直接渲染成品
       this.#stream = isJobActive(r.item.job) && r.item.job?.status !== 'need_confirm' ? { videoKey, acc: '' } : null;
+      // F13 注记状态仅随「视频真切换」重置（审查 P1-3：SUMMARY_* 广播重开同视频详情时
+      // 保留已展开/流式中的段卡；缓存本体在 DB，切走的视频零请求可再取）
+      if (this.#detailKey !== videoKey) {
+        this.#segNotes = new Map();
+        this.#segOpen = new Set();
+      }
+      this.#detailKey = videoKey;
       this.#renderDetail(r.item, r.transcript);
     } catch {
       if (gen !== this.#routeGen) return;
@@ -283,6 +300,8 @@ export class PanelController {
     this.#view = 'list';
     this.#detailKey = null;
     this.#stream = null;
+    this.#segNotes = new Map();
+    this.#segOpen = new Set();
     void this.refresh();
   }
 
@@ -316,10 +335,11 @@ export class PanelController {
       summaryHtml = '<div class="d-summary-empty">还没有摘要</div>';
     }
 
+    // P1.11 F13：大纲条目 = seek 行（.ol-row）+ 独立【AI 解读】入口 + 内联注记容器（流式/缓存/失败重试）
     const outlineHtml = (s?.outline ?? [])
       .map(
-        (o) =>
-          `<li data-sec="${Math.max(0, Math.floor(o.time))}"><span class="ot">${fmtSec(o.time)}</span><span>${esc(o.text)}</span></li>`,
+        (o, i) =>
+          `<li data-sec="${Math.max(0, Math.floor(o.time))}"><div class="ol-row"><span class="ot">${fmtSec(o.time)}</span><span>${esc(o.text)}</span><button class="seg-btn" data-seg="${i}" title="解读该时间段">AI 解读</button></div><div class="seg-note hidden" data-segnote="${i}"></div></li>`,
       )
       .join('');
     const sayHtml =
@@ -347,11 +367,21 @@ export class PanelController {
       `<div class="d-foot"><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`;
 
     root.getElementById('d-back')?.addEventListener('click', () => this.#backToList());
-    // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）
+    // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）；
+    // P1.11：【AI 解读】按钮与注记卡内的点击不触发 seek（两动作互不干扰，PRD F13）
     const seekKey = item.visit.videoKey;
     box.querySelectorAll<HTMLElement>('.d-outline li, .tr-line').forEach((el) => {
-      el.addEventListener('click', () => this.deps.onSeek(seekKey, Number(el.getAttribute('data-sec')) || 0));
+      el.addEventListener('click', (ev) => {
+        const t = ev.target as HTMLElement | null;
+        if (t?.closest('.seg-btn, .seg-note')) return;
+        this.deps.onSeek(seekKey, Number(el.getAttribute('data-sec')) || 0);
+      });
     });
+    box.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
+      btn.addEventListener('click', () => void this.#onSegToggle(Number(btn.getAttribute('data-seg'))));
+    });
+    // 重渲染后恢复已展开注记（详情内刷新路径）
+    for (const i of this.#segOpen) this.#paintSegNote(i);
     root.getElementById('d-copy')?.addEventListener('click', () => {
       const text = s?.summary ?? '';
       if (!text) return;
@@ -369,6 +399,26 @@ export class PanelController {
   handleEvent(e: UiEvent): void {
     if (e.type === 'LOGIN_STATE') {
       this.setLoginState(e.loggedIn ?? null); // P1.10 引导卡实时翻转
+      return;
+    }
+    // P1.11 F13：分段解读流式/终态 → 内联注记卡（仅当前详情视频消费）
+    if (e.type === 'SEGMENT_NOTE_STREAM' || e.type === 'SEGMENT_NOTE_DONE' || e.type === 'SEGMENT_NOTE_FAILED') {
+      if (e.videoKey !== this.#detailKey || e.segIndex === undefined) return;
+      const i = e.segIndex;
+      if (e.type === 'SEGMENT_NOTE_STREAM') {
+        const st = this.#segNotes.get(i);
+        if (st && st.status === 'streaming') {
+          st.text += e.deltaText ?? '';
+          this.#paintSegNote(i);
+        }
+        return;
+      }
+      if (e.type === 'SEGMENT_NOTE_DONE') {
+        this.#segNotes.set(i, { status: 'done', text: e.text ?? '', truncated: e.truncated });
+      } else {
+        this.#segNotes.set(i, { status: 'failed', text: '', error: e.error });
+      }
+      this.#paintSegNote(i);
       return;
     }
     if (e.type === 'SUMMARY_PROGRESS') {
@@ -408,5 +458,88 @@ export class PanelController {
     el.innerHTML = partial
       ? `${esc(partial)}<span class="caret"></span>`
       : `<div class="d-summary-empty"><span class="spinner"></span>${stage}</div>`;
+  }
+
+  // ---- P1.11 · F13 分段解读内联注记 ----
+
+  /** 展开/收起【AI 解读】；首次展开取缓存或发起 SEGMENT_ANALYZE（流式经广播回填）。 */
+  async #onSegToggle(i: number): Promise<void> {
+    if (!this.#detailKey) return;
+    if (this.#segOpen.has(i)) {
+      this.#segOpen.delete(i);
+      this.#paintSegNote(i);
+      return;
+    }
+    this.#segOpen.add(i);
+    const st = this.#segNotes.get(i);
+    // 审查 P2-6：残留 streaming（终态广播被 SW 死亡/断连吞掉）重展开也重发 OPEN 自愈
+    // （OPEN 幂等：健康流式中仅多一条消息、不覆盖已累计文本；残留态触发重建）
+    if (!st || st.status === 'streaming') {
+      if (!st) this.#segNotes.set(i, { status: 'streaming', text: '' });
+      this.#paintSegNote(i);
+      await this.#requestSegNote(i, 0);
+    } else {
+      this.#paintSegNote(i);
+    }
+  }
+
+  async #onSegRetry(i: number): Promise<void> {
+    if (!this.#detailKey) return;
+    this.#segNotes.set(i, { status: 'streaming', text: '' });
+    this.#segOpen.add(i);
+    this.#paintSegNote(i);
+    await this.#requestSegNote(i, 1); // retry=1：用户显式重试（同 SUMMARY_OPEN 口径，F11）
+  }
+
+  async #requestSegNote(i: number, retry: number): Promise<void> {
+    try {
+      const r = await this.deps.bridge.request<{
+        ok: boolean;
+        note?: SegNoteVM;
+        error?: string;
+        started?: boolean;
+      }>({ type: 'SEGMENT_NOTE_OPEN', videoKey: this.#detailKey, segIndex: i, ...(retry === 1 ? { retry: 1 } : {}) });
+      if (this.#detailKey === null) return; // 已返回列表：丢弃
+      if (!r?.ok) {
+        this.#segNotes.set(i, {
+          status: 'failed',
+          text: '',
+          error: { code: r?.error ?? 'OPEN_FAIL', msg: r?.error === 'NO_OUTLINE' ? '大纲不可用' : '解读发起失败' },
+        });
+        this.#paintSegNote(i);
+        return;
+      }
+      // 本次新入队（重试/残留重建）→ 清空旧增量残留，从空占位重新累计
+      if (r.started) this.#segNotes.set(i, { status: 'streaming', text: '' });
+      const n = r.note;
+      if (n?.status === 'done') this.#segNotes.set(i, { status: 'done', text: n.text ?? '', truncated: n.truncated });
+      else if (n?.status === 'failed') this.#segNotes.set(i, { status: 'failed', text: '', error: n.error });
+      // streaming：保持占位，等 SEGMENT_NOTE_STREAM/DONE 广播回填
+      this.#paintSegNote(i);
+    } catch {
+      this.#segNotes.set(i, { status: 'failed', text: '', error: { code: 'OPEN_FAIL', msg: '解读发起失败，稍后再试' } });
+      this.#paintSegNote(i);
+    }
+  }
+
+  /** 只重绘单条注记容器（不整屏重建）。 */
+  #paintSegNote(i: number): void {
+    const el = this.deps.ui.root.querySelector<HTMLElement>(`[data-segnote="${i}"]`);
+    if (!el) return;
+    const open = this.#segOpen.has(i);
+    el.classList.toggle('hidden', !open);
+    if (!open) return;
+    const st = this.#segNotes.get(i);
+    if (!st) return;
+    if (st.status === 'streaming') {
+      el.innerHTML = st.text
+        ? `${esc(st.text)}<span class="caret"></span>`
+        : '<span class="spinner"></span>豆包正在解读该段…';
+    } else if (st.status === 'done') {
+      el.innerHTML = `${esc(st.text)}${st.truncated ? '<span class="seg-trunc">段过长：仅解读了段内前部分字幕</span>' : ''}`;
+    } else {
+      el.innerHTML = `<span class="seg-err">解读失败：${esc(st.error?.msg ?? '未知错误')}</span><button class="btn btn-ghost seg-retry" data-segretry="${i}">重试</button>`;
+      el.querySelector(`[data-segretry="${i}"]`)?.addEventListener('click', () => void this.#onSegRetry(i));
+    }
   }
 }

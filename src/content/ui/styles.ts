@@ -135,10 +135,19 @@ export const UI_STYLES = `
   .d-summary .caret { display: inline-block; width: 2px; height: 12px; background: var(--blue); vertical-align: -1px; animation: caretBlink .8s step-end infinite; }
   .d-summary-empty { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text2); }
   .d-outline { list-style: none; }
-  .d-outline li { display: flex; gap: 10px; padding: 7px 8px; border-radius: 8px; cursor: pointer; font-size: 12.8px; line-height: 1.5; transition: background .15s; }
+  .d-outline li { display: flex; flex-direction: column; padding: 7px 8px; border-radius: 8px; cursor: pointer; font-size: 12.8px; line-height: 1.5; transition: background .15s; }
   .d-outline li:hover { background: #fff0f5; }
+  .d-outline .ol-row { display: flex; gap: 10px; width: 100%; align-items: baseline; }
   .d-outline .ot { flex: none; color: var(--blue); font-variant-numeric: tabular-nums; font-weight: 600; }
   .d-outline li:hover .ot { color: var(--pink); }
+  /* P1.11 F13：段解读入口与内联注记卡 */
+  .seg-btn { flex: none; margin-left: auto; font-size: 10.5px; font-weight: 600; color: var(--blue2); background: var(--blue2-bg); border-radius: 99px; padding: 2px 9px; transition: all .15s; white-space: nowrap; }
+  .seg-btn:hover { background: #cdeefe; color: #0369a1; }
+  .seg-note { margin: 7px 2px 2px; background: #f6f7f9; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font-size: 12px; line-height: 1.75; color: #333; cursor: default; text-align: justify; }
+  .seg-note .caret { display: inline-block; width: 2px; height: 12px; background: var(--blue); vertical-align: -1px; animation: caretBlink .8s step-end infinite; }
+  .seg-trunc { display: block; margin-top: 5px; font-size: 10.5px; color: var(--text3); }
+  .seg-err { color: var(--red); }
+  .seg-retry { margin-left: 8px; padding: 2px 10px; font-size: 11px; }
   .mascot-card { background: linear-gradient(135deg,#fff9ec,#fff2f6); border: 1px solid #ffe3c2; }
   .empty-mascot { width: 72px; height: 72px; object-fit: contain; display: block; margin: 0 auto 10px; }
   .mascot-say { display: flex; gap: 10px; }

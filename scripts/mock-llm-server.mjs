@@ -23,6 +23,9 @@ const validPayload = () =>
     rating: 4,
   });
 const badPayload = () => '这不是JSON{{{「summary": "oops 截断了';
+// P1.11 F13：分段解读请求（system 含「分段解读」标记）→ 纯文本 SSE（非 JSON Schema）
+const segmentPayload = () =>
+  '本段为分段解读的模拟纯文本输出：先给出该段的核心结论，再围绕三个关键点展开论证，最后补充作者对数据来源与适用边界的提醒，整体论证完整、结构清晰。';
 
 const rounds = new Map(); // BADJSON 轮次计数（首轮坏、二轮好）
 const bump = (k) => {
@@ -73,8 +76,10 @@ const server = http.createServer((req, res) => {
       } catch {
         text = body;
       }
+      // 失败分支优先（审查 P2-8：段解读失败用例的标记可能被标题/字幕带入，不得被成功 payload 抢答）
       if (text.includes('ALWAYS_BAD')) return sse(res, badPayload());
       if (text.includes('BADJSON') && bump('BADJSON') === 1) return sse(res, badPayload());
+      if (text.includes('分段解读')) return sse(res, segmentPayload());
       sse(res, validPayload());
     });
     return;
