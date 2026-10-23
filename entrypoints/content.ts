@@ -1,6 +1,8 @@
-// Phase 0 PoC · content script 骨架（0.3）
-// 职责：识别当前页 bvid → Shadow DOM 挂豆包立绘（零页面重排）→ SPA 路由变化重新识别。
-// 摘要链路（bvid → 字幕 → LLM）经 chrome.runtime 消息由 background 执行（host_permissions）。
+// content script：Phase 0 骨架（0.3）+ P1.2 watcher 接线。
+// 职责：识别当前页 bvid → Shadow DOM 挂豆包立绘 → SPA 路由变化重新识别
+//       → watcher 有效观看计时（20s 触发 / WATCH_TICK 节流上报，经 runtime 消息走 background）。
+import { WatchSession } from '../src/content/watcher/dom';
+
 export default defineContentScript({
   matches: ['*://www.bilibili.com/*'],
   runAt: 'document_idle',
@@ -31,9 +33,52 @@ export function detectBvid(url: string): string | null {
 
 function report(bvid: string | null) {
   console.log('[doubao-poc] bvid =', bvid);
-  void browser.runtime.sendMessage({ type: 'VIDEO_SEEN', bvid }).catch(() => {
-    /* background 未就绪时静默（PoC 级容错） */
-  });
+  if (bvid) {
+    // PoC E2E 载波（进页即跑链路，任务 1.4 移除）
+    void browser.runtime.sendMessage({ type: 'VIDEO_SEEN', bvid }).catch(() => {});
+  }
+  void startWatcher(bvid);
+}
+
+/** VIDEO_ENTER（background 解析元信息/多P）→ 建 WatchSession（有效观看→WATCH_TICK/TRIGGER_SUMMARY）。
+ * 代数令牌：应答在途时用户又切视频 → 丢弃过期应答，否则旧视频的 session 永不 dispose，
+ * 与新 session 双路累计同一 <video>，会给没在看的视频误触发摘要（真实 LLM 成本）。 */
+let watchSession: WatchSession | null = null;
+let watchGen = 0;
+
+async function startWatcher(bvid: string | null): Promise<void> {
+  const gen = ++watchGen;
+  watchSession?.dispose();
+  watchSession = null;
+  if (!bvid) return;
+  try {
+    const r = (await browser.runtime.sendMessage({
+      type: 'VIDEO_ENTER',
+      bvid,
+      url: location.href,
+    })) as {
+      ok: boolean;
+      videoKey?: string;
+      duration?: number;
+      triggerSeconds?: number;
+    } | undefined;
+    if (gen !== watchGen) return; // 等待期间已切走：过期应答作废
+    if (!r?.ok || !r.videoKey) return;
+    const { videoKey, duration = 0, triggerSeconds = 20 } = r;
+    watchSession = new WatchSession({
+      videoKey,
+      durationSec: duration,
+      thresholdSec: triggerSeconds,
+      onTick: (p) => {
+        void browser.runtime.sendMessage({ type: 'WATCH_TICK', ...p }).catch(() => {});
+      },
+      onTrigger: (p) => {
+        void browser.runtime.sendMessage({ type: 'TRIGGER_SUMMARY', ...p }).catch(() => {});
+      },
+    });
+  } catch {
+    /* background 未就绪时静默，下次路由变化重试 */
+  }
 }
 
 /** Shadow DOM 挂载豆包立绘：position:fixed 不参与文档流，避免页面重排（对标准则 #7）。 */

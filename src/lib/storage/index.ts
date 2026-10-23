@@ -1,6 +1,6 @@
 // P1.1 · 存储助手：sessionPointer（chrome.storage.local）、24h 缓存判定、visit upsert、清除事务。
 // lib 层不直接触碰 browser API：KV 存储由调用方注入（browserKv.ts 提供扩展实现，测试注入内存版）。
-import type { CompanionDB, SummaryRow, TranscriptRow, VisitRow, VideoRow } from './db';
+import type { CompanionDB, TranscriptRow, VisitRow } from './db';
 
 export * from './db';
 
@@ -39,14 +39,7 @@ export const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 export const isCacheFresh = (cachedAt: number, now = Date.now(), ttl = CACHE_TTL_MS): boolean =>
   now - cachedAt <= ttl;
 
-export async function getFreshVideo(
-  db: CompanionDB,
-  key: string,
-  now = Date.now(),
-): Promise<VideoRow | undefined> {
-  const row = await db.videos.get(key);
-  return row && isCacheFresh(row.fetchedAt, now) ? row : undefined;
-}
+// videos 表的缓存命中按 bvid 索引查（键含 cid，取 view 前未知），见 background.handleVideoEnter。
 
 export async function getFreshTranscript(
   db: CompanionDB,
@@ -96,7 +89,13 @@ export async function updateVisitProgress(
   await db.transaction('rw', db.visits, async () => {
     const existing = await db.visits.where(where).first();
     if (!existing) return; // 无行可更（会话未建/已清除）——静默，watcher 下个 tick 重建
-    await db.visits.put({ ...existing, ...patch, lastSeenAt: patch.lastSeenAt ?? Date.now() });
+    await db.visits.put({
+      ...existing,
+      ...patch,
+      // 刷新页面后 tracker 从 0 重新累计：取 max 保住会话累计口径，避免 watchedSeconds 回退
+      watchedSeconds: Math.max(existing.watchedSeconds, patch.watchedSeconds),
+      lastSeenAt: patch.lastSeenAt ?? Date.now(),
+    });
   });
 }
 

@@ -45,17 +45,27 @@ interface ViewPage {
   cid: number;
   page: number;
   part: string;
+  /** 该 P 时长（秒）。注意 view 顶层 duration 是全部分 P 之和（多 P 视频不可用作单 P 时长）。 */
+  duration?: number;
 }
 interface ViewResp {
   code?: number;
-  data?: { aid: number; title: string; duration: number; pages?: ViewPage[] };
+  data?: { aid: number; title: string; duration: number; pic?: string; owner?: { name?: string }; pages?: ViewPage[] };
 }
 export interface VideoView {
   aid: number;
   cid: number;
   title: string;
+  cover: string;
+  owner: string;
   duration: number;
   pages: ViewPage[];
+}
+
+/** 多 P 选页（架构 §3.3：只取当前 cid）：p 为 1 起始的分 P 号，越界/缺省回退第 1P。 */
+export function pickPage(pages: ViewPage[], p: number | null): ViewPage | undefined {
+  if (!pages.length) return undefined;
+  return pages.find((pg) => pg.page === p) ?? pages[0];
 }
 interface PlayerV2Resp {
   code?: number;
@@ -196,6 +206,8 @@ export class BiliClient {
       aid: d.aid,
       cid: pages[0]?.cid ?? 0,
       title: d.title ?? '',
+      cover: d.pic ?? '',
+      owner: d.owner?.name ?? '',
       duration: d.duration ?? 0,
       pages,
     };

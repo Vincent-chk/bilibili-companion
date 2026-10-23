@@ -7,7 +7,6 @@ import {
   clearSessionPointer,
   getSessionPointer,
   getFreshTranscript,
-  getFreshVideo,
   isCacheFresh,
   setSessionPointer,
   summaryKey,
@@ -83,16 +82,16 @@ describe('sessionPointer', () => {
 });
 
 describe('24h 缓存判定', () => {
-  it('TTL 内命中、超时未命中、边界（恰好 24h）命中', async () => {
+  it('TTL 内命中、超时未命中、边界（恰好 24h）命中（videos/transcripts 同一判定）', async () => {
     const db = freshDb();
     const now = 1_000_000_000;
     expect(isCacheFresh(now - CACHE_TTL_MS, now)).toBe(true);
     expect(isCacheFresh(now - CACHE_TTL_MS - 1, now)).toBe(false);
 
     await db.videos.put(videoRow(now - CACHE_TTL_MS));
-    expect((await getFreshVideo(db, 'BV1x:111', now))?.key).toBe('BV1x:111');
+    expect(isCacheFresh((await db.videos.get('BV1x:111'))!.fetchedAt, now)).toBe(true);
     await db.videos.put(videoRow(now - CACHE_TTL_MS - 1));
-    expect(await getFreshVideo(db, 'BV1x:111', now)).toBeUndefined();
+    expect(isCacheFresh((await db.videos.get('BV1x:111'))!.fetchedAt, now)).toBe(false);
 
     await db.transcripts.put({ key: 'BV1x:111', source: 'manual_sub', lan: 'zh-CN', cues: [], charCount: 0, cachedAt: now });
     expect(await getFreshTranscript(db, 'BV1x:111', now + CACHE_TTL_MS)).toBeDefined();
@@ -130,6 +129,18 @@ describe('visit upsert', () => {
     await upsertVisit(db, { sessionId: 's1', videoKey: 'v2', now: 1 });
     await upsertVisit(db, { sessionId: 's2', videoKey: 'v1', now: 1 });
     expect(await db.visits.count()).toBe(3);
+    await db.delete();
+  });
+
+  it('watchedSeconds 单调不回退（刷新页面后 tracker 从 0 重新累计）', async () => {
+    const db = freshDb();
+    await upsertVisit(db, { sessionId: 's', videoKey: 'v', now: 1 });
+    await updateVisitProgress(db, { sessionId: 's', videoKey: 'v' }, { watchedSeconds: 30, progressPct: 50 });
+    // 模拟刷新：新 tracker 实例从 0 累计，只看了 3s
+    await updateVisitProgress(db, { sessionId: 's', videoKey: 'v' }, { watchedSeconds: 3, progressPct: 55 });
+    const row = (await db.visits.toArray())[0]!;
+    expect(row.watchedSeconds).toBe(30); // max 保累计
+    expect(row.progressPct).toBe(55); // 进度跟随媒体时间正常刷新
     await db.delete();
   });
 });

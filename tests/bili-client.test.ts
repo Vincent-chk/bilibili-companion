@@ -1,7 +1,7 @@
 // client.ts 网络部分：注入 fake fetchImpl，不打真实网络。
 // 文件名超出任务白名单（白名单只列了三个纯函数测试文件），但"client 至少 3 用例"是硬性要求——已向 lead 报备。
 import { describe, expect, it } from 'vitest';
-import { BiliApiError, BiliClient, type FetchLike } from '@/lib/bilibili/client';
+import { BiliApiError, BiliClient, pickPage, type FetchLike } from '@/lib/bilibili/client';
 
 const IMG_KEY = '7cd084941338484aae1ad9425b84077c';
 const SUB_KEY = '4932caff0ff746eab6f01bf08b70ac45';
@@ -126,6 +126,34 @@ describe('BiliClient（fake fetch）', () => {
     expect(calls).toHaveLength(2);
     expect(view.cid).toBe(9);
     expect(view.pages).toEqual([{ cid: 9, page: 1, part: 'p1' }]);
+  });
+
+  it('getView 带回封面与 UP 主（videos 表字段来源）；缺失时给空串', async () => {
+    const { client } = makeClient(() =>
+      jsonResponse({ code: 0, data: { aid: 1, title: 't', duration: 10, pic: 'https://i0.hdslb.com/x.jpg', owner: { name: 'up主' }, pages: [{ cid: 9, page: 1, part: 'p1' }] } }),
+    );
+    const v = await client.getView('BV1x');
+    expect(v).toMatchObject({ cover: 'https://i0.hdslb.com/x.jpg', owner: 'up主' });
+    const { client: c2 } = makeClient(() =>
+      jsonResponse({ code: 0, data: { aid: 1, title: 't', duration: 10, pages: [] } }),
+    );
+    expect(await c2.getView('BV1y')).toMatchObject({ cover: '', owner: '' });
+  });
+
+  it('多 P：顶层 duration 是各 P 之和，pickPage 必须取单 P 的 duration', async () => {
+    // 实测口径 BV1h7pteyEww：顶层 208406s=94P 之和，P1 实际 201s
+    const pages = [
+      { cid: 111, page: 1, part: 'p1', duration: 201 },
+      { cid: 222, page: 2, part: 'p2', duration: 580 },
+    ];
+    const { client } = makeClient(() =>
+      jsonResponse({ code: 0, data: { aid: 1, title: 't', duration: 781, pages } }),
+    );
+    const v = await client.getView('BV1multi');
+    expect(v.duration).toBe(781); // 顶层=总和（列表时长不可直接用，须用 pickPage 的单 P 值）
+    expect(pickPage(v.pages, 1)?.duration).toBe(201);
+    expect(pickPage(v.pages, 2)?.duration).toBe(580);
+    expect(pickPage(v.pages, null)?.duration).toBe(201);
   });
 
   it('fetchTranscript 匿名直下：补 https 前缀、无 Referer、解析 body', async () => {
