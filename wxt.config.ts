@@ -1,8 +1,17 @@
 import { defineConfig } from 'wxt';
 
-// manifest 权限按 02-开发方案/01-技术架构设计.md §5（出网白名单四域，F-2/G-3）。
-// PoC 阶段不申请 cookies 权限：登录态由浏览器自动携带（host_permissions + credentials）。
+// LLM 配置的构建期注入：PoC/E2E 用环境变量带入（如 mock 服务器地址），**API Key 永不写进仓库**。
+// 运行期优先级：chrome.storage.local（用户配置）> 这里的构建期注入 > 无配置报可读错误。
+const inject = (v: string | undefined, fallback = '') => JSON.stringify(v ?? fallback);
+
 export default defineConfig({
+  vite: () => ({
+    define: {
+      __POC_LLM_BASE_URL__: inject(process.env.POC_LLM_BASE_URL),
+      __POC_LLM_MODEL__: inject(process.env.POC_LLM_MODEL),
+      __POC_LLM_KEY__: inject(process.env.POC_LLM_API_KEY),
+    },
+  }),
   manifest: {
     name: '豆包陪看助手（PoC）',
     description: 'Phase 0 PoC：B 站视频识别 + 字幕直取 + LLM 摘要 console 打印',
