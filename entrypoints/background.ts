@@ -10,6 +10,7 @@ import {
   CompanionDB,
   getSessionPointer,
   isCacheFresh,
+  setSessionPointer,
   updateVisitProgress,
   upsertVisit,
   type JobRow,
@@ -212,11 +213,67 @@ export default defineBackground(() => {
         return handleListQuery();
       case 'SUMMARY_OPEN':
         return handleSummaryOpen(m);
+      case 'SESSION_START':
+        return handleSessionStart();
+      case 'SESSION_END':
+        return handleSessionEnd();
       default:
         return undefined; // 未识别消息交给其它 listener（SUMMARY_PROGRESS 由 executeViaOffscreen 处理）
     }
   });
 });
+
+// ---- P1.6 · 会话最小切片（完整状态机/保留期判定是任务 2.1） ---------------------
+
+const rand4 = () => Math.random().toString(36).slice(2, 6);
+
+/**
+ * SESSION_START（开始/恢复陪看）：未配置 LLM → NEED_ONBOARDING（F1/F9，content 弹 onboarding）。
+ * GRACE 内重开 = 恢复同一会话（保留列表与进度）；无 pointer 才新建 session 行。
+ */
+async function handleSessionStart(): Promise<Record<string, unknown>> {
+  const cfg = await readStoredLlmConfig(browserKv);
+  if (!cfg) return { ok: false, reason: 'NEED_ONBOARDING' };
+  const now = Date.now();
+  const existing = await getSessionPointer(browserKv);
+  const resumable = existing?.state === 'ACTIVE' || existing?.state === 'GRACE';
+  // shortcut: 双标签页无 pointer 并发点开始会各建一会话行（输家成孤儿行，2.1 保留期清理时收口）
+  let sessionId: string;
+  if (existing && resumable) {
+    // 恢复（GRACE）或幂等重入（ACTIVE）
+    sessionId = existing.sessionId;
+    await db.sessions.update(sessionId, {
+      state: 'ACTIVE',
+      lastActiveAt: now,
+      ...(existing.state === 'GRACE' ? { restoredAt: now } : {}),
+    });
+  } else {
+    sessionId = `s_${now}_${rand4()}`;
+    await db.sessions.put({ id: sessionId, state: 'ACTIVE', startedAt: now, lastActiveAt: now });
+  }
+  await setSessionPointer(browserKv, {
+    sessionId,
+    state: 'ACTIVE',
+    startedAt: existing && resumable ? existing.startedAt : now,
+    lastActiveAt: now,
+    ...(existing?.state === 'GRACE' ? { restoredAt: now } : {}),
+  });
+  console.log(`[doubao] session ${resumable ? 'resumed' : 'started'}: ${sessionId}`);
+  broadcastToUi({ type: 'SESSION_STATE', state: 'ACTIVE' });
+  return { ok: true, sessionState: 'ACTIVE', resumed: resumable };
+}
+
+/** SESSION_END（结束陪看）：ACTIVE → GRACE（closedAt=现在，1h 保留基准）。 */
+async function handleSessionEnd(): Promise<Record<string, unknown>> {
+  const pointer = await getSessionPointer(browserKv);
+  if (!pointer || pointer.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
+  const now = Date.now();
+  await db.sessions.update(pointer.sessionId, { state: 'GRACE', closedAt: now, lastActiveAt: now });
+  await setSessionPointer(browserKv, { ...pointer, state: 'GRACE', closedAt: now, lastActiveAt: now });
+  console.log(`[doubao] session ended (GRACE): ${pointer.sessionId}`);
+  broadcastToUi({ type: 'SESSION_STATE', state: 'GRACE' });
+  return { ok: true, sessionState: 'GRACE' };
+}
 
 // ---- P1.2 · watcher 服务端 ---------------------------------------------------
 
@@ -272,12 +329,21 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
   }
 }
 
-/** WATCH_TICK（1Hz 节流后到达）：刷新 visit 进度。未激活（无 sessionPointer）不产生记录（F1）。 */
+/** WATCH_TICK（1Hz 节流后到达）：刷新 visit 进度。未激活（无 sessionPointer）不产生记录（F1）。
+ *  行缺失时惰性补建（P1.6）：「先开视频后点开始陪看」时序下 VIDEO_ENTER 早于激活、
+ *  当时无 pointer 不建行——首个 tick 自愈，保证「会话内看过的视频一个不漏」（F4）。 */
 async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey, watchedSeconds = 0, progressPct = 0 } = m;
   if (!videoKey) return { ok: false };
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, reason: 'inactive' };
+  const existing = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
+  if (!existing) {
+    // videos 行可能也缺（VIDEO_ENTER 全程未激活）：job 链有兜底，列表标题退 videoKey
+    await upsertVisit(db, { sessionId: pointer.sessionId, videoKey, now: Date.now() });
+    await updateVisitProgress(db, { sessionId: pointer.sessionId, videoKey }, { watchedSeconds, progressPct });
+    return { ok: true, created: true };
+  }
   await updateVisitProgress(db, { sessionId: pointer.sessionId, videoKey }, { watchedSeconds, progressPct });
   return { ok: true };
 }

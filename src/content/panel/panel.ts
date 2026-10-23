@@ -34,6 +34,9 @@ export interface ListQueryResponse {
 export interface PanelDeps {
   ui: DoubaoUi;
   bridge: Bridge;
+  /** 会话操作（P1.6）：开始/恢复 与 结束——流程由 content 侧持有（含 onboarding 门槛）。 */
+  onSessionStart: () => void;
+  onSessionEnd: () => void;
   /** 测试可注入的定时器。 */
   setTimeout?: typeof setTimeout;
 }
@@ -101,14 +104,31 @@ export class PanelController {
 
   #renderStatus(): void {
     const el = this.deps.ui.root.getElementById('p-status');
+    const acts = this.deps.ui.root.getElementById('p-head-actions');
     if (!el) return;
+    acts?.classList.toggle('hidden', false);
     if (this.#sessionState === 'ACTIVE') {
       el.innerHTML = '<span class="dot-live"></span> 陪看中 · 仅记录本次激活期间看过的视频';
+      this.#renderActions(acts, '<button class="btn btn-ghost" id="btn-end" style="flex:1">⏻ 结束陪看</button>', () =>
+        this.deps.onSessionEnd(),
+      );
     } else if (this.#sessionState === 'GRACE') {
       el.innerHTML = '<span class="countdown-pill">⏳ 陪看已结束 · 数据保留中</span>';
+      this.#renderActions(acts, '<button class="btn btn-primary" id="btn-resume" style="flex:1">▶ 恢复陪看</button>', () =>
+        this.deps.onSessionStart(),
+      );
     } else {
       el.textContent = '未激活 · 点豆包「开始陪看」';
+      this.#renderActions(acts, '<button class="btn btn-primary" id="btn-start2" style="flex:1">▶ 开始陪看</button>', () =>
+        this.deps.onSessionStart(),
+      );
     }
+  }
+
+  #renderActions(acts: HTMLElement | null, html: string, onClick: () => void): void {
+    if (!acts) return;
+    acts.innerHTML = html;
+    acts.firstElementChild?.addEventListener('click', () => onClick());
   }
 
   // ---- 列表 ----

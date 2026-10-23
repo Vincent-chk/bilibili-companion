@@ -187,19 +187,53 @@ async function main() {
     const nav = await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
     log('navigate →', PAGE_URL, nav.result?.frameId ? 'ok' : JSON.stringify(nav.error ?? nav.result));
 
-    // 7) 驱动真实链（P1.4 起旧 VIDEO_SEEN 载波已移除）：
-    //    SW 注入 sessionPointer + 低阈值(5s) → reload 让 VIDEO_ENTER 建 visit
+    // 7) 驱动真实链（P1.6 起为完全真实用户路径）：
+    //    SW 只注入 settings（5s 阈值 + mock LLM 三件套，模拟已配置状态）
+    //    → reload → 点豆包气泡「▶ 开始陪看」→ SESSION_START 建会话（不再预注入 sessionPointer）
+    //    → WATCH_TICK 惰性补建 visit（先开视频后激活的真实时序）
     //    → 页面 muted play() 让 watcher 真实累计 5s → TRIGGER_SUMMARY → pipeline → offscreen → 落库
     for (let i = 0; i < 40 && !swSessionId; i++) { await sleep(250); }
     if (!swSessionId) throw new Error('扩展 service worker 未 attach——扩展未加载？');
     const setStorageRes = await cdp('Runtime.evaluate', {
-      expression: `chrome.storage.local.set({sessionPointer:{sessionId:'s_e2e',state:'ACTIVE',lastActiveAt:Date.now()},settings:{triggerSeconds:5}})`,
+      expression: `chrome.storage.local.set({settings:{triggerSeconds:5, llm:{baseUrl:'http://127.0.0.1:${mockPort}', modelId:'mock-seed-lite', apiKey:'e2e-mock-key'}}})`,
       awaitPromise: true, returnByValue: true,
     }, swSessionId);
-    log('sessionPointer+settings 注入:', JSON.stringify(setStorageRes?.result?.result?.value ?? setStorageRes?.result ?? 'void'));
+    log('settings 注入:', JSON.stringify(setStorageRes?.result?.result?.value ?? setStorageRes?.result ?? 'void'));
 
     await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
-    await sleep(4000); // 等 content script 重注入 + VIDEO_ENTER 建 visit + 播放器就绪
+    await sleep(4000); // 等 content script 重注入（此时 INACTIVE：豆包应挂「开始陪看」气泡）
+
+    // 7.5) P1.6 真实激活：点「▶ 开始陪看」→ 断言 ACTIVE + happy 切图 + 气泡文案
+    const startRes = await cdp('Runtime.evaluate', {
+      expression: `(() => {
+        const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+        const btn = sr?.getElementById('btn-start');
+        if (!btn) return 'no-btn';
+        btn.click();
+        return 'clicked';
+      })()`,
+      returnByValue: true,
+    }, landingSid);
+    const startClicked = String(startRes?.result?.result?.value ?? '') === 'clicked';
+    await sleep(1500); // SESSION_START → 广播 → 豆包 happy/气泡
+    let sessionProbe = {};
+    {
+      const st = await cdp('Runtime.evaluate', {
+        expression: `(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`,
+        awaitPromise: true, returnByValue: true,
+      }, swSessionId);
+      try { sessionProbe.pointer = JSON.parse(st?.result?.result?.value); } catch { sessionProbe.pointer = null; }
+      const dom = await cdp('Runtime.evaluate', {
+        expression: `(() => {
+          const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+          return JSON.stringify({ img: sr?.getElementById('mascot-img')?.getAttribute('src') ?? '', bubble: (sr?.getElementById('mascot-bubble')?.textContent ?? '').slice(0, 30) });
+        })()`,
+        returnByValue: true,
+      }, landingSid);
+      try { sessionProbe.dom = JSON.parse(dom?.result?.result?.value); } catch { sessionProbe.dom = null; }
+      log('P1.6 激活探针:', JSON.stringify(sessionProbe));
+    }
+    if (!startClicked) throw new Error('「开始陪看」气泡按钮未找到——豆包未进入未激活引导态？');
 
     const playExpr = `(async () => {
       const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
@@ -242,8 +276,9 @@ async function main() {
       log('IndexedDB 终态:', JSON.stringify(dbSummary));
     }
 
-    // 8) DOM 探针：共享 UI root 是否注入 + 面板全链（P1.5：豆包点击 → 列表 → 详情）
+    // 8) DOM 探针：共享 UI root 是否注入 + 面板全链（P1.5：豆包点击 → 列表 → 详情）+ P1.6 豆包交互
     let uiProbe = null;
+    let mascotProbe = null;
     const probeSid = [...pageSessions].pop();
     if (probeSid) {
       let r = await cdp('Runtime.evaluate', { expression: '!!document.getElementById("doubao-ui-root")', returnByValue: true }, probeSid);
@@ -303,6 +338,141 @@ async function main() {
         } else {
           uiProbe = { list };
         }
+
+        // 8.7) P1.6 豆包交互：Esc 关面板 → 拖拽（不误触面板）→ 位置持久化 → reload 还原 → 结束陪看
+        const pageEval = async (expression) => {
+          const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, probeSid);
+          try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
+        };
+        const swEval = async (expression) => {
+          const rr = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, swSessionId);
+          try { return JSON.parse(rr?.result?.result?.value); } catch { return null; }
+        };
+
+        // 关面板（Esc），模拟 60px 拖拽：pointerdown(mascot) → pointermove/up(document)
+        await cdp('Runtime.evaluate', {
+          expression: `document.getElementById('doubao-ui-root').shadowRoot.getElementById('view-list').dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', bubbles:true})) || 'esc'`,
+          returnByValue: true,
+        }, probeSid).catch(() => {});
+        await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, probeSid).catch(() => {});
+        await sleep(400);
+        const dragRes = await pageEval(`(() => {
+          const sr = document.getElementById('doubao-ui-root').shadowRoot;
+          const m = sr.getElementById('mascot');
+          const wrap = sr.getElementById('mascot-wrap');
+          const r = m.getBoundingClientRect();
+          const x0 = r.left + 40, y0 = r.top + 40;
+          const before = { left: wrap.offsetLeft, top: wrap.offsetTop };
+          m.dispatchEvent(new PointerEvent('pointerdown', { clientX: x0, clientY: y0, bubbles: true }));
+          document.dispatchEvent(new PointerEvent('pointermove', { clientX: x0 + 60, clientY: y0 + 20, bubbles: true }));
+          document.dispatchEvent(new PointerEvent('pointerup', { clientX: x0 + 60, clientY: y0 + 20, bubbles: true }));
+          return JSON.stringify({ before, after: { left: wrap.offsetLeft, top: wrap.offsetTop },
+            vw: window.innerWidth, vh: window.innerHeight,
+            panelOpenAfterDrag: sr.getElementById('panel').classList.contains('open') });
+        })()`);
+        await sleep(500); // storage.set 异步落盘
+        const savedPos = await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('mascotPos')).mascotPos ?? null))()`);
+        log('P1.6 拖拽探针:', JSON.stringify({ dragRes, savedPos }));
+
+        // reload：mascotPos 相对坐标还原（±5px 容差，按实际视口钳位还原）
+        await cdp('Page.navigate', { url: PAGE_URL }, probeSid);
+        await sleep(4000);
+        const restored = await pageEval(`(() => {
+          const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+          if (!sr) return JSON.stringify({ err: 'no-root' });
+          const wrap = sr.getElementById('mascot-wrap');
+          return JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, vw: window.innerWidth, vh: window.innerHeight,
+            img: sr.getElementById('mascot-img')?.getAttribute('src') ?? '' });
+        })()`);
+        const expectLeft = savedPos && dragRes ? Math.min(Math.max(4, savedPos.x * dragRes.vw), dragRes.vw - 178) : null;
+        const posRestored = !!(
+          restored && savedPos && expectLeft !== null &&
+          Math.abs(restored.left - expectLeft) <= 5
+        );
+        log('P1.6 位置还原探针:', JSON.stringify({ restored, expectLeft, posRestored }));
+
+        // 结束陪看：开面板 → 头部「⏻ 结束陪看」→ GRACE + sleep 切图 + 「恢复陪看」按钮
+        await cdp('Runtime.evaluate', {
+          expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("mascot").click()',
+          returnByValue: true,
+        }, probeSid);
+        await sleep(1000);
+        await cdp('Runtime.evaluate', {
+          expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("btn-end")?.click()',
+          returnByValue: true,
+        }, probeSid);
+        await sleep(1200);
+        const endProbe = {
+          pointer: await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`),
+          dom: await pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+            if (!sr) return null;
+            return JSON.stringify({ img: sr.getElementById('mascot-img')?.getAttribute('src') ?? '',
+              resumeBtn: !!sr.getElementById('btn-resume') });
+          })()`),
+        };
+        log('P1.6 结束陪看探针:', JSON.stringify(endProbe));
+
+        // 8.8) 审查 P1 回归探针：
+        //  a) 旧气泡 hide 计时器不得掐死新气泡——GRACE 后 4.2s 内恢复，新「开始陪看」气泡须活过旧计时时刻
+        //  b) 真鼠标拖拽（CDP Input，产生原生 pointer+click）不得双触发点击（面板保持关闭）
+        let bubbleSurvivesResume = null;
+        if (endProbe?.pointer?.state === 'GRACE') {
+          await cdp('Runtime.evaluate', {
+            expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("btn-resume")?.click()',
+            returnByValue: true,
+          }, probeSid);
+          // 观察窗：旧 GRACE 气泡 hide 计时（T_end+4.2s）已过、新「开始陪看」气泡自身 hide（T_resume+4.2s≈T_end+5.8s）未到
+          await sleep(3600); // 落在 T_end+5.1s 左右（resume 在 T_end+1.5s 附近）
+          const bubbleProbe = await pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+            const b = sr?.getElementById('mascot-bubble');
+            return JSON.stringify({ hidden: b?.classList.contains('hidden') ?? true, text: (b?.textContent ?? '').slice(0, 20) });
+          })()`);
+          const act = await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer?.state ?? null))()`);
+          bubbleSurvivesResume = bubbleProbe?.hidden === false && String(bubbleProbe?.text ?? '').includes('开始陪看') && act === 'ACTIVE';
+          log('P1.6 恢复气泡存活探针:', JSON.stringify({ bubbleProbe, act, bubbleSurvivesResume }));
+        }
+
+        // b) 真鼠标拖拽：Input 域原生事件（含 click 派发）→ 面板不得开（P1-2 回归）
+        let realMouseDrag = null;
+        {
+          await cdp('Input.enable', {}, probeSid).catch(() => {});
+          await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, probeSid).catch(() => {});
+          await sleep(400);
+          const geo = await pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const r = sr.getElementById('mascot').getBoundingClientRect();
+            return JSON.stringify({ x: r.left + 75, y: r.top + 75, left0: sr.getElementById('mascot-wrap').offsetLeft });
+          })()`);
+          if (geo) {
+            await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: geo.x, y: geo.y, button: 'left', clickCount: 1 }, probeSid);
+            await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: geo.x + 70, y: geo.y + 30, button: 'left' }, probeSid);
+            await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: geo.x + 70, y: geo.y + 30, button: 'left', clickCount: 1 }, probeSid);
+            await sleep(800);
+            const after = await pageEval(`(() => {
+              const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
+              return JSON.stringify({ panelOpen: sr?.getElementById('panel')?.classList.contains('open') ?? null,
+                left: sr?.getElementById('mascot-wrap')?.offsetLeft ?? null });
+            })()`);
+            realMouseDrag = after?.panelOpen === false && after?.left > geo.left0;
+            log('P1.6 真鼠标拖拽探针:', JSON.stringify({ geo, after, realMouseDrag }));
+          }
+        }
+
+        mascotProbe = {
+          startActive: sessionProbe?.pointer?.state === 'ACTIVE',
+          startHappyImg: String(sessionProbe?.dom?.img ?? '').includes('mascot-happy'),
+          dragMovedNotToggled: !!dragRes && dragRes.panelOpenAfterDrag === false && dragRes.after.left > dragRes.before.left,
+          posPersisted: !!savedPos && !!dragRes && Math.abs(savedPos.x * dragRes.vw - dragRes.after.left) <= 5,
+          posRestored,
+          endGrace: endProbe?.pointer?.state === 'GRACE',
+          endSleepImg: String(endProbe?.dom?.img ?? '').includes('mascot-sleep'),
+          endResumeBtn: endProbe?.dom?.resumeBtn === true,
+          bubbleSurvivesResume: bubbleSurvivesResume === true,
+          realMouseDragNoToggle: realMouseDrag === true,
+        };
+        log('P1.6 豆包判定项:', JSON.stringify(mascotProbe));
       }
     }
 
@@ -319,16 +489,18 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
-    // 10) 判定（真实链标记：watcher 触发 → 排队 → offscreen → 终态 → DB 落库 → 面板渲染）
+    // 10) 判定（真实链标记：watcher 触发 → 排队 → offscreen → 终态 → DB 落库 → 面板渲染 → P1.6 豆包交互）
     const has = (s) => lines.some((l) => l.text.includes(s));
     const verdict = {
       contentInjected: has('content script injected'),
       bvid: has(`bvid = ${BVID}`),
       uiRootInjected: uiProbe !== null,
-      visitTriggered: has('summary job queued'), // watcher 5s 真实触发（含 visit 建行）
+      sessionStartActive: mascotProbe?.startActive === true, // 真实点击「开始陪看」→ ACTIVE
+      sessionStartHappy: mascotProbe?.startHappyImg === true, // 激活 → happy 切图
+      visitTriggered: has('summary job queued'), // watcher 5s 真实触发（visit 由 WATCH_TICK 惰性补建）
       offscreenRun: has('offscreen run job'), // offscreen 执行体真的跑了
       chainDone: lines.some((l) => l.text.includes('job SUMMARIZE') && l.text.includes('→ done')),
       dbSummaryDone: Array.isArray(dbSummary?.summaries) && dbSummary.summaries.some((s) => s.status === 'done'),
@@ -339,6 +511,11 @@ async function main() {
         !!uiProbe?.detail?.mascotSay &&
         (uiProbe?.detail?.transcriptRows ?? 0) >= 1 &&
         String(uiProbe?.detail?.srcBadge ?? '').length > 0,
+      mascotDragNoToggle: mascotProbe?.dragMovedNotToggled === true, // 拖拽移动且不误触面板
+      mascotPosPersisted: mascotProbe?.posPersisted === true && mascotProbe?.posRestored === true, // 相对坐标落盘 + reload 还原
+      sessionEndGrace: mascotProbe?.endGrace === true && mascotProbe?.endSleepImg === true && mascotProbe?.endResumeBtn === true,
+      bubbleSurvivesResume: mascotProbe?.bubbleSurvivesResume === true, // 旧 hide 计时器不掐死新气泡（审查 P1-1 回归）
+      realMouseDragNoToggle: mascotProbe?.realMouseDragNoToggle === true, // 真鼠标拖拽含原生 click 不双触发（审查 P1-2 回归）
       noExplicitFail: !lines.some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

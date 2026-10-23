@@ -1,14 +1,19 @@
-// content script：Phase 0 骨架（0.3）+ P1.2 watcher + P1.5 面板/共享 UI 层。
+// content script：Phase 0 骨架（0.3）+ P1.2 watcher + P1.5 面板 + P1.6 豆包状态机。
 // 职责：识别当前页 bvid → Shadow DOM 挂豆包 + 面板 → SPA 路由变化重新识别
 //       → watcher 有效观看计时（20s 触发 / WATCH_TICK 节流上报，经 runtime 消息走 background）。
-// P1.5：单一 Shadow 宿主（doubao-ui-root）承载 mascot/panel/modal/toast；豆包点击开合面板；
-//       Port（doubao-port）接收 SUMMARY_* 推送驱动面板流式/刷新。
-// P1.6 将把此处占位豆包升级为完整状态机模块（src/content/mascot）。
+// UI：单一 Shadow 宿主（doubao-ui-root）；豆包（五表情状态机/气泡/拖拽/点击开合）+ 面板（列表/详情）。
+// 会话：开始/结束陪看走 SESSION_START/END（最小切片，完整保留期状态机是任务 2.1）；
+//       未配置 LLM → NEED_ONBOARDING（onboarding 弹窗是任务 1.7，当前 toast 提示）。
 import { browser } from 'wxt/browser';
-import { Bridge } from '../src/content/bridge';
+import type { PublicPath } from 'wxt/browser';
+import { Bridge, type UiEvent } from '../src/content/bridge';
+import { MascotController } from '../src/content/mascot/mascot';
+import type { UiSessionState } from '../src/content/mascot/logic';
 import { PanelController } from '../src/content/panel/panel';
-import { mountDoubaoUi } from '../src/content/ui/root';
+import { mountDoubaoUi, toast } from '../src/content/ui/root';
 import { WatchSession } from '../src/content/watcher/dom';
+
+let mascot: MascotController | null = null;
 
 export default defineContentScript({
   matches: ['*://www.bilibili.com/*'],
@@ -16,10 +21,63 @@ export default defineContentScript({
   main() {
     const ui = mountDoubaoUi();
     let panel: PanelController | null = null;
-    const bridge = new Bridge((e) => panel?.handleEvent(e));
-    bridge.connect();
-    panel = new PanelController({ ui, bridge });
-    mountMascotPlaceholder(ui, () => panel?.toggle());
+
+    const requestSessionStart = async (): Promise<void> => {
+      try {
+        const r = await bridge.request<{ ok: boolean; reason?: string }>({ type: 'SESSION_START' });
+        if (r?.ok) return; // 表情/气泡/头部按钮由 SESSION_STATE 广播统一驱动（跨标签页一致）
+        if (r?.reason === 'NEED_ONBOARDING') {
+          // F1/F9：未配置 LLM 强制引导（onboarding 弹窗为任务 1.7）
+          toast(ui, '先配置模型才能开始陪看哦');
+        }
+      } catch {
+        toast(ui, '激活失败，稍后再试');
+      }
+    };
+    const requestSessionEnd = async (): Promise<void> => {
+      try {
+        await bridge.request({ type: 'SESSION_END' });
+      } catch {
+        /* SW 未就绪：忽略，重试成本低 */
+      }
+    };
+
+    const bridge = new Bridge((e: UiEvent) => {
+      panel?.handleEvent(e);
+      if (e.type === 'SESSION_STATE' && e.state) mascot?.setSessionState(e.state as UiSessionState);
+      // 记完/失败的表情反馈只在激活期（睡觉时不吵醒，F3 克制语义）
+      if (mascot?.session === 'ACTIVE') {
+        if (e.type === 'SUMMARY_DONE') {
+          mascot.pulse('happy', 9000);
+          void mascot.say('写完啦！点我看笔记 📖', 9000);
+        } else if (e.type === 'SUMMARY_FAILED') {
+          void mascot.say('有个视频没记完…点开看看');
+        }
+      }
+    });
+
+    mascot = new MascotController({
+      ui,
+      assetUrl: (p) => browser.runtime.getURL(p as PublicPath),
+      storage: {
+        get: async <T>(key: string) => ((await browser.storage.local.get(key)) as Record<string, T>)[key],
+        set: (key, value) => browser.storage.local.set({ [key]: value }),
+      },
+      onBodyClickActive: () => panel?.toggle(),
+      onStartClick: () => void requestSessionStart(),
+      bubblesEnabled: async () =>
+        ((await browser.storage.local.get('settings'))['settings'] as { bubbles?: boolean } | undefined)?.bubbles !==
+        false,
+    });
+
+    panel = new PanelController({
+      ui,
+      bridge,
+      onSessionStart: () => void requestSessionStart(),
+      onSessionEnd: () => void requestSessionEnd(),
+    });
+
+    bridge.connect(); // 连接后 SW 回放 SESSION_STATE → 豆包按当前会话态初始化表情/气泡
 
     report(detectBvid(location.href));
 
@@ -82,27 +140,22 @@ async function startWatcher(bvid: string | null): Promise<void> {
         void browser.runtime.sendMessage({ type: 'WATCH_TICK', ...p }).catch(() => {});
       },
       onTrigger: (p) => {
-        void browser.runtime.sendMessage({ type: 'TRIGGER_SUMMARY', ...p }).catch(() => {});
+        // 首次真实触发（去重后）→ 豆包 note 态 + 气泡（F2）；deduped=幂等重放不打扰
+        void browser.runtime
+          .sendMessage({ type: 'TRIGGER_SUMMARY', ...p })
+          .then((r2) => {
+            const res = r2 as { ok?: boolean; deduped?: boolean } | undefined;
+            if (res?.ok && !res.deduped && mascot?.session === 'ACTIVE') {
+              mascot.setState('note');
+              void mascot.say('开始偷偷记笔记啦～', 4200);
+            }
+          })
+          .catch(() => {});
       },
     });
   } catch {
     /* background 未就绪时静默，下次路由变化重试 */
   }
-}
-
-/**
- * P1.5 豆包占位（进 ui root；点击开合面板）。position:fixed 不参与文档流（浮层准则 #7）。
- * 默认位参考原型：右下区域、避开播放器控件；气泡头顶空间预留。P1.6 换完整模块（状态机/气泡/拖拽）。
- */
-function mountMascotPlaceholder(ui: ReturnType<typeof mountDoubaoUi>, onClick: () => void): void {
-  const wrap = ui.root.getElementById('mascot-wrap');
-  const img = ui.root.querySelector<HTMLImageElement>('#mascot-img');
-  if (!wrap || !img) return;
-  wrap.classList.remove('hidden');
-  wrap.style.left = `${Math.max(20, window.innerWidth - 380)}px`;
-  wrap.style.top = `${Math.max(170, window.innerHeight - 280)}px`;
-  img.src = browser.runtime.getURL('/mascot/mascot-idle.png');
-  ui.root.getElementById('mascot')?.addEventListener('click', () => onClick());
 }
 
 function patchHistoryPushState(onChange: () => void) {
