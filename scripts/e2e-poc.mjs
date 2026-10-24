@@ -1813,6 +1813,7 @@ async function main() {
           const failDetail = await srOf(`return JSON.stringify({
             err: sr.getElementById('d-summary')?.textContent ?? '',
             goSettings: !!sr.getElementById('d-gosettings') })`);
+          await shotNamed(probeSid, 'visual-key-invalid.png'); // 视觉验收：解析失败详情+【去设置】入口
           let keyBubble = '';
           for (let i = 0; i < 8; i++) {
             const b = await srOf(`return JSON.stringify({ t: sr.getElementById('mascot-bubble')?.textContent ?? '' })`);
@@ -1872,6 +1873,7 @@ async function main() {
           await pclick('#d-back'); // 回列表才能读徽章（详情态列表 DOM 不在文档）
           await sleep(800);
           const waitBadge = await srOf(`return JSON.stringify({ badge: sr.querySelector(".v-item[data-video-key^='${BVID}:'] .badge")?.textContent ?? '' })`);
+          await shotNamed(probeSid, 'visual-offline-wait.png'); // 视觉验收：断网挂起=徽章保持生成中（不轰炸）
           // 恢复网络：mock 按原端口重启（存储的 baseUrl 不变）+ 面板开关触发 LIST_QUERY drain
           mock2 = spawn(process.execPath, [path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), String(mockPort0)], { stdio: ['ignore', 'pipe', 'pipe'] });
           mock2.stderr?.on('data', (d) => process.stderr.write(`[mock2!] ${d}`));
