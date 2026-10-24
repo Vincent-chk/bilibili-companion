@@ -26,6 +26,7 @@ import { excerptOf } from '../src/content/panel/view-models';
 import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
 import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/content/seek';
 import { parseVideoKey } from '../src/lib/summarize/chain';
+import { buildRefererRules, DNR_RULE_IDS } from '../src/lib/dnr';
 
 const db = new CompanionDB();
 
@@ -268,34 +269,15 @@ interface InMsg {
 // ---- P2.3 · DNR 音频防盗链（架构 §3.8） -------------------------------------------
 // bilivideo CDN 是否校验 Referer 取决于调度命中的节点类型（不可预测，07 报告 G-2）——
 // 对扩展自身发起的音频请求无条件补 Referer: https://www.bilibili.com/（.com+.cn 双域）。
-// 用动态规则而非静态 JSON：initiator 域=chrome.runtime.id 只有运行时可知（静态文件写不了）；
-// 任务 2.4 的「静态规则」交付以本组动态规则等价实现（规则集经 getDynamicRules 可审计）。
+// 规则形状在 lib/dnr（任务 2.4 抽出可单测）；用动态规则而非静态 JSON：initiator 域=
+// chrome.runtime.id 只有运行时可知（静态文件写不了）且无 initiator 限定会波及页面自身请求。
 async function ensureDnrRules(): Promise<void> {
-  const setReferer = { header: 'Referer', operation: 'set', value: 'https://www.bilibili.com/' } as const;
-  const rules = [
-    {
-      id: 1,
-      priority: 1,
-      condition: {
-        urlFilter: '||bilivideo.com^',
-        resourceTypes: ['xmlhttprequest'],
-        initiatorDomains: [browser.runtime.id],
-      },
-      action: { type: 'modifyHeaders', requestHeaders: [setReferer] },
-    },
-    {
-      id: 2,
-      priority: 1,
-      condition: {
-        urlFilter: '||bilivideo.cn^',
-        resourceTypes: ['xmlhttprequest'],
-        initiatorDomains: [browser.runtime.id],
-      },
-      action: { type: 'modifyHeaders', requestHeaders: [setReferer] },
-    },
-  ];
+  const rules = buildRefererRules(browser.runtime.id);
   try {
-    await browser.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [1, 2], addRules: rules as never });
+    await browser.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [...DNR_RULE_IDS],
+      addRules: rules as never,
+    });
     console.log('[doubao] dnr rules ensured: 2 (bilivideo.com/.cn Referer for extension requests)');
   } catch (e) {
     console.log(`[doubao] dnr ensure error: ${String(e).slice(0, 500)}`);

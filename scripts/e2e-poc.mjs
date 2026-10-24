@@ -133,6 +133,9 @@ async function main() {
     // Network.requestWillBeSent 全量收集，收口判 host 白名单（页面自身流量不属扩展出网，不采）
     const netSessions = new Set();
     const netUrls = [];
+    // P2.4 头级验证：requestId → URL / requestId → 实发请求头（extraInfo 与 requestWillBeSent 乱序到达，两 map 事后关联）
+    const reqUrlById = new Map();
+    const extraHeadersById = new Map();
     const ws = new WebSocket(ver.webSocketDebuggerUrl);
     await onceEvent(ws, 'open');
     let msgId = 0;
@@ -160,7 +163,11 @@ async function main() {
         attachedTargets.push({ type: t.type, url: t.url, targetId: t.targetId, at: Date.now() });
         if (t.type === 'service_worker' && t.url.includes('background')) swSessionId = sessionId; // SW 可能重启，始终取最新
         cdp('Runtime.enable', {}, sessionId).catch(() => {});
-        if (t.url.startsWith('chrome-extension://')) {
+        // 扩展出网审计面：SW（chrome-extension:// URL）+ offscreen 文档——后者 attach 时
+        // targetInfo.url 常为空且 type='other'（P2.4 实测：按 URL 过滤会漏掉 offscreen 的
+        // 音频/LLM 请求，出网审计与 DNR 头级验证全部失明），故 type='other' 一并纳入。
+        // offscreen 的 host 都在白名单（bilivideo/LLM 端点），不会误伤 networkWhitelist 判定。
+        if (t.url.startsWith('chrome-extension://') || t.type === 'other') {
           netSessions.add(sessionId); // SW 重启/offscreen 重建会带新 session 进来
           cdp('Network.enable', {}, sessionId).catch(() => {}); // T-3：Network.enable 在 CfT 正常（挂起的是 Cookie 命令）
         }
@@ -174,6 +181,21 @@ async function main() {
       if (m.method === 'Network.requestWillBeSent' && netSessions.has(m.sessionId)) {
         const u = m.params?.request?.url;
         if (u) netUrls.push(u);
+        // P2.4 头级验证：bilivideo 音频请求的 requestId → URL（extraInfo 不带 URL，靠此关联）。
+        // 键含 sessionId：requestId 只在单 target 内唯一，跨 target 撞号会错配 URL↔头（审查 N-2）
+        if (u) reqUrlById.set(`${m.sessionId}:${m.params?.requestId}`, u);
+        return;
+      }
+      // P2.4 DNR 头级验证：extraInfo 携带网络栈实际发送的请求头（含 DNR 改写后的值）——
+      // 与 requestWillBeSent 的 requestId 关联，判定时核对 bilivideo 请求的 Referer。
+      // responseReceivedExtraInfo 同样带实发请求头，作第二来源兜（两事件必达其一）。
+      if ((m.method === 'Network.requestWillBeSentExtraInfo' || m.method === 'Network.responseReceivedExtraInfo') && netSessions.has(m.sessionId)) {
+        const rid = `${m.sessionId}:${m.params?.requestId}`;
+        const headers = m.params?.headers;
+        if (m.params?.requestId && headers) {
+          const prev = extraHeadersById.get(rid) ?? {};
+          extraHeadersById.set(rid, { ...prev, ...headers });
+        }
         return;
       }
       if (m.method === 'Runtime.consoleAPICalled') {
@@ -522,6 +544,7 @@ async function main() {
     let retentionProbe = null; // P2.1：保留期判定探针（GRACE 倒计时/59min 恢复/超期 EXPIRED）
     let wipeProbe = null; // P2.2：F10 清除链路探针（超期弹窗/稍后提醒重弹/立即清除/手动清除）
     let asrProbe = null; // P2.3：F6 ASR 确认流探针（need_asr 卡片/未配置引导/三段进度/done ASR转写）
+    let dnrProbe = null; // P2.4：DNR 头级验证探针（bilivideo 实发 Referer + getDynamicRules 形状审计）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -1430,6 +1453,41 @@ async function main() {
               (asrDb?.summaries ?? []).some((s) => s.status === 'done' && s.source === 'asr'),
           };
           log('P2.3 判定项:', JSON.stringify(asrProbe));
+
+          // P2.4 DNR 头级验证（验收记录 §3 N-10 记账项收口）：
+          // ① ASR 链真实下载的 bilivideo 音频请求（offscreen 发起），网络栈实发头 Referer 必须
+          //    等于 DNR 注入值（extraInfo 与 requestWillBeSent 乱序到达，事后按 requestId 关联）；
+          // ② SW getDynamicRules 形状审计（双域 / initiator=runtime.id / xmlhttprequest / modifyHeaders）。
+          const biliAudioReqs = [...reqUrlById.entries()].filter(([, u]) => {
+            try { return /(^|\.)bilivideo\.(com|cn)$/.test(new URL(u).hostname); } catch { return false; }
+          });
+          const refererOf = (rid) => {
+            const hd = extraHeadersById.get(rid) ?? {};
+            const ent = Object.entries(hd).find(([k]) => k.toLowerCase() === 'referer');
+            return ent ? String(ent[1]) : null;
+          };
+          const dnrRules = await swEval(`(async () => {
+            const rules = await chrome.declarativeNetRequest.getDynamicRules();
+            return JSON.stringify({ runtimeId: chrome.runtime.id, rules: rules.map((r) => ({
+              id: r.id, urlFilter: r.condition.urlFilter, initiator: r.condition.initiatorDomains,
+              types: r.condition.resourceTypes, headers: r.action.requestHeaders })) });
+          })()`);
+          dnrProbe = {
+            audioReqCount: biliAudioReqs.length,
+            referers: biliAudioReqs.map(([rid, u]) => ({ host: new URL(u).hostname, referer: refererOf(rid) })),
+            headerOk: biliAudioReqs.length > 0 && biliAudioReqs.every(([rid]) => refererOf(rid) === 'https://www.bilibili.com/'),
+            ruleShapeOk:
+              !!dnrRules &&
+              dnrRules.rules?.length === 2 &&
+              dnrRules.rules.every(
+                (r) =>
+                  (r.urlFilter === '||bilivideo.com^' || r.urlFilter === '||bilivideo.cn^') &&
+                  r.initiator?.[0] === dnrRules.runtimeId &&
+                  r.types?.length === 1 && r.types[0] === 'xmlhttprequest' &&
+                  r.headers?.length === 1 && r.headers[0].header === 'Referer' && r.headers[0].operation === 'set',
+              ),
+          };
+          log('P2.4 判定项:', JSON.stringify(dnrProbe));
         }
       }
     }
@@ -1452,7 +1510,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -1624,6 +1682,10 @@ async function main() {
       asrNeedConfigOnboarding: REAL || asrProbe?.needConfigOnboarding === true,
       asrSaveAsrThenRun: REAL || (asrProbe?.saveAsrThenRun === true && (asrProbe?.audioBytes ?? 0) > 100_000), // 审查 N-10：真实音频体量进判定（multipart ≥100KB）
       asrDnrRulesEnsured: has('dnr rules ensured: 2'),
+      // P2.4 头级验证：bilivideo 音频请求实发 Referer=DNR 注入值 + getDynamicRules 形状审计
+      //（真实模式不跑 ASR 链无音频请求，以日志判定项兜——与 asrNeedConfirmBadge 同口径）
+      dnrRefererHeader: REAL || dnrProbe?.headerOk === true,
+      dnrRulesShapeAudited: REAL || dnrProbe?.ruleShapeOk === true,
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
