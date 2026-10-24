@@ -196,6 +196,12 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
       console.log(`[doubao] offscreen job failed: ${reply.error?.code}: ${reply.error?.msg}`);
     }
     if (!reply) throw new Error('offscreen 无应答（文档可能未加载完成）');
+    // P2.6 F11 断网挂起续跑：网络级失败（LLM 传输层/离线期任何 UNKNOWN）回 wait——
+    // pipeline 落 pending 不烧重试不 failed 轰炸；恢复时机=SW online 事件/面板 LIST_QUERY/alarms
+    if (reply.result === 'failed' && (reply.error?.code === 'LLM_NETWORK' || (navigator.onLine === false && reply.error?.code === 'UNKNOWN'))) {
+      console.log(`[doubao] job waits for network: ${job.videoKey} (${reply.error?.code})`);
+      return { result: 'wait', error: reply.error };
+    }
     return reply;
   } catch (e) {
     console.log(`[doubao] offscreen executor error: ${String(e).slice(0, 200)}`);
@@ -228,7 +234,12 @@ const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
         : j.status === 'failed' ? 'SUMMARY_FAILED'
         : j.status === 'need_confirm' ? 'SUMMARY_NEED_ASR'
         : 'SUMMARY_UPDATED';
-      broadcastToUi({ type: t, videoKey: j.videoKey });
+      // P2.6：失败终态随带错误码/文案（F9 Key 无效→气泡「去设置」；其余码仅随行不消费）
+      broadcastToUi(
+        t === 'SUMMARY_FAILED' && j.error
+          ? { type: t, videoKey: j.videoKey, errorCode: j.error.code, errorMsg: j.error.msg }
+          : { type: t, videoKey: j.videoKey },
+      );
     }
   },
 });
@@ -307,7 +318,15 @@ export default defineBackground(() => {
   // P2.1 兜底：30min 周期闹钟在 SW 被唤醒时补一次判定（MV3 定时器不可靠，判定以时间戳比较为准）
   void browser.alarms.create('doubao-retention', { periodInMinutes: 30 });
   browser.alarms.onAlarm.addListener((a) => {
-    if ((a as { name?: string }).name === 'doubao-retention') void runRetention(true);
+    if ((a as { name?: string }).name === 'doubao-retention') {
+      void runRetention(true);
+      drainUnlessPaused(); // P2.6：断网挂起的 pending 在 30min 兜底唤醒时也试续跑
+    }
+  });
+  // P2.6 F11：网络恢复事件 → 立即续跑挂起队列（MV3 SW 全局作用域可收 online/offline）
+  addEventListener('online', () => {
+    console.log('[doubao] network online: resuming suspended jobs');
+    drainUnlessPaused();
   });
   // P2.3：DNR 音频 Referer 规则（幂等重建；启动/重启均确保在位）
   void ensureDnrRules();
@@ -641,6 +660,7 @@ function drainUnlessPaused(): void {
  *  广播会与面板 refresh 互触发成风暴；倒计时数据随本应答下发，状态变化经应答自然到达）。 */
 async function handleListQuery(): Promise<Record<string, unknown>> {
   const { pointer } = await runRetention();
+  drainUnlessPaused(); // P2.6：面板在看=续跑挂起队列的好时机（断网恢复后首个用户触点）
   const settings = await readSettings();
   const retainUntil = pointer ? retainUntilOf(pointer) : undefined;
   const base = {

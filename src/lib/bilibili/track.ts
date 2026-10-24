@@ -26,3 +26,25 @@ export function selectTrack(subtitles: SubtitleTrack[]): SubtitleTrack | null {
 export function normalizeSubtitleUrl(url: string): string {
   return url.startsWith('//') ? `https:${url}` : url;
 }
+
+// P2.6 · 字幕结构变化降级（F11）：B 站字幕 JSON 形状漂移的防御性归一化——
+// 变体字段容忍（from|start / to|end / content|text，数值字符串容错），非数组/全无效 → []
+// （空 cues 走 chain 既有 'empty' → NO_CONTENT 明确失败，可重试可转 ASR；绝不炸成 UNKNOWN）。
+export function normalizeCues(body: unknown): { from: number; to: number; content: string }[] {
+  if (!Array.isArray(body)) return [];
+  const out: { from: number; to: number; content: string }[] = [];
+  for (const raw of body) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const c = raw as Record<string, unknown>;
+    const cText = typeof c.content === 'string' ? c.content : '';
+    const tText = typeof c.text === 'string' ? c.text : '';
+    const text = cText || tText; // content 空串也回退 text（审查 P2-3）
+    const fromRaw = Number(c.from ?? c.start);
+    const from = Number.isFinite(fromRaw) ? fromRaw : 0;
+    const toRaw = Number(c.to ?? c.end);
+    const to = Number.isFinite(toRaw) ? toRaw : from;
+    if (!text) continue; // 无文本的行（结构噪声）不进库
+    out.push({ from, to, content: text });
+  }
+  return out;
+}

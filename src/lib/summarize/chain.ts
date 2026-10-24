@@ -47,6 +47,10 @@ export function mapLlmError(e: unknown): { code: string; msg: string } {
   if (e instanceof BiliApiError && (e.code === -101 || e.code === -352)) {
     return { code: 'NEED_LOGIN', msg: '需要登录 B 站才能取字幕，请先在本浏览器登录' };
   }
+  // P2.6 F11：-412 → RISK_CONTROL（此前落 UNKNOWN 文案含技术细节不可读；熔断 60s 后自动恢复）
+  if (e instanceof BiliApiError && e.code === -412) {
+    return { code: 'RISK_CONTROL', msg: 'B 站风控拦截（-412），已熔断冷却约 1 分钟，稍后可点击重试' };
+  }
   if (e instanceof LlmHttpError) {
     if (e.status === 401 || e.status === 403) return { code: 'KEY_INVALID', msg: 'LLM Key 无效或无权限，请到设置检查' };
     if (e.status === 402) return { code: 'NO_BALANCE', msg: 'LLM 余额不足' };

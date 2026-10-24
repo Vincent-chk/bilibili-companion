@@ -94,7 +94,12 @@ export default defineContentScript({
           mascot.pulse('happy', 9000);
           void mascot.say('写完啦！点我看笔记 📖', 9000, 'done');
         } else if (e.type === 'SUMMARY_FAILED') {
-          void mascot.say('有个视频没记完…点开看看', 5000, 'failed');
+          // P2.6 F9/F11：Key 无效专属气泡（带去设置指引）；kind 限频防连败轰炸
+          if (e.errorCode === 'KEY_INVALID') {
+            void mascot.say('Key 无效了…到设置里检查一下吧', 7000, 'key-invalid');
+          } else {
+            void mascot.say('有个视频没记完…点开看看', 5000, 'failed');
+          }
         }
       }
     });

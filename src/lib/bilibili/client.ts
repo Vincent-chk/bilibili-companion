@@ -1,5 +1,5 @@
 import { getMixinKey, toSortedQuery, wbiSign, type WbiParams } from './wbi';
-import { normalizeSubtitleUrl, type SubtitleTrack } from './track';
+import { normalizeCues, normalizeSubtitleUrl, type SubtitleTrack } from './track';
 
 const API_BASE = 'https://api.bilibili.com';
 const UA =
@@ -35,6 +35,8 @@ export interface BiliClientOptions {
   extraHeaders?: Record<string, string>;
   /** buvid3 兜底取到指纹 Cookie 后回调，由调用方（background）落地；lib 层不碰 chrome API */
   onCookie?: (cookies: Record<string, string>) => void;
+  /** P2.6：熔断门禁时钟（默认 performance.now；单测注入可控时钟）。 */
+  now?: () => number;
 }
 
 interface NavResp {
@@ -122,6 +124,9 @@ export class BiliClient {
   #mixinKey: string | null = null;
   #tLast = -Infinity; // performance.now() 自进程起算，-Infinity 保证首个请求不等待（python monotonic 自开机起等效）
   #fingerCookies: Record<string, string> = {};
+  /** P2.6 跨请求熔断：-412 后 breakerWaitMs 内所有请求即刻拒绝（F11「60s 内不再请求」）。 */
+  #blockedUntil = -Infinity;
+  #now: () => number;
 
   constructor(opts: BiliClientOptions = {}) {
     // 裸存 fetch 引用会在 ServiceWorker 里 Illegal invocation（脱离 globalThis 上下文）——必须 bind
@@ -132,6 +137,7 @@ export class BiliClient {
     this.#breakerWaitMs = opts.breakerWaitMs ?? 60_000;
     this.#extraHeaders = opts.extraHeaders ?? {};
     this.#onCookie = opts.onCookie;
+    this.#now = opts.now ?? performance.now.bind(performance);
   }
 
   // -- 基础设施 -------------------------------------------------------------
@@ -163,6 +169,10 @@ export class BiliClient {
 
   /** GET 并解析 JSON。JSON code!=0 / HTTP 412 抛 BiliApiError；-412 熔断后重试 1 次；网络异常重试 1 次。 */
   async #getJson<T>(path: string, params?: WbiParams, signed = false): Promise<T> {
+    // P2.6 熔断门禁：冷却期内不再发任何请求（F11：快速刷新触发 -412 后 60s 内零请求，恢复自动续）
+    if (this.#now() < this.#blockedUntil) {
+      throw new BiliApiError(-412, path, `风控熔断中（-412），约 ${Math.ceil((this.#blockedUntil - this.#now()) / 1000)}s 后自动恢复`);
+    }
     for (let attempt = 1; attempt <= 2; attempt++) {
       // 每次尝试都从原始参数重签（python 版重试时会带着旧 w_rid 再签，此处修正）
       const finalParams = signed ? wbiSign(params ?? {}, this.#requireMixin()) : params;
@@ -178,9 +188,11 @@ export class BiliClient {
         if (res.status === 412) {
           // HTTP 层风控与 JSON code -412 同等处理（对齐 python：熔断后重试 1 次）
           if (attempt === 1) {
+            this.#blockedUntil = this.#now() + this.#breakerWaitMs; // P2.6：跨请求熔断窗（同实例其他请求即刻拒绝）
             await sleep(this.#breakerWaitMs);
             continue;
           }
+          this.#blockedUntil = this.#now() + this.#breakerWaitMs; // 审查 P2-1：二次 -412 续窗（attempt1 的窗恰已睡完）
           throw new BiliApiError(-412, path, `HTTP 412 风控拦截（${path}）`);
         }
         let json: { code?: number };
@@ -192,9 +204,11 @@ export class BiliClient {
         const apiCode = json.code ?? 0;
         if (apiCode !== 0) {
           if (apiCode === -412 && attempt === 1) {
+            this.#blockedUntil = this.#now() + this.#breakerWaitMs; // P2.6：跨请求熔断窗
             await sleep(this.#breakerWaitMs);
             continue;
           }
+          if (apiCode === -412) this.#blockedUntil = this.#now() + this.#breakerWaitMs; // 审查 P2-1：二次 -412 续窗
           throw new BiliApiError(apiCode, path);
         }
         return json as T;
@@ -301,7 +315,8 @@ export class BiliClient {
     }
   }
 
-  /** 匿名直下字幕 JSON：不带 Cookie/Referer——auth_key 自鉴权（07 报告 §4 第 3 次复证）。 */
+  /** 匿名直下字幕 JSON：不带 Cookie/Referer——auth_key 自鉴权（07 报告 §4 第 3 次复证）。
+   *  P2.6 字幕结构变化降级：非 JSON/形状漂移不炸链路——归一化吸收变体，空内容走既有 'empty' 语义。 */
   async fetchTranscript(subtitleUrl: string): Promise<TranscriptCue[]> {
     const url = normalizeSubtitleUrl(subtitleUrl);
     await this.#pace();
@@ -311,7 +326,12 @@ export class BiliClient {
       signal: AbortSignal.timeout(this.#timeoutMs),
     });
     if (!res.ok) throw new Error(`字幕下载失败：HTTP ${res.status}`);
-    const j = (await res.json()) as { body?: TranscriptCue[] };
-    return j.body ?? [];
+    let j: unknown;
+    try {
+      j = await res.json();
+    } catch {
+      throw new Error('字幕内容不是有效 JSON（结构变化），稍后重试或改用 ASR');
+    }
+    return normalizeCues((j as { body?: unknown }).body);
   }
 }

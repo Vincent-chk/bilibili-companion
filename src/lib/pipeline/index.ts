@@ -12,7 +12,9 @@ export interface JobError {
 export type JobOutcome =
   | { result: 'done' }
   | { result: 'need_confirm' } // 如 SUMMARIZE 无字幕轨 → 等 ASR 用户确认（F6）
-  | { result: 'failed'; error: JobError };
+  | { result: 'failed'; error: JobError }
+  /** P2.6 F11 断网挂起：网络级失败 → 回 pending 不烧重试（不报错轰炸），恢复后续跑。 */
+  | { result: 'wait'; error: JobError };
 
 export interface JobContext {
   /** 执行中更新 stage/progress（进度动画数据源，落库持久化）。 */
@@ -98,8 +100,11 @@ export class Pipeline {
     return stale.length;
   }
 
-  /** 取最早的 pending 执行到底；无任务返回 false。 */
-  async tick(): Promise<boolean> {
+  /**
+   * 取最早的 pending 执行到底；无任务返回 false，网络挂起返回 'wait'（drain 据此停轮——
+   * 否则 wait 回 pending 会被立即重取，热循环空转）。
+   */
+  async tick(): Promise<boolean | 'wait'> {
     const job = (await this.#db.jobs.where('status').equals('pending').sortBy('createdAt'))[0];
     if (!job) return false;
     await this.#set({ ...job, status: 'running', updatedAt: this.#now() });
@@ -126,6 +131,13 @@ export class Pipeline {
       await this.#set({ ...fresh, status: 'done', progress: 100, updatedAt: this.#now() });
     } else if (outcome.result === 'need_confirm') {
       await this.#set({ ...fresh, status: 'need_confirm', updatedAt: this.#now() });
+    } else if (outcome.result === 'wait') {
+      // P2.6 F11：网络级失败挂起——回 pending 不烧重试（徽章保持「生成中」，不 failed 轰炸）；
+      // 续跑时机由调用方触发（SW online 事件/面板 LIST_QUERY/alarms 兜底）。
+      // 静默写回（审查 P1-1）：running→pending 的 onTransition 广播 SUMMARY_UPDATED 会被
+      // 开着的面板（刷新→LIST_QUERY→drainUnlessPaused）放大成 ~10次/s 的全链重试热循环
+      await this.#set({ ...fresh, status: 'pending', updatedAt: this.#now() }, true);
+      return 'wait';
     } else if (fresh.retries < this.#maxRetries && fresh.type !== 'ASR_SUMMARIZE') {
       // P2.3 审查 P2-4：ASR 链失败不自动重排——重跑=重新下载+重新转写（真实计费）；
       // 用户显式再点【调用 ASR 解析】才会重试（F11 重试由用户发起的同口径）
@@ -138,13 +150,14 @@ export class Pipeline {
     return true;
   }
 
-  /** 串行清空 pending（并发=1；重入时等当前轮结束再补一轮）。 */
+  /** 串行清空 pending（并发=1；重入时等当前轮结束再补一轮；网络挂起即停轮）。 */
   async drain(): Promise<void> {
     if (this.#busy) return;
     this.#busy = true;
     try {
-      while (await this.tick()) {
-        /* 逐个执行 */
+      for (;;) {
+        const r = await this.tick();
+        if (!r || r === 'wait') break; // wait=网络挂起，等恢复后续跑
       }
     } finally {
       this.#busy = false;
@@ -165,7 +178,7 @@ export class Pipeline {
     await this.#set({ ...job, status: 'pending', retries: 0, updatedAt: this.#now() });
   }
 
-  async #set(row: JobRow): Promise<void> {
+  async #set(row: JobRow, silent = false): Promise<void> {
     // 审查 P2-3：error 只在 failed 终态随行——done/need_confirm/重排 pending 一律清除，
     // 防重试成功的 done 行带着旧 error（语义陷阱；单点在 #set 收口覆盖所有迁移路径）
     if (row.status !== 'failed' && row.error !== undefined) {
@@ -173,7 +186,7 @@ export class Pipeline {
       row = rest as JobRow;
     }
     await this.#db.jobs.put(row);
-    this.#emit(row);
+    if (!silent) this.#emit(row); // wait→pending 静默：徽章本就「生成中」，广播只喂热循环
   }
 
   #emit(row: JobRow): void {

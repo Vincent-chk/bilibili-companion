@@ -52,6 +52,7 @@ async function main() {
 
   // 1) mock LLM 服务器（CORS 就绪；port 0 动态分配，从 stdout 解析）——真实模式跳过
   let mock = null;
+  let mock2 = null; // P2.6 断网探针：杀 mock 后原端口重启的实例（finally 须一并回收）
   if (!REAL) {
     requireExists(path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), 'mock-llm-server.mjs（poc-llm 交付物）');
     mock = spawn(process.execPath, [path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), '0'], {
@@ -546,6 +547,8 @@ async function main() {
     let asrProbe = null; // P2.3：F6 ASR 确认流探针（need_asr 卡片/未配置引导/三段进度/done ASR转写）
     let dnrProbe = null; // P2.4：DNR 头级验证探针（bilivideo 实发 Referer + getDynamicRules 形状审计）
     let settingsProbe = null; // P2.5：设置页探针（视图/打码/2.7b 人设联动/阈值/暂停/气泡/清 Key/隐藏+清除迁移）
+    let errProbe = null; // P2.6：错误态探针（Key 无效全链/断网挂起续跑）
+    let errProbeStartIdx = 0; // noExplicitFail 截止线（错误态探针预期产生 failed 终态）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -1513,7 +1516,7 @@ async function main() {
             return JSON.stringify(vs.filter((v) => String(v.videoKey).startsWith(${JSON.stringify(vk + ':')})).length); })()`);
 
           // ---- a) 设置视图基础 + Key 打码 + 测试连接（打码哨兵）+ 保存不改 Key ----
-          await pageEval(`(async () => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); try { v?.pause(); } catch (e) {} return 'paused'; })()`).catch(() => {}); // 防自动播放切走视频
+          await pageEval(`(async () => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); try { if (v && Number.isFinite(v.duration) && v.duration > 0) v.currentTime = v.duration / 2; } catch (e) {} try { v?.pause(); } catch (e) {} return 'paused'; })()`).catch(() => {}); // seek 中段+pause：挡 ended→B 站自动播推荐（p26b/p26d 实测 flake 源）
           await pclick('#btn-settings');
           await sleep(900);
           const stDom = await srOf(`return JSON.stringify({
@@ -1768,7 +1771,142 @@ async function main() {
               containerReset?.listHidden === false && containerReset?.settingsHidden === true &&
               String(containerReset?.status ?? '').includes('未激活'),
           };
+          log('P2.5 llmClear 子值:', JSON.stringify({
+            clearModal, clearedLlm: clearedStore?.settings?.llm, onboarded: clearedStore?.onboarded,
+            pointer: clearedPointer, reLlm: reconfigured?.settings?.llm?.apiKey, reOnboarded: reconfigured?.onboarded,
+            asrAfterClear: asrClearedStore?.settings?.asr }));
           log('P2.5 判定项:', JSON.stringify(settingsProbe));
+
+          // ============================================================
+          // 8.997) P2.6 错误态探针：
+          //   Key 无效全链（F9/F11：坏 Key 首摘要→红徽章+详情 Key 无效+【去设置】+气泡→
+          //   修复→点击重试→徽章转绿）/ 断网挂起续跑（F11：offline→wait 挂起不轰炸→
+          //   恢复→续跑 done）
+          // ============================================================
+          errProbeStartIdx = lines.length; // noExplicitFail 判定在此段前截止（错误态探针预期产生 failed）
+          // a) 坏 Key 全链：先配错 Key（此刻仍在未激活态）→ 开始陪看 → 仍在播的主视频 watcher
+          //    阈值 sweep 立即入队 → 坏 Key 401 → failed(KEY_INVALID)（无需重新观看 20s——
+          //    sweep 以 DB watchedSeconds 为权威，P2.5-d 起累计早已超阈值）
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const i = sr.querySelector('#sec-llm input[data-k="apiKey"]'); i.value = 'e2e-bad-key'; })()`);
+          await pclick('[data-save="sec-llm"]');
+          await sleep(1000);
+          await pclick('#s-back');
+          await sleep(600);
+          await pclick('#btn-start2');
+          let badKeyFailed = false;
+          for (let i = 0; i < 60 && !badKeyFailed; i++) {
+            await sleep(500);
+            const j = (await jobsOf(BVID)) ?? {};
+            badKeyFailed = (j?.sum ?? []).some((x) => x.status === 'failed');
+          }
+          // b) 列表红徽章 + 详情「Key 无效」+【去设置】+ 气泡
+          await pageEval(`(async () => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); try { if (v && Number.isFinite(v.duration) && v.duration > 0) v.currentTime = v.duration / 2; } catch (e) {} try { v?.pause(); } catch (e) {} return 'paused'; })()`).catch(() => {}); // 同 P2.5：防 ended 自动播
+          await pclick('#mascot');
+          await sleep(400);
+          await pclick('#mascot');
+          await sleep(1200);
+          const failBadge = await srOf(`return JSON.stringify({ badge: sr.querySelector(".v-item[data-video-key^='${BVID}:'] .badge")?.textContent ?? '' })`);
+          await srOf(`sr.querySelector(".v-item[data-video-key^='${BVID}:']")?.click()`);
+          await sleep(1200);
+          const failDetail = await srOf(`return JSON.stringify({
+            err: sr.getElementById('d-summary')?.textContent ?? '',
+            goSettings: !!sr.getElementById('d-gosettings') })`);
+          let keyBubble = '';
+          for (let i = 0; i < 8; i++) {
+            const b = await srOf(`return JSON.stringify({ t: sr.getElementById('mascot-bubble')?.textContent ?? '' })`);
+            keyBubble = b?.t ?? '';
+            if (keyBubble.includes('Key 无效')) break;
+            await sleep(400);
+          }
+          // c) 【去设置】直达 → 修复 Key → 回列表点击重试 → 徽章转绿（F11 重试由用户发起）
+          await pclick('#d-gosettings');
+          await sleep(900);
+          const settingsFromFail = await srOf(`return JSON.stringify({ shown: !sr.getElementById('view-settings')?.classList.contains('hidden') })`);
+          await srOf(`(() => { const i = sr.querySelector('#sec-llm input[data-k="apiKey"]'); i.value = ${JSON.stringify(llmCfg.apiKey)}; })()`);
+          await pclick('[data-save="sec-llm"]');
+          await sleep(1000);
+          await pclick('#s-back');
+          await sleep(700);
+          await srOf(`sr.querySelector(".v-item[data-video-key^='${BVID}:']")?.click()`); // retry:1 → failed 摘要重入队
+          let retryDone = false;
+          for (let i = 0; i < 60 && !retryDone; i++) {
+            await sleep(500);
+            const j = (await jobsOf(BVID)) ?? {};
+            retryDone = (j?.sum ?? []).some((x) => x.status === 'done');
+          }
+          await pclick('#d-back'); // 回列表读徽章（F11：重试成功后徽章转绿）
+          await sleep(900);
+          const greenBadge = await srOf(`return JSON.stringify({ badge: sr.querySelector(".v-item[data-video-key^='${BVID}:'] .badge")?.textContent ?? '' })`);
+
+          // d) 断网挂起续跑（F11）：杀掉 mock LLM 服务器（端点不可达=确定性断网；CDP
+          //    emulateNetworkConditions 实测对 offscreen 文档的 fetch 不生效）→ REGENERATE
+          //    → LLM_NETWORK → wait 挂起（pending 不轰炸）→ 原端口重启 mock → 面板 LIST_QUERY
+          //    机会性 drain → done
+          await pclick('#d-back');
+          await sleep(700);
+          const mockPort0 = Number(new URL(llmCfg.baseUrl).port);
+          mock.kill('SIGKILL');
+          await sleep(600);
+          log(`P2.6 mock LLM killed (port ${mockPort0}) = 确定性断网`);
+          await srOf(`sr.querySelector(".v-item[data-video-key^='${BVID}:']")?.click()`);
+          await sleep(1000);
+          await pclick('#d-regen'); // 用户显式重生成 → offscreen fetch mock → 网络失败 → wait
+          let waitedPending = false;
+          let waitLogSeen = false;
+          let oldDoneKept = false; // 审查 P2-4：挂起期间旧 done 行保留（2.7a force 失败不覆盖语义）
+          for (let i = 0; i < 20 && !waitedPending; i++) {
+            await sleep(400);
+            const j = (await jobsOf(BVID)) ?? {};
+            oldDoneKept = oldDoneKept || (j?.sum ?? []).some((x) => x.status === 'done');
+            const rows = await swEval(`(async () => {
+              const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+              const js = await new Promise((res) => { const q = db.transaction('jobs','readonly').objectStore('jobs').getAll(); q.onsuccess = () => res(q.result); });
+              return JSON.stringify(js.filter((x) => String(x.videoKey).startsWith(${JSON.stringify(BVID + ':')})).map((x) => ({ status: x.status, type: x.type })));
+            })()`);
+            const pendingJob = (rows ?? []).some((x) => x.status === 'pending' && x.type === 'REGENERATE');
+            waitLogSeen = lines.slice(errProbeStartIdx).some((l) => l.text.includes('waits for network'));
+            waitedPending = pendingJob && !lines.slice(errProbeStartIdx).some((l) => l.text.includes('REGENERATE') && l.text.includes('→ failed'));
+          }
+          await pclick('#d-back'); // 回列表才能读徽章（详情态列表 DOM 不在文档）
+          await sleep(800);
+          const waitBadge = await srOf(`return JSON.stringify({ badge: sr.querySelector(".v-item[data-video-key^='${BVID}:'] .badge")?.textContent ?? '' })`);
+          // 恢复网络：mock 按原端口重启（存储的 baseUrl 不变）+ 面板开关触发 LIST_QUERY drain
+          mock2 = spawn(process.execPath, [path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), String(mockPort0)], { stdio: ['ignore', 'pipe', 'pipe'] });
+          mock2.stderr?.on('data', (d) => process.stderr.write(`[mock2!] ${d}`));
+          await waitHttp(`http://127.0.0.1:${mockPort0}/health`, 10_000);
+          log('P2.6 mock LLM restarted (网络恢复)');
+          await pclick('#mascot'); // 关面板
+          await sleep(400);
+          await pclick('#mascot'); // 开面板 → LIST_QUERY → drainUnlessPaused
+          let resumedDone = false;
+          for (let i = 0; i < 60 && !resumedDone; i++) {
+            await sleep(500);
+            const j = (await jobsOf(BVID)) ?? {};
+            const rows = j?.sum ?? [];
+            const first = rows[0] ?? {};
+            resumedDone = rows.length >= 1 && first.status === 'done' && lines.slice(errProbeStartIdx).some((l) => l.text.includes('job REGENERATE') && l.text.includes('→ done'));
+          }
+
+          errProbe = {
+            keyInvalidFullLoop:
+              badKeyFailed === true &&
+              (failBadge?.badge ?? '').includes('解析失败') &&
+              (failDetail?.err ?? '').includes('Key 无效') &&
+              failDetail?.goSettings === true &&
+              keyBubble.includes('Key 无效') &&
+              settingsFromFail?.shown === true &&
+              retryDone === true &&
+              (greenBadge?.badge ?? '').includes('已总结'),
+            offlineWaitResume:
+              waitLogSeen === true &&
+              waitedPending === true &&
+              oldDoneKept === true &&
+              (waitBadge?.badge ?? '').includes('生成中') &&
+              resumedDone === true,
+          };
+          log('P2.6 判定项:', JSON.stringify(errProbe));
         }
       }
     }
@@ -1791,7 +1929,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, settingsProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, settingsProbe, errProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -1977,7 +2115,11 @@ async function main() {
       settingsBubblesToggle: REAL || settingsProbe?.bubblesToggle === true,
       settingsLlmClearGates: REAL || settingsProbe?.llmClearGates === true,
       settingsHideAndWipe: REAL || settingsProbe?.hideMascotAndWipe === true,
-      noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
+      // P2.6 错误态：Key 无效全链（红徽章/详情+去设置/气泡/修复重试转绿）+ 断网挂起续跑
+      keyInvalidFullLoop: REAL || errProbe?.keyInvalidFullLoop === true,
+      offlineWaitResume: REAL || errProbe?.offlineWaitResume === true,
+      // P2.6 起：错误态探针段（errProbeStartIdx 起）预期制造 failed 终态——非预期失败判定截止到该段前
+      noExplicitFail: !lines.slice(cookieLineIdx, errProbeStartIdx || lines.length).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
     for (const [k, v] of Object.entries(verdict)) console.log(`  ${v ? '✅' : '❌'} ${k}`);
@@ -1993,6 +2135,7 @@ async function main() {
     await sleep(1200);
     try { chrome.kill('SIGKILL'); } catch { /* noop */ }
     try { mock?.kill('SIGTERM'); } catch { /* noop */ }
+    try { mock2?.kill('SIGTERM'); } catch { /* noop */ } // P2.6 重启的 mock 实例（不杀会拖住进程）
     fs.rmSync(profile, { recursive: true, force: true });
     log('cleanup done (temp profile removed:', !fs.existsSync(profile), ')');
   }

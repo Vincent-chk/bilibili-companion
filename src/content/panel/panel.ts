@@ -673,7 +673,12 @@ export class PanelController {
         (tooBig ? `<div class="d-summary-empty" style="color:#f59e0b">视频较长：音频约 ${estMB}MB，可能超出 25MB 上限</div>` : '') +
         '<div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-primary" id="btn-asr-ok" style="flex:1">调用 ASR 解析</button><button class="btn btn-ghost" id="btn-asr-no" style="flex:1">暂不</button></div>';
     } else if (s?.status === 'failed') {
-      summaryHtml = `<div class="d-summary-empty" style="color:#dc2626">解析失败：${esc(s.error?.msg ?? '未知错误')}</div>`;
+      // P2.6 F9：Key 无效给【去设置】直达入口（错误码分流；其余失败仅文案）
+      summaryHtml =
+        `<div class="d-summary-empty" style="color:#dc2626">解析失败：${esc(s.error?.msg ?? '未知错误')}</div>` +
+        (s.error?.code === 'KEY_INVALID'
+          ? '<div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-primary" id="d-gosettings" style="flex:1">⚙ 去设置检查 Key</button></div>'
+          : '');
     } else {
       summaryHtml = '<div class="d-summary-empty">还没有摘要</div>';
     }
@@ -713,6 +718,7 @@ export class PanelController {
 
     root.getElementById('d-back')?.addEventListener('click', () => this.#backToList());
     root.getElementById('d-regen')?.addEventListener('click', () => void this.#onRegenerate());
+    root.getElementById('d-gosettings')?.addEventListener('click', () => void this.#showSettings());
     root.getElementById('btn-asr-ok')?.addEventListener('click', () => void this.#onAsrConfirm(item.visit.videoKey));
     root.getElementById('btn-asr-no')?.addEventListener('click', () => void this.#onAsrDecline(item.visit.videoKey));
     // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）；

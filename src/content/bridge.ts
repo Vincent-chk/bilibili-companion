@@ -26,6 +26,8 @@ export interface UiEvent {
   segIndex?: number; // SEGMENT_NOTE_*（P1.11）
   text?: string; // SEGMENT_NOTE_DONE 终态文本
   error?: { code: string; msg: string }; // SEGMENT_NOTE_FAILED
+  errorCode?: string; // SUMMARY_FAILED（P2.6）：失败码（KEY_INVALID→气泡「去设置」分流）
+  errorMsg?: string; // SUMMARY_FAILED（P2.6）：失败文案
   truncated?: boolean; // 超长段截断标注
   closedAt?: number; // SESSION_STATE（P2.1）：GRACE 基准时刻
   retainUntil?: number; // SESSION_STATE（P2.1）：保留截止时刻（面板倒计时数据源）

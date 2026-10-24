@@ -124,6 +124,11 @@ const server = http.createServer((req, res) => {
       res.writeHead(401, { ...CORS, 'Content-Type': 'application/json' });
       return res.end('{"error":{"message":"missing or invalid Bearer token"}}');
     }
+    // P2.6 E2E：指定坏 Key → 401（F9/F11「填入错误 Key→生成失败明确提示 Key 无效」全链）
+    if (auth.slice(7).trim() === 'e2e-bad-key') {
+      res.writeHead(401, { ...CORS, 'Content-Type': 'application/json' });
+      return res.end('{"error":{"message":"Invalid API key provided"}}');
+    }
     const held = slowNext > 0 ? (slowNext -= 1, slowMs) : 0;
     let body = '';
     req.on('data', (c) => (body += c));
