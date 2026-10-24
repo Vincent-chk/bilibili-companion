@@ -7,6 +7,7 @@
 import { browser } from 'wxt/browser';
 import type { Bridge, UiEvent } from '../bridge';
 import { LOGIN_CARD_TEXT, shouldShowLoginCard } from '../login';
+import { estimateAudioBytes } from '../../lib/asr';
 import { esc, toast, type DoubaoUi } from '../ui/root';
 import {
   BADGE_HTML,
@@ -55,6 +56,8 @@ export interface PanelDeps {
   onSessionEnd: () => void;
   /** 大纲/转写条目点击 → 播放器 seek（P1.8；同页/跨标签页路由在 content 侧）。 */
   onSeek: (videoKey: string, timeSec: number) => void;
+  /** P2.3 F6-③：未配置 ASR 时点【调用 ASR 解析】→ 打开 onboarding 的 ASR 补配模式（content 侧持有弹窗流程）。 */
+  onNeedAsrConfig: () => void;
   /** 测试可注入的定时器。 */
   setTimeout?: typeof setTimeout;
 }
@@ -375,11 +378,7 @@ export class PanelController {
   async #onItemClick(videoKey: string): Promise<void> {
     const item = this.#items.find((i) => i.videoKey === videoKey);
     if (!item) return;
-    if (item.badge === 'nosub') {
-      // ASR 确认卡是任务 2.3（F6）；先提示文案本身
-      toast(this.deps.ui, '该视频文字信息较少，ASR 解析确认流将在后续版本接入');
-      return;
-    }
+    // nosub（need_asr/need_confirm）也进详情——ASR 确认卡在详情摘要区（P2.3 F6）
     // 已总结 → 直接取缓存；生成中/未生成/失败 → SUMMARY_OPEN（无缓存时按需建 job）→ 流式详情
     // retry:1 = 用户显式点击——仅此路径允许对 failed 摘要重新入队（F11 重试由用户发起；
     // 广播刷新路径不带 retry，否则 failed+详情打开 = 无限自动重试环）
@@ -456,6 +455,44 @@ export class PanelController {
     }
   }
 
+  /**
+   * P2.3 F6：【调用 ASR 解析】→ ASR_CONFIRM。成功 → 详情切流式（阶段动画 audio→asr→llm）；
+   * 未配置 → onNeedAsrConfig（onboarding ASR 补配模式，配置后回卡片可继续）；
+   * busy（同视频任务在途）→ toast。
+   */
+  async #onAsrConfirm(videoKey: string): Promise<void> {
+    try {
+      const r = await this.deps.bridge.request<{ ok: boolean; started?: boolean; reason?: string; error?: string }>({
+        type: 'ASR_CONFIRM',
+        videoKey,
+      });
+      if (r?.reason === 'NEED_ASR_CONFIG') {
+        this.deps.onNeedAsrConfig();
+        return;
+      }
+      if (!r?.ok || !r.started) {
+        toast(this.deps.ui, r?.error === 'no-session' ? '会话未激活' : '已有任务进行中，稍后再试');
+        return;
+      }
+      this.#segNotes = new Map();
+      this.#segOpen = new Set();
+      this.#stream = { videoKey, acc: '' };
+      this.#paintStream(); // 立即切「下载音频中…」等待态；增量经 SUMMARY_PROGRESS 进 #stream
+    } catch {
+      toast(this.deps.ui, 'ASR 解析发起失败，稍后再试');
+    }
+  }
+
+  /** P2.3 F6-⑥：【暂不】→ 保持橙色标注（无状态迁移），回列表。 */
+  async #onAsrDecline(videoKey: string): Promise<void> {
+    try {
+      await this.deps.bridge.request({ type: 'ASR_DECLINE', videoKey });
+    } catch {
+      /* SW 未就绪：decline 无状态迁移，忽略 */
+    }
+    this.#backToList();
+  }
+
   #renderDetail(item: ListQueryItem, transcript?: TranscriptExcerpt): void {
     const root = this.deps.ui.root;
     const box = root.getElementById('view-list');
@@ -479,7 +516,17 @@ export class PanelController {
     } else if (s?.status === 'done' && s.summary) {
       summaryHtml = esc(s.summary);
     } else if (s?.status === 'need_asr') {
-      summaryHtml = '<div class="d-summary-empty">该视频文字信息较少，请确认是否调用 ASR 做进一步解析？</div>';
+      // P2.3 F6-①：卡片文案逐字（总纲口径）；【调用 ASR 解析】【暂不】+ 超长预告（音频估算 >25MB）
+      const estMB = Math.round(estimateAudioBytes(v?.duration ?? 0) / 1048576);
+      const tooBig = estMB > 25; // settings.asrMaxMB 默认 25；预告口径用默认值即可（实际拦截在执行体）
+      // 审查 P1-1：上次 ASR 尝试失败原因（音频链失败保留 need_asr 行、错误在 job 行）——不显示则
+      // 用户「点确认→闪一下→回原卡」零反馈，反复点＝反复下载整段音频（F6-⑦ 明确提示不成立）
+      const lastErr = !isJobActive(item.job) && item.lastJob?.status === 'failed' ? item.lastJob?.error : undefined;
+      summaryHtml =
+        '<div class="d-summary-empty">该视频文字信息较少，请确认是否调用 ASR 做进一步解析？</div>' +
+        (lastErr ? `<div class="d-summary-empty" style="color:#dc2626">上次尝试失败：${esc(lastErr.msg)}</div>` : '') +
+        (tooBig ? `<div class="d-summary-empty" style="color:#f59e0b">视频较长：音频约 ${estMB}MB，可能超出 25MB 上限</div>` : '') +
+        '<div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-primary" id="btn-asr-ok" style="flex:1">调用 ASR 解析</button><button class="btn btn-ghost" id="btn-asr-no" style="flex:1">暂不</button></div>';
     } else if (s?.status === 'failed') {
       summaryHtml = `<div class="d-summary-empty" style="color:#dc2626">解析失败：${esc(s.error?.msg ?? '未知错误')}</div>`;
     } else {
@@ -515,10 +562,14 @@ export class PanelController {
       (outlineHtml ? `<div class="d-sec"><h3>🧭 要点大纲</h3><ul class="d-outline">${outlineHtml}</ul></div>` : '') +
       sayHtml +
       trHtml +
-      `<div class="d-foot"><button class="btn btn-ghost" id="d-regen">↻ 重新生成</button><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`;
+      (s && s.status !== 'need_asr'
+        ? `<div class="d-foot"><button class="btn btn-ghost" id="d-regen">↻ 重新生成</button><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`
+        : '');
 
     root.getElementById('d-back')?.addEventListener('click', () => this.#backToList());
     root.getElementById('d-regen')?.addEventListener('click', () => void this.#onRegenerate());
+    root.getElementById('btn-asr-ok')?.addEventListener('click', () => void this.#onAsrConfirm(item.visit.videoKey));
+    root.getElementById('btn-asr-no')?.addEventListener('click', () => void this.#onAsrDecline(item.visit.videoKey));
     // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）；
     // P1.11：【AI 解读】按钮与注记卡内的点击不触发 seek（两动作互不干扰，PRD F13）
     const seekKey = item.visit.videoKey;

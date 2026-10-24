@@ -126,7 +126,9 @@ export class Pipeline {
       await this.#set({ ...fresh, status: 'done', progress: 100, updatedAt: this.#now() });
     } else if (outcome.result === 'need_confirm') {
       await this.#set({ ...fresh, status: 'need_confirm', updatedAt: this.#now() });
-    } else if (fresh.retries < this.#maxRetries) {
+    } else if (fresh.retries < this.#maxRetries && fresh.type !== 'ASR_SUMMARIZE') {
+      // P2.3 审查 P2-4：ASR 链失败不自动重排——重跑=重新下载+重新转写（真实计费）；
+      // 用户显式再点【调用 ASR 解析】才会重试（F11 重试由用户发起的同口径）
       await this.#set({ ...fresh, status: 'pending', retries: fresh.retries + 1, updatedAt: this.#now() });
     } else {
       // error 随终态落 job 行：摘要失败的权威源仍是 summaries.error（任务 1.4），

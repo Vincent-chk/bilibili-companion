@@ -6,6 +6,7 @@
 import { browser } from 'wxt/browser';
 import { BiliClient } from '../../src/lib/bilibili/client';
 import { runSummarizeJob } from '../../src/lib/summarize/chain';
+import { runAsrJob } from '../../src/lib/summarize/asr';
 import { runSegmentJob } from '../../src/lib/summarize/segment';
 import { CompanionDB } from '../../src/lib/storage';
 import type { LlmConfig } from '../../src/lib/llm/types';
@@ -19,6 +20,9 @@ interface RunJobMsg {
   persona?: string;
   /** 整流超时（SW resolveConfig 解析，思考型真实模型 > 默认 60s）。 */
   timeoutMs?: number;
+  /** P2.3：ASR 配置随 job 下发（offscreen 读不了 storage，SW 解析后传入）。 */
+  asr?: { baseUrl: string; modelId: string; apiKey: string };
+  asrMaxMB?: number;
 }
 
 /** 进度回传节流：token 级 delta 高频，200ms 合并一次防消息风暴（stage/progress/deltaText 共用）。
@@ -60,7 +64,7 @@ function makeCtx(jobId: string, segIndex?: number) {
 browser.runtime.onMessage.addListener((msg: unknown) => {
   const m = msg as RunJobMsg;
   if (m?.type !== 'OFFSCREEN_RUN_JOB' || !m.job?.videoKey || !m.llm) return undefined; // 非本品消息交给其它 listener
-  return handleRun(m.job, m.llm, m.persona, m.timeoutMs).catch((e: unknown) => ({
+  return handleRun(m.job, m.llm, m.persona, m.timeoutMs, m.asr, m.asrMaxMB).catch((e: unknown) => ({
     result: 'failed' as const,
     error: { code: 'CHAIN_ERROR', msg: String(e).slice(0, 200) },
   }));
@@ -71,6 +75,8 @@ async function handleRun(
   llm: LlmConfig,
   persona?: string,
   timeoutMs?: number,
+  asr?: { baseUrl: string; modelId: string; apiKey: string },
+  asrMaxMB?: number,
 ) {
   console.log(
     `[doubao] offscreen run job=${job.id} videoKey=${job.videoKey}${job.type === 'SEGMENT_ANALYZE' ? ` seg=${job.segIndex}` : ''}`,
@@ -88,12 +94,33 @@ async function handleRun(
             { videoKey: job.videoKey, segIndex: job.segIndex },
             ctx,
           )
-      : await runSummarizeJob(
-          { db, bili: new BiliClient(), llm, persona, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
-          job,
-          ctx,
-          { force: job.type === 'REGENERATE' }, // 2.7a：重新生成绕过 done 缓存，成功整行覆盖
-        );
+      : job.type === 'ASR_SUMMARIZE'
+        ? asr
+          ? await runAsrJob(
+              {
+                db,
+                bili: new BiliClient(),
+                llm,
+                persona,
+                timeoutMs,
+                asr,
+                asrMaxMB: asrMaxMB ?? 25,
+                onDelta: (t) => ctx.pushDelta(t),
+              },
+              job,
+              ctx,
+            )
+          : {
+              // SW 侧已拦未配置；此为防御（offscreen 读不了 storage，配置必须由 SW 随 job 传入）
+              result: 'failed' as const,
+              error: { code: 'NEED_ASR_CONFIG', msg: 'ASR 未配置（配置未随任务下发）' },
+            }
+        : await runSummarizeJob(
+            { db, bili: new BiliClient(), llm, persona, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
+            job,
+            ctx,
+            { force: job.type === 'REGENERATE' }, // 2.7a：重新生成绕过 done 缓存，成功整行覆盖
+          );
   console.log(`[doubao] offscreen job=${job.id} → ${outcome.result}`);
   return outcome;
 }

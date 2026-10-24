@@ -65,9 +65,10 @@ export function originPattern(baseUrl: string): string | null {
   return r.ok ? `${r.origin}/*` : null;
 }
 
-/** onboarding 保存载荷（content → background SETTINGS_SAVE）。 */
+/** onboarding 保存载荷（content → background SETTINGS_SAVE）。
+ *  P2.3：llm 可选——ASR 补配模式只带 asr（SW 沿用已存 LLM，Key 明文不下发面板）。 */
 export interface SettingsSavePayload {
-  llm: ModelConfigInput;
+  llm?: ModelConfigInput;
   asr?: ModelConfigInput;
 }
 

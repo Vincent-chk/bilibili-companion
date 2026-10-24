@@ -16,8 +16,9 @@ export default defineConfig({
   manifest: {
     name: '豆包陪看助手（PoC）',
     description: 'Phase 0 PoC：B 站视频识别 + 字幕直取 + LLM 摘要 console 打印',
-    // alarms：P2.1 保留期判定的 30min 兜底唤醒（架构 §3.7）；webNavigation：P1.9 起 SPA 路由探测（架构 §3.1 主路）
-    permissions: ['storage', 'offscreen', 'webNavigation', 'alarms'],
+    // alarms：P2.1 保留期判定的 30min 兜底唤醒（架构 §3.7）；webNavigation：P1.9 起 SPA 路由探测（架构 §3.1 主路）；
+    // declarativeNetRequest：P2.3 起 ASR 音频请求补 Referer（架构 §3.8，bilivideo.com/.cn 动态规则）
+    permissions: ['storage', 'offscreen', 'webNavigation', 'alarms', 'declarativeNetRequest'],
     host_permissions: [
       '*://*.bilibili.com/*',
       '*://*.hdslb.com/*',

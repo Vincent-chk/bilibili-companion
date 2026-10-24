@@ -212,3 +212,33 @@ describe('执行中被清除（F10 wipe）不复活', () => {
     await db.delete();
   });
 });
+
+describe('P2.3 审查 P2-4：ASR_SUMMARIZE 失败不自动重排', () => {
+  it('failed 的 ASR job 直落终态（重试=重新下载+转写计费，须用户显式发起）', async () => {
+    const db = freshDb();
+    const q = new Pipeline(db, {
+      execute: async () => ({ result: 'failed', error: { code: 'ASR_HTTP', msg: 'x' } }),
+    });
+    const j = await q.enqueue({ type: 'ASR_SUMMARIZE', videoKey: 'BV1x:1', sessionId: 's' });
+    await q.drain();
+    const row = await db.jobs.get(j.id);
+    expect(row?.status).toBe('failed'); // 不回 pending
+    expect(row?.retries).toBe(0);
+    await db.delete();
+  });
+  it('SUMMARIZE 失败仍自动重试一次（对照组，行为不变）', async () => {
+    const db = freshDb();
+    let n = 0;
+    const q = new Pipeline(db, {
+      execute: async () => {
+        n += 1;
+        return n === 1 ? { result: 'failed', error: { code: 'X', msg: 'x' } } : { result: 'done' };
+      },
+    });
+    const j = await q.enqueue({ type: 'SUMMARIZE', videoKey: 'BV1x:1', sessionId: 's' });
+    await q.drain();
+    expect(n).toBe(2);
+    expect((await db.jobs.get(j.id))?.status).toBe('done');
+    await db.delete();
+  });
+});

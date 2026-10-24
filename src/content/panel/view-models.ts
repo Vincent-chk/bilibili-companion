@@ -26,6 +26,8 @@ export interface ListQueryItem {
   video?: VideoRow;
   summary?: SummaryInfo;
   job?: JobInfo;
+  /** P2.3 审查 P1-1：最近一次 job 终态（failed 时的 error 是 need_asr 卡片的失败反馈数据源）。 */
+  lastJob?: { status: JobRow['status']; error?: { code: string; msg: string } };
 }
 
 export interface ListItemVM {

@@ -57,6 +57,8 @@ function sse(res, text) {
   tick();
 }
 
+let asrStats = { bytes: 0, sawFile: false, calls: 0 }; // P2.3 E2E 判定数据源（音频体量进判定，审查 N-10）
+
 const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS);
@@ -73,6 +75,48 @@ const server = http.createServer((req, res) => {
     console.log(`slow-llm armed: next ${slowNext} request(s) hold ${slowMs}ms`);
     res.writeHead(200, { ...CORS, 'Content-Type': 'text/plain' });
     return res.end('armed');
+  }
+  // P2.3 mock ASR：GET /models 探活；POST /audio/transcriptions 收 multipart → verbose_json
+  // （转写文本含「分段解读」标记吗？不含——走 validPayload 的正常摘要链）
+  if (req.method === 'GET' && req.url === '/models') {
+    const auth = req.headers.authorization ?? '';
+    if (!auth.startsWith('Bearer ') || auth.slice(7).trim() === '') {
+      res.writeHead(401, { ...CORS, 'Content-Type': 'application/json' });
+      return res.end('{"error":{"message":"missing Bearer"}}');
+    }
+    res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ object: 'list', data: [{ id: 'mock-asr-model' }] }));
+  }
+  if (req.method === 'GET' && req.url === '/__test/asr-stats') {
+    res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(asrStats));
+  }
+  if (req.method === 'POST' && req.url === '/audio/transcriptions') {
+    const auth = req.headers.authorization ?? '';
+    if (!auth.startsWith('Bearer ') || auth.slice(7).trim() === '') {
+      res.writeHead(401, { ...CORS, 'Content-Type': 'application/json' });
+      return res.end('{"error":{"message":"missing Bearer"}}');
+    }
+    let bytes = 0;
+    let sawFile = false;
+    const ct = req.headers['content-type'] ?? '';
+    const boundary = (ct.match(/boundary=(\S+)/) ?? [])[1] ?? '';
+    req.on('data', (c) => {
+      bytes += c.length;
+      if (!sawFile && boundary && String(c).includes('name="file"')) sawFile = true;
+    });
+    req.on('end', () => {
+      asrStats = { bytes, sawFile, calls: asrStats.calls + 1 };
+      console.log(`mock-asr transcriptions: bytes=${bytes} sawFile=${sawFile}`);
+      // 30 条 × 12 字 = 360 字（>50 低内容阈值；>1 条进 Map-Reduce 阈值不必需）
+      const segs = Array.from({ length: 30 }, (_, i) => ({ start: i * 10, end: i * 10 + 9, text: `第${i + 1}句模拟语音转写内容示例` }));
+      res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        task: 'transcribe', language: 'zh', duration: 300, text: segs.map((s) => s.text).join(''),
+        segments: segs, model: 'mock-asr-model',
+      }));
+    });
+    return;
   }
   if (req.method === 'POST' && req.url === '/chat/completions') {
     const auth = req.headers.authorization ?? '';

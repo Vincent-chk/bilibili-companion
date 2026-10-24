@@ -187,61 +187,83 @@ export async function runSummarizeJob(
       return { result: 'failed', error: err };
     }
     const transcript = tr.transcript;
-    await ctx.update({ stage: 'llm_map', progress: 45 });
-
-    const meta = { title: video.title, duration: video.duration, cueCount: transcript.cues.length };
-    const llmOpts = {
-      fetchImpl: deps.fetchImpl,
-      persona,
-      ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}),
-      ...(deps.onDelta
-        ? { onDelta: (ev: StreamEvent) => { if (ev.type === 'delta') deps.onDelta?.(ev.text); } }
-        : {}),
-    };
-    let outcome: SummarizeOutcome;
-    if (transcript.charCount <= SINGLE_PASS_THRESHOLD_CHARS) {
-      outcome = await summarize(llm, meta, compactCues(transcript.cues), llmOpts);
-    } else {
-      outcome = await mapReduceSummarize(llm, meta, transcript.cues, llmOpts);
-    }
-    // 真实 LLM 补验指标（offscreen console → E2E console.json 采集；ttft=首 content token，不含 reasoning）
-    console.log(
-      `[doubao] llm summarize ttft=${outcome.ttftMs ?? -1}ms attempts=${outcome.attempts} degraded=${outcome.degraded} usage=${JSON.stringify(outcome.usage ?? null)}`,
-    );
-    await ctx.update({ stage: 'llm_reduce', progress: 90 });
-
-    if (outcome.degraded || !outcome.summaryResult) {
-      // 审查 P2-4：force+旧 done → 不以降级纯文本（outline=[]）换掉旧结构化摘要+注记
-      if (keepDone) {
-        return { result: 'failed', error: { code: 'DEGRADED', msg: '重生成输出未通过校验，旧摘要已保留，可稍后重试' } };
-      }
-      // 降级纯文本（F5：不白屏）：summary=前600字、outline 置空
-      await db.summaries.put({
-        ...baseSummary,
-        source: transcript.source,
-        summary: outcome.plainText ?? '',
-        status: 'done',
-      });
-      return { result: 'done' };
-    }
-    const r = outcome.summaryResult;
-    await db.summaries.put({
-      ...baseSummary,
-      source: transcript.source,
-      summary: r.summary,
-      outline: r.outline,
-      evaluation: r.evaluation,
-      rating: r.rating,
-      status: 'done',
-    });
-    return { result: 'done' };
+    // P2.3 起本段与 ASR 链共用（runLlmAndPersist）：转写→LLM→校验→落库的单一实现
+    return await runLlmAndPersist(deps, ctx, { video, transcript, baseSummary, keepDone });
   } catch (e) {
     const error = mapLlmError(e);
-    // 2.7a：force 重生成失败不覆盖旧 done 摘要（keepDone，审查 P0-1/P1-1：口径=videoKey 最新行，
-    // 多模型安全）；成功路径的 put 为整行替换——segmentNotes 不在 baseSummary 中，分段缓存随重生成自然失效清空
+    // 2.7a：force 重生成失败不覆盖旧 done 摘要（keepDone 在 try 前锁定，审查 P0-1/P1-1：
+    // 口径=videoKey 最新行，多模型安全）；成功路径的 put 为整行替换——segmentNotes 不在
+    // baseSummary 中，分段缓存随重生成自然失效清空
     if (!keepDone) {
       await db.summaries.put({ ...baseSummary, status: 'failed', error });
     }
     return { result: 'failed', error };
   }
+}
+
+/**
+ * P2.3 抽取（SUMMARIZE 与 ASR_SUMMARIZE 共用）：已有 transcript → LLM（单趟/Map-Reduce）
+ * → 结构化校验/降级 → summaries 落库。keepDone=失败不覆盖旧 done 行（2.7a 审查 P0-1 语义）。
+ */
+export async function runLlmAndPersist(
+  deps: SummarizeChainDeps,
+  ctx: ChainCtx,
+  input: {
+    video: VideoRow;
+    transcript: TranscriptRow;
+    baseSummary: Omit<SummaryRow, 'status'>;
+    keepDone: boolean;
+  },
+): Promise<JobOutcome> {
+  const { db, llm } = deps;
+  const { video, transcript, baseSummary, keepDone } = input;
+  const persona = deps.persona ?? 'spicy';
+  await ctx.update({ stage: 'llm_map', progress: 45 });
+
+  const meta = { title: video.title, duration: video.duration, cueCount: transcript.cues.length };
+  const llmOpts = {
+    fetchImpl: deps.fetchImpl,
+    persona,
+    ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}),
+    ...(deps.onDelta
+      ? { onDelta: (ev: StreamEvent) => { if (ev.type === 'delta') deps.onDelta?.(ev.text); } }
+      : {}),
+  };
+  let outcome: SummarizeOutcome;
+  if (transcript.charCount <= SINGLE_PASS_THRESHOLD_CHARS) {
+    outcome = await summarize(llm, meta, compactCues(transcript.cues), llmOpts);
+  } else {
+    outcome = await mapReduceSummarize(llm, meta, transcript.cues, llmOpts);
+  }
+  // 真实 LLM 补验指标（offscreen console → E2E console.json 采集；ttft=首 content token，不含 reasoning）
+  console.log(
+    `[doubao] llm summarize ttft=${outcome.ttftMs ?? -1}ms attempts=${outcome.attempts} degraded=${outcome.degraded} usage=${JSON.stringify(outcome.usage ?? null)}`,
+  );
+  await ctx.update({ stage: 'llm_reduce', progress: 90 });
+
+  if (outcome.degraded || !outcome.summaryResult) {
+    // 审查 P2-4：force+旧 done → 不以降级纯文本（outline=[]）换掉旧结构化摘要+注记
+    if (keepDone) {
+      return { result: 'failed', error: { code: 'DEGRADED', msg: '重生成输出未通过校验，旧摘要已保留，可稍后重试' } };
+    }
+    // 降级纯文本（F5：不白屏）：summary=前600字、outline 置空
+    await db.summaries.put({
+      ...baseSummary,
+      source: transcript.source,
+      summary: outcome.plainText ?? '',
+      status: 'done',
+    });
+    return { result: 'done' };
+  }
+  const r = outcome.summaryResult;
+  await db.summaries.put({
+    ...baseSummary,
+    source: transcript.source,
+    summary: r.summary,
+    outline: r.outline,
+    evaluation: r.evaluation,
+    rating: r.rating,
+    status: 'done',
+  });
+  return { result: 'done' };
 }

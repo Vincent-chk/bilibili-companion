@@ -29,6 +29,8 @@ const EXT_DIR = path.join(ROOT, '.output', 'chrome-mv3');
 const CFT = path.join(ROOT, '.bin', 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing');
 const CHROME = process.env.E2E_BROWSER || (fs.existsSync(CFT) ? CFT : '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
 const BVID = process.argv[2] || 'BV1XynB6EEiM';
+// P2.3 ASR 探针样本：无字幕视频（基线清单，07 报告 §6.1；可用 ASR_BVID 覆盖）
+const ASR_BVID = process.env.ASR_BVID || 'BV1B5JY66E1X';
 const PAGE_URL = `https://www.bilibili.com/video/${BVID}`;
 // 真实 LLM 补验模式：跳过 mock server，POC_LLM_* 直打真实端点（Key 仅经进程 env，不打印不落盘不入仓库）
 const REAL = process.env.E2E_REAL_LLM === '1';
@@ -519,6 +521,7 @@ async function main() {
     let regenProbe = null; // 2.7a：【重新生成】REGENERATE 探针
     let retentionProbe = null; // P2.1：保留期判定探针（GRACE 倒计时/59min 恢复/超期 EXPIRED）
     let wipeProbe = null; // P2.2：F10 清除链路探针（超期弹窗/稍后提醒重弹/立即清除/手动清除）
+    let asrProbe = null; // P2.3：F6 ASR 确认流探针（need_asr 卡片/未配置引导/三段进度/done ASR转写）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -1286,6 +1289,148 @@ async function main() {
           };
           log('P2.2 判定项:', JSON.stringify(wipeProbe));
         }
+
+        // 8.995) P2.3 F6 ASR 确认流（mock 模式）：无字幕视频 → 20s 触发 → need_asr 橙标
+        //   → 卡片文案逐字 → 未配置点【调用 ASR 解析】→ onboarding ASR 补配模式（LLM 沿用）
+        //   → 填 mock ASR 保存 → 回卡片再点确认 → 真实 playurl+音频下载（DNR 补 Referer）
+        //   → mock /audio/transcriptions（verbose_json）→ mock LLM → done（来源=ASR转写）
+        if (!REAL) {
+          const ASR_PAGE = `https://www.bilibili.com/video/${ASR_BVID}/`;
+          const panelJson = (expr) => pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const first = sr.querySelector('.v-item');
+            ${expr}
+            return JSON.stringify(ret);
+          })()`);
+          const asrModal = () => pageEval(`(() => {
+            const mr = document.getElementById('doubao-ui-root').shadowRoot.getElementById('modal-root');
+            return JSON.stringify({ shown: mr.classList.contains('show'),
+              title: mr.querySelector('h2')?.textContent ?? '', hasLlmStep: !!mr.querySelector('#ob-llm'),
+              hasAsrStep: !!mr.querySelector('#ob-asr'), hasSave: !!mr.querySelector('#ob-save') });
+          })()`);
+          const pclick = (sel) => pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('${sel}')?.click()`);
+
+          // a) 新会话（P2.2 收尾已回未激活）→ 导航无字幕视频页 → 静音播放
+          await pclick('#btn-start2');
+          await sleep(900);
+          await cdp('Page.navigate', { url: ASR_PAGE }, probeSid);
+          await cdp('Page.bringToFront', {}, probeSid).catch(() => {}); // 有效观看=前台+播放中：tab1 此前被 tab2/tab3 顶到后台
+          let uiReady = false;
+          for (let i = 0; i < 40 && !uiReady; i++) {
+            await sleep(500);
+            uiReady = await pageEval(`!!document.getElementById('doubao-ui-root')?.shadowRoot?.getElementById('mascot')`);
+          }
+          // 面板随导航重置为关：开面板等 need_asr 徽章（5s 阈值真实触发 → 无轨 → need_confirm）
+          await pclick('#mascot');
+          await sleep(800);
+          const playExpr2 = `(async () => {
+            const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
+            if (!v) return JSON.stringify({ err: 'no-video' });
+            v.muted = true;
+            try { await v.play(); return JSON.stringify({ ok: true, paused: v.paused }); } catch (e) { return JSON.stringify({ err: String(e.name ?? e) }); }
+          })()`;
+          let played = false;
+          for (let i = 0; i < 12 && !played; i++) {
+            const r = await pageEval(`(async () => ${playExpr2})()`);
+            played = r?.ok === true && r?.paused === false;
+            log(`ASR play attempt ${i + 1}:`, JSON.stringify(r));
+            if (!played) await sleep(1500);
+          }
+          let nosubBadge = null;
+          for (let i = 0; i < 120 && !(nosubBadge?.badge ?? '').includes('无字幕'); i++) {
+            await sleep(500);
+            nosubBadge = await panelJson(`const b = first?.querySelector('.badge'); const ret = { badge: b?.textContent ?? '', key: first?.getAttribute('data-video-key') ?? '' };`);
+          }
+          await shotNamed(probeSid, 'visual-asr-need-confirm.png');
+
+          // b) 点条目 → 详情 ASR 确认卡（文案逐字 F6-①）+【调用 ASR 解析】【暂不】
+          await pclick('.v-item');
+          let asrCard = null;
+          for (let i = 0; i < 16 && !(asrCard?.text ?? '').includes('调用 ASR'); i++) {
+            await sleep(400);
+            asrCard = await pageEval(`(() => {
+              const sr = document.getElementById('doubao-ui-root').shadowRoot;
+              const s = sr.getElementById('d-summary');
+              return JSON.stringify({ text: s?.textContent ?? '', hasOk: !!sr.getElementById('btn-asr-ok'), hasNo: !!sr.getElementById('btn-asr-no'), hint: (s?.textContent ?? '').includes('25MB') });
+            })()`);
+          }
+
+          // c) 未配置 → 点【调用 ASR 解析】→ onboarding ASR 补配模式（无 LLM 步、有 ASR 步）
+          await pclick('#btn-asr-ok');
+          let obAsr = null;
+          for (let i = 0; i < 12 && !(obAsr?.shown); i++) {
+            await sleep(400);
+            obAsr = await asrModal();
+          }
+          // d) 填 mock ASR → 保存（asr-only 载荷：SW 沿用已存 LLM）→ 模态关闭
+          if (obAsr?.shown) {
+            await pageEval(`(() => {
+              const sec = document.getElementById('doubao-ui-root').shadowRoot.getElementById('ob-asr');
+              const set = (k, v) => { const i = sec.querySelector(\`input[data-k="\${k}"]\`); if (i) i.value = v; };
+              set('baseUrl', ${JSON.stringify(llmCfg.baseUrl)});
+              set('modelId', 'mock-asr-model');
+              set('apiKey', 'e2e-mock-asr-key');
+            })()`);
+            await pclick('#ob-save');
+            await sleep(1200);
+          }
+          const afterSave = await asrModal();
+
+          // e) 回到卡片（详情仍在）再点确认 → 三段进度动画 → done ASR转写。
+          //    mock 全链 ~3s：阶段文案是转瞬动画，轮询断言「至少一个阶段文案被观测到」
+          //    （下载音频/语音转写/整理要点/撰写摘要），不要求逐一捕获。
+          let stageSeen = false;
+          const stageSamples = [];
+          if (!afterSave?.shown) {
+            await pclick('#btn-asr-ok');
+            for (let i = 0; i < 40 && !stageSeen; i++) {
+              await sleep(300);
+              const st = await pageEval(`(() => {
+                const sr = document.getElementById('doubao-ui-root').shadowRoot;
+                const t = sr.getElementById('d-summary')?.textContent ?? '';
+                return JSON.stringify({ stage: t.includes('下载音频') || t.includes('语音转写') || t.includes('整理要点') || t.includes('撰写摘要'),
+                  sample: t.slice(0, 40), inDetail: !!sr.getElementById('d-back') });
+              })()`);
+              if (stageSamples.length < 6) stageSamples.push(st?.sample ?? '');
+              stageSeen = st?.stage === true;
+            }
+            log('ASR 阶段观测样本:', JSON.stringify(stageSamples));
+          }
+          // done 判定以详情视图为准：面板此刻在详情页（点过确认卡），列表徽章 DOM 不在文档中；
+          // done 后 SUMMARY_DONE 广播重开详情 → 来源徽章 ASR转写 + 成品摘要就位
+          let asrDetail = null;
+          for (let i = 0; i < 60 && !(asrDetail?.srcBadge ?? '').includes('ASR转写'); i++) {
+            await sleep(500);
+            asrDetail = await pageEval(`(() => {
+              const sr = document.getElementById('doubao-ui-root').shadowRoot;
+              return JSON.stringify({ srcBadge: sr.querySelector('.src-badge')?.textContent ?? '',
+                sumLen: (sr.getElementById('d-summary')?.textContent ?? '').length });
+            })()`);
+          }
+          const asrDb = await swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const trs = await new Promise((res) => { const q = db.transaction('transcripts','readonly').objectStore('transcripts').getAll(); q.onsuccess = () => res(q.result); });
+            const sums = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
+            return JSON.stringify({ transcripts: trs.map((t) => ({ source: t.source, cues: t.cues.length })),
+              summaries: sums.map((s) => ({ status: s.status, source: s.source })) });
+          })()`);
+          await shotNamed(probeSid, 'visual-asr-done.png');
+          const asrStats = await fetch(`${llmCfg.baseUrl}/__test/asr-stats`).then((r) => r.json()).catch(() => null);
+          asrProbe = {
+            audioBytes: asrStats?.bytes ?? 0,
+            needConfirmBadge: played && (nosubBadge?.badge ?? '').includes('无字幕') && !!(nosubBadge?.key ?? '').startsWith(ASR_BVID),
+            confirmCardCopy: (asrCard?.text ?? '').includes('该视频文字信息较少，请确认是否调用 ASR 做进一步解析？') && asrCard?.hasOk === true && asrCard?.hasNo === true,
+            needConfigOnboarding: obAsr?.shown === true && obAsr?.hasLlmStep === false && obAsr?.hasAsrStep === true && obAsr?.title.includes('补配 ASR') === true,
+            saveAsrThenRun:
+              afterSave?.shown === false &&
+              stageSeen === true &&
+              (asrDetail?.srcBadge ?? '').includes('ASR转写') &&
+              (asrDetail?.sumLen ?? 0) > 100 &&
+              (asrDb?.transcripts ?? []).some((t) => t.source === 'asr' && t.cues > 0) &&
+              (asrDb?.summaries ?? []).some((s) => s.status === 'done' && s.source === 'asr'),
+          };
+          log('P2.3 判定项:', JSON.stringify(asrProbe));
+        }
       }
     }
 
@@ -1307,7 +1452,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -1473,6 +1618,12 @@ async function main() {
         wipeProbe?.manualWipeDoubleConfirm?.startsActive === true &&
         wipeProbe?.manualWipeDoubleConfirm?.cancelNoop === true &&
         wipeProbe?.manualWipeDoubleConfirm?.confirmWipes === true,
+      // P2.3 F6 ASR 确认流（mock）：need_asr 橙标 / 卡片文案逐字 / 未配置→ASR 补配 onboarding / 确认后三段进度→done ASR转写
+      asrNeedConfirmBadge: REAL || asrProbe?.needConfirmBadge === true,
+      asrConfirmCardCopy: REAL || asrProbe?.confirmCardCopy === true,
+      asrNeedConfigOnboarding: REAL || asrProbe?.needConfigOnboarding === true,
+      asrSaveAsrThenRun: REAL || (asrProbe?.saveAsrThenRun === true && (asrProbe?.audioBytes ?? 0) > 100_000), // 审查 N-10：真实音频体量进判定（multipart ≥100KB）
+      asrDnrRulesEnsured: has('dnr rules ensured: 2'),
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

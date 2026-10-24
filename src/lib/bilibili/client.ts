@@ -84,6 +84,27 @@ interface FingerSpiResp {
   code?: number;
   data?: { b_3?: string; b_4?: string };
 }
+// P2.3 · playurl DASH 音轨（响应字段驼峰/下划线两种形态都容忍——实测两种都出现过）
+interface PlayUrlResp {
+  code?: number;
+  data?: {
+    dash?: {
+      audio?: ({
+        id?: number;
+        bandwidth?: number;
+        baseUrl?: string;
+        backupUrl?: string[];
+        backup_url?: string[];
+      })[];
+    };
+  };
+}
+export interface DashAudioStream {
+  id: number;
+  bandwidth: number;
+  baseUrl: string;
+  backupUrl: string[];
+}
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -248,6 +269,20 @@ export class BiliClient {
     const j = await this.#getJson<PlayerV2Resp>('/x/player/wbi/v2', { bvid, cid }, true);
     const sub = j.data?.subtitle;
     return { subtitles: sub?.subtitles ?? [], need_login_subtitle: sub?.need_login_subtitle };
+  }
+
+  // ---- P2.3 · ASR 音频流（playurl，仅确认流使用；架构 §3.3/§3.8） ----------------
+
+  /** DASH 音轨候选（bandwidth 为选档依据；baseUrl/backupUrl 为选源依据）。 */
+  async getPlayUrlAudio(bvid: string, cid: number): Promise<DashAudioStream[]> {
+    // fnval=16 → DASH；qn 对 DASH 无关紧要（音轨不随视频清晰度变），带 16（最低档）示意
+    const j = await this.#getJson<PlayUrlResp>('/x/player/wbi/playurl', { bvid, cid, fnval: 16, qn: 16 }, true);
+    return (j.data?.dash?.audio ?? []).map((a) => ({
+      id: a.id ?? 0,
+      bandwidth: a.bandwidth ?? Number.MAX_SAFE_INTEGER,
+      baseUrl: a.baseUrl ?? '',
+      backupUrl: a.backupUrl ?? a.backup_url ?? [],
+    }));
   }
 
   async #fingerFallback(): Promise<boolean> {

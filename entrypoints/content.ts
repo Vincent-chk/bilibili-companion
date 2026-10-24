@@ -43,8 +43,8 @@ export default defineContentScript({
           openOnboarding({
             ui,
             assetUrl: (p) => browser.runtime.getURL(p as PublicPath),
-            testConnection: (cfg) =>
-              bridge.request<{ ok: boolean; msg: string }>({ type: 'TEST_CONNECTION', llm: cfg }),
+            testConnection: (cfg, kind) =>
+              bridge.request<{ ok: boolean; msg: string }>({ type: 'TEST_CONNECTION', kind, llm: cfg }),
             save: (payload) => bridge.request<{ ok: boolean; error?: string }>({ type: 'SETTINGS_SAVE', ...payload }),
             onDismiss: () => toast(ui, '配置好 LLM 后随时点我开始陪看'),
             onSaved: () => void requestSessionStart(), // 配置已就绪，激活必成
@@ -166,6 +166,19 @@ export default defineContentScript({
       onSessionStart: () => void requestSessionStart(),
       onSessionEnd: () => void requestSessionEnd(),
       onSeek: (videoKey, timeSec) => void handleSeekRequest(videoKey, timeSec),
+      // P2.3 F6-③：未配置 ASR → onboarding 补配模式（LLM 沿用不重填；保存后回卡片可继续）
+      onNeedAsrConfig: () => {
+        openOnboarding({
+          ui,
+          assetUrl: (p2) => browser.runtime.getURL(p2 as PublicPath),
+          testConnection: (cfg, kind) =>
+            bridge.request<{ ok: boolean; msg: string }>({ type: 'TEST_CONNECTION', kind, llm: cfg }),
+          save: (payload) => bridge.request<{ ok: boolean; error?: string }>({ type: 'SETTINGS_SAVE', ...payload }),
+          onDismiss: () => toast(ui, '可稍后在设置中配置 ASR'),
+          onSaved: () => toast(ui, 'ASR 已配置，回到卡片点【调用 ASR 解析】', 3200),
+          asrOnly: true,
+        });
+      },
     });
 
     // P1.9 准则#3：浏览器全屏时把 Shadow 宿主迁入全屏元素子树（退出迁回）

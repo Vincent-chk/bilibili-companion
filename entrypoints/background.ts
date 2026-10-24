@@ -169,17 +169,20 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   try {
     await ensureOffscreen();
-    // offscreen 文档读不了 storage（API 受限）：LLM 配置与 persona 在 SW 解析后随 job 传入
+    // offscreen 文档读不了 storage（API 受限）：LLM/ASR 配置与 persona 在 SW 解析后随 job 传入
     const { config, error: cfgErr, timeoutMs } = resolveConfig(await readStoredLlmConfig(browserKv));
     if (!config) return { result: 'failed', error: { code: 'NO_LLM_CONFIG', msg: cfgErr ?? '未配置 LLM' } };
-    const persona = ((await browser.storage.local.get('settings'))['settings'] as { persona?: string } | undefined)
-      ?.persona;
+    const settings = await readSettings();
     const reply = (await Promise.race([
       sendToOffscreen({
         type: 'OFFSCREEN_RUN_JOB',
         job: { id: job.id, videoKey: job.videoKey, type: job.type, segIndex: job.segIndex },
         llm: config,
-        persona,
+        persona: settings.persona,
+        // P2.3：ASR 配置仅 ASR_SUMMARIZE 需要（Key 只进 SW/offscreen 内存，消息为扩展内部通道）
+        ...(job.type === 'ASR_SUMMARIZE' && settings.asr
+          ? { asr: settings.asr, asrMaxMB: clamp(settings.asrMaxMB ?? 25, 1, 100) }
+          : {}),
         timeoutMs,
       }),
       new Promise<never>((_, rej) => {
@@ -259,6 +262,44 @@ interface InMsg {
   retry?: number; // SUMMARY_OPEN 用户显式重试标记（1=点击进入，可对 failed 摘要重新入队）
   llm?: ModelConfigMsg;
   asr?: ModelConfigMsg;
+  kind?: 'llm' | 'asr'; // TEST_CONNECTION：探活对象（P2.3 起 asr 走 /models 探活）
+}
+
+// ---- P2.3 · DNR 音频防盗链（架构 §3.8） -------------------------------------------
+// bilivideo CDN 是否校验 Referer 取决于调度命中的节点类型（不可预测，07 报告 G-2）——
+// 对扩展自身发起的音频请求无条件补 Referer: https://www.bilibili.com/（.com+.cn 双域）。
+// 用动态规则而非静态 JSON：initiator 域=chrome.runtime.id 只有运行时可知（静态文件写不了）；
+// 任务 2.4 的「静态规则」交付以本组动态规则等价实现（规则集经 getDynamicRules 可审计）。
+async function ensureDnrRules(): Promise<void> {
+  const setReferer = { header: 'Referer', operation: 'set', value: 'https://www.bilibili.com/' } as const;
+  const rules = [
+    {
+      id: 1,
+      priority: 1,
+      condition: {
+        urlFilter: '||bilivideo.com^',
+        resourceTypes: ['xmlhttprequest'],
+        initiatorDomains: [browser.runtime.id],
+      },
+      action: { type: 'modifyHeaders', requestHeaders: [setReferer] },
+    },
+    {
+      id: 2,
+      priority: 1,
+      condition: {
+        urlFilter: '||bilivideo.cn^',
+        resourceTypes: ['xmlhttprequest'],
+        initiatorDomains: [browser.runtime.id],
+      },
+      action: { type: 'modifyHeaders', requestHeaders: [setReferer] },
+    },
+  ];
+  try {
+    await browser.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [1, 2], addRules: rules as never });
+    console.log('[doubao] dnr rules ensured: 2 (bilivideo.com/.cn Referer for extension requests)');
+  } catch (e) {
+    console.log(`[doubao] dnr ensure error: ${String(e).slice(0, 500)}`);
+  }
 }
 
 export default defineBackground(() => {
@@ -279,6 +320,8 @@ export default defineBackground(() => {
   browser.alarms.onAlarm.addListener((a) => {
     if ((a as { name?: string }).name === 'doubao-retention') void runRetention(true);
   });
+  // P2.3：DNR 音频 Referer 规则（幂等重建；启动/重启均确保在位）
+  void ensureDnrRules();
 
   // P1.5：面板 Port。连接即回放当前会话状态（新标签页初始化；P1.6 豆包消费）
   // P2.1 时机③：content 首连即判保留期（浏览器重开后的第一个连接点），回放判定后的最新态
@@ -332,6 +375,10 @@ export default defineBackground(() => {
         return handleSummaryOpen(m);
       case 'REGENERATE':
         return handleRegenerate(m);
+      case 'ASR_CONFIRM':
+        return handleAsrConfirm(m); // P2.3 F6：用户确认调用 ASR
+      case 'ASR_DECLINE':
+        return handleAsrDecline(m); // P2.3 F6：暂不（保持橙色标注，无状态迁移）
       case 'SEEK_TO':
         return handleSeekTo(m);
       case 'SEGMENT_NOTE_OPEN':
@@ -568,8 +615,15 @@ async function activeJob(videoKey: string): Promise<JobRow | undefined> {
   return rows.find((j) => ACTIVE_JOB_STATUSES.includes(j.status));
 }
 
-async function readSettings(): Promise<{ triggerSeconds?: number; persona?: string }> {
-  return ((await browser.storage.local.get('settings'))['settings'] as { triggerSeconds?: number; persona?: string }) ?? {};
+interface StoredSettings {
+  triggerSeconds?: number;
+  persona?: string;
+  asrMaxMB?: number;
+  asr?: { baseUrl: string; modelId: string; apiKey: string };
+}
+
+async function readSettings(): Promise<StoredSettings> {
+  return ((await browser.storage.local.get('settings'))['settings'] as StoredSettings) ?? {};
 }
 
 /** LIST_QUERY：visits+videos+summaries+jobs 联查快照（02-数据模型 §3，列表数据源）。
@@ -632,7 +686,9 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
     void pipeline.drain();
   }
   const transcript = excerptOf(await db.transcripts.get(videoKey));
-  return { ok: true, item: { visit, video, summary, job }, transcript };
+  // P2.3 审查 P1-1：need_asr 卡片要能显示上次 ASR 尝试的失败原因——音频链失败保留 need_asr 行、
+  // 错误只在 job 行，activeJob（仅活动态）永远带不出；lastJobRow 上面已查，随详情下发
+  return { ok: true, item: { visit, video, summary, job, lastJob: lastJobRow }, transcript };
 }
 
 /**
@@ -650,6 +706,44 @@ async function handleRegenerate(m: InMsg): Promise<Record<string, unknown>> {
   await pipeline.enqueue({ type: 'REGENERATE', videoKey, sessionId: pointer.sessionId });
   void pipeline.drain();
   return { ok: true, started: true };
+}
+
+// ---- P2.3 · ASR 确认流（F6，架构 §4.2） -------------------------------------------
+
+/**
+ * ASR_CONFIRM：未配置 ASR → NEED_ASR_CONFIG（面板跳 onboarding 的 ASR 补配模式）。
+ * 确认后：need_confirm 的 SUMMARIZE job 收口为 done（其结论=需 ASR，用户已确认），
+ * 同事务入队 ASR_SUMMARIZE——不退役旧活动行会让 busy 守卫（activeJob 含 need_confirm）
+ * 永久卡死【重新生成】/二次确认。幂等：ASR_SUMMARIZE 已在途时 enqueue 去重复用。
+ */
+async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
+  const { videoKey } = m;
+  if (!videoKey) return { ok: false, error: 'ASR_CONFIRM 缺 videoKey' };
+  const settings = await readSettings();
+  const asr = settings.asr;
+  if (!asr?.baseUrl || !asr.modelId || !asr.apiKey) return { ok: false, reason: 'NEED_ASR_CONFIG' };
+  const pointer = await getSessionPointer(browserKv);
+  if (!pointer) return { ok: false, error: 'no-session' };
+  await db.transaction('rw', db.jobs, async () => {
+    const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
+    for (const j of rows) {
+      // 审查 P2-3：need_confirm 语义唯一（等 ASR 确认），不按 type 过滤——REGENERATE 落
+      // need_confirm（旧 failed 行重跑无轨）同样必须收口，否则 busy 守卫永久卡死
+      if (j.status === 'need_confirm') {
+        await db.jobs.put({ ...j, status: 'done', updatedAt: Date.now() });
+      }
+    }
+    await pipeline.enqueue({ type: 'ASR_SUMMARIZE', videoKey, sessionId: pointer.sessionId });
+  });
+  console.log(`[doubao] asr job queued (user confirmed): ${videoKey}`);
+  void pipeline.drain();
+  return { ok: true, started: true };
+}
+
+/** ASR_DECLINE：暂不——保持 need_asr 橙色标注（F6-⑥ 不再自动追问，下次打开面板仍可见）。 */
+async function handleAsrDecline(m: InMsg): Promise<Record<string, unknown>> {
+  console.log(`[doubao] asr declined (keep need_asr): ${m.videoKey ?? ''}`);
+  return { ok: true };
 }
 
 // ---- P1.8 · 大纲 seek（SEEK_TO） ------------------------------------------------
@@ -856,6 +950,29 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   const v = validateEndpointUrl(baseUrl);
   if (!v.ok) return { ok: false, msg: v.error ?? 'Base URL 不合法' };
   await ensureOriginPermission(`${v.origin}/*`);
+  // P2.3：ASR 探活走 GET /models（OpenAI-compatible 惯例；/audio/transcriptions 探活需真音频不划算）
+  if (m.kind === 'asr') {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort('timeout'), 15_000);
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
+      });
+      if (res.ok) return { ok: true, msg: '连接成功（HTTP ' + res.status + '）' };
+      if (res.status === 401 || res.status === 403) return { ok: false, msg: 'Key 无效或无权限（HTTP ' + res.status + '）' };
+      if (res.status === 404) return { ok: true, msg: '端点可达（不支持模型列表接口，保存后可直接使用；若失败请检查 Base URL 是否含 /v1）' };
+      const body = await res.text().catch(() => '');
+      return { ok: false, msg: `HTTP ${res.status}: ${maskBody(body, apiKey)}` };
+    } catch (e) {
+      return {
+        ok: false,
+        msg: controller.signal.aborted ? '连接超时（>15s）' : `无法连接端点：${String(e).slice(0, 80)}`,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), 35_000);
   try {
@@ -891,18 +1008,25 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
 async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
   const llm = m.llm ?? {};
   const asr = m.asr;
-  const v = validateLlm({ baseUrl: llm.baseUrl ?? '', modelId: llm.modelId ?? '', apiKey: llm.apiKey ?? '' });
-  if (!v.ok) return { ok: false, error: v.error ?? `必填项缺失：${v.missing.join(' / ')}` };
-
   const prev =
     ((await browser.storage.local.get('settings'))['settings'] as Record<string, unknown> | undefined) ?? {};
-  const next: Record<string, unknown> = {
-    ...prev,
-    llm: { baseUrl: llm.baseUrl!.trim(), modelId: llm.modelId!.trim(), apiKey: llm.apiKey!.trim() },
-  };
+
+  // P2.3：ASR 补配模式（m.llm 缺省）——LLM 三件套不重填、沿用已存配置（Key 只留在 SW 侧，
+  // 面板永不见明文；没有已存 LLM 却不带 llm 保存 = 非法路径，拒绝）
+  const asrOnly = m.llm === undefined;
+  const prevLlm = prev['llm'] as { baseUrl?: string; modelId?: string; apiKey?: string } | undefined;
+  if (asrOnly && !(prevLlm?.baseUrl && prevLlm.modelId && prevLlm.apiKey)) {
+    return { ok: false, error: 'LLM 尚未配置，请完整填写 LLM 三项' };
+  }
+  const next: Record<string, unknown> = { ...prev };
   const patterns: string[] = [];
-  const oL = validateEndpointUrl(llm.baseUrl!);
-  if (oL.ok && oL.origin) patterns.push(`${oL.origin}/*`);
+  if (!asrOnly) {
+    const v = validateLlm({ baseUrl: llm.baseUrl ?? '', modelId: llm.modelId ?? '', apiKey: llm.apiKey ?? '' });
+    if (!v.ok) return { ok: false, error: v.error ?? `必填项缺失：${v.missing.join(' / ')}` };
+    next['llm'] = { baseUrl: llm.baseUrl!.trim(), modelId: llm.modelId!.trim(), apiKey: llm.apiKey!.trim() };
+    const oL = validateEndpointUrl(llm.baseUrl!);
+    if (oL.ok && oL.origin) patterns.push(`${oL.origin}/*`);
+  }
 
   const a = asr
     ? validateAsr({ baseUrl: asr.baseUrl ?? '', modelId: asr.modelId ?? '', apiKey: asr.apiKey ?? '' })
@@ -918,6 +1042,7 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
   if (typeof next['triggerSeconds'] !== 'number') next['triggerSeconds'] = 20;
   if (typeof next['persona'] !== 'string') next['persona'] = 'spicy';
   if (typeof next['bubbles'] !== 'boolean') next['bubbles'] = true;
+  if (typeof next['asrMaxMB'] !== 'number') next['asrMaxMB'] = 25; // P2.3：音频上限默认 25MB（≈50 分钟）
 
   await browser.storage.local.set({ settings: next, onboarded: true });
 
@@ -927,7 +1052,7 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
     (await ensureOriginPermission(p) ? granted : denied).push(p);
   }
   console.log(
-    `[doubao] settings saved (llm ok, asr ${a.kind === 'ok' ? 'provided' : 'cleared/skipped'}; origins granted=${granted.length} denied=${denied.length})`,
+    `[doubao] settings saved (${asrOnly ? 'llm kept' : 'llm ok'}, asr ${a.kind === 'ok' ? 'provided' : 'cleared/skipped'}; origins granted=${granted.length} denied=${denied.length})`,
   );
   return { ok: true, granted, denied };
 }
