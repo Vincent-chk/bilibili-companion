@@ -517,6 +517,7 @@ async function main() {
     let seekProbe = null; // P1.8：同页/跨页/新标签 seek 探针
     let p19Probe = null; // P1.9：浮层七准则探针（overlay/全屏/闲时/输入聚焦/跟随）
     let regenProbe = null; // 2.7a：【重新生成】REGENERATE 探针
+    let retentionProbe = null; // P2.1：保留期判定探针（GRACE 倒计时/59min 恢复/超期 EXPIRED）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -1047,6 +1048,102 @@ async function main() {
           }
           p19Probe = p19;
         }
+
+        // 8.98) P2.1 保留期判定：结束陪看 → GRACE 倒计时（保留至 HH:MM + #cd 秒级走动）
+        //   → warp -30min 重开面板仍 GRACE（59min 内恢复+倒计时续算，F10）
+        //   → warp -2h 重开面板 → EXPIRED_PENDING_CONFIRM（状态文案+无开始/恢复按钮+数据仍在+豆包可开面板）
+        //   时间 warp = 直写 sessionPointer.closedAt（与 DEV_RETENTION_WARP 消息等价的存储层操作，
+        //   判定路径完全一致：重开面板走 LIST_QUERY → evaluateRetention）
+        {
+          const panelState = () => pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            const st = sr.getElementById('p-status');
+            return JSON.stringify({ open: sr.getElementById('panel').classList.contains('open'),
+              status: st?.textContent ?? '', hasCd: !!sr.getElementById('cd'),
+              cd: sr.getElementById('cd')?.textContent ?? null,
+              resumeBtn: !!sr.getElementById('btn-resume'), startBtn: !!sr.getElementById('btn-start2'),
+              items: sr.querySelectorAll('.v-item').length,
+              toasts: [...sr.querySelectorAll('#toast-root .toast')].map((x) => x.textContent ?? '') });
+          })()`);
+          const getPtr = () => swEval(`(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`);
+          const warp = (backMs) => swEval(`(async () => {
+            const p = (await chrome.storage.local.get('sessionPointer')).sessionPointer;
+            if (!p) return 'no-pointer';
+            p.closedAt = Date.now() - ${backMs};
+            await chrome.storage.local.set({ sessionPointer: p });
+            return 'warped';
+          })()`);
+          const setPanel = async (wantOpen) => {
+            const st = await panelState();
+            if (st && st.open !== wantOpen) {
+              await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot').click()`);
+              await sleep(700);
+            }
+          };
+
+          // a) ACTIVE → 点「结束陪看」→ GRACE：toast（保留 1 小时口径）+ 倒计时挂载 + retainUntil 数学
+          await setPanel(true);
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('btn-end')?.click()`);
+          await sleep(1100);
+          const graceDom = await panelState();
+          const gracePtr = await getPtr();
+          // 倒计时秒级走动：轮询观察（隐藏标签页的 setTimeout 会被 Chrome 节流，固定 1.3s 窗口会 flake）
+          let cdAfter = graceDom;
+          for (let i = 0; i < 14 && cdAfter?.cd === graceDom?.cd; i++) {
+            await sleep(500);
+            cdAfter = await panelState();
+          }
+          const graceMath = gracePtr?.closedAt !== undefined && Date.now() - gracePtr.closedAt < 10_000;
+          log('P2.1 GRACE 探针:', JSON.stringify({ graceDom, gracePtr: { state: gracePtr?.state, closedAt: gracePtr?.closedAt }, cdAfter: cdAfter?.cd, graceMath }));
+
+          // b) warp -30min → 重开面板：仍 GRACE（59min<1h 恢复）+ 倒计时续算（≈30min 量级）
+          await warp(30 * 60_000);
+          await setPanel(false);
+          await setPanel(true);
+          await sleep(900);
+          const midDom = await panelState();
+          const midPtr = await getPtr();
+          log('P2.1 warp-30min 探针:', JSON.stringify({ midDom: { status: midDom?.status, cd: midDom?.cd, items: midDom?.items }, midPtr: midPtr?.state }));
+
+          // c) warp -2h → 重开面板：EXPIRED_PENDING_CONFIRM（文案+无开始/恢复按钮+数据仍在+豆包可开面板）
+          await warp(2 * 3600_000);
+          await setPanel(false);
+          await setPanel(true);
+          await sleep(900);
+          const expDom = await panelState();
+          const expPtr = await getPtr();
+          // EXPIRED 态点豆包身体=开面板（处置入口可达，P2.1 点击路由修复）
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot').click()`);
+          await sleep(400);
+          const expPanelClosed = await panelState();
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('mascot').click()`);
+          await sleep(700);
+          const expPanelReopen = await panelState();
+          retentionProbe = {
+            grace: {
+              state: gracePtr?.state === 'GRACE',
+              toast: (graceDom?.toasts ?? []).some((t) => t.includes('保留 1 小时')),
+              hasCountdown: graceDom?.hasCd === true,
+              cdTicking: typeof graceDom?.cd === 'string' && typeof cdAfter?.cd === 'string' && graceDom.cd !== cdAfter.cd,
+              closedAtFresh: graceMath,
+            },
+            restoreUnder1h: {
+              state: midPtr?.state === 'GRACE',
+              statusHasRetain: (midDom?.status ?? '').includes('保留至'),
+              cdResumed: /^00:[23]\d:\d\d$/.test(midDom?.cd ?? ''), // warp -30min → 剩 ≈29–30min
+              itemsKept: (midDom?.items ?? 0) >= 1,
+            },
+            expiredOver1h: {
+              state: expPtr?.state === 'EXPIRED_PENDING_CONFIRM',
+              statusText: (expDom?.status ?? '').includes('已超保留期'),
+              noStartNoResume: expDom?.startBtn === false && expDom?.resumeBtn === false,
+              itemsStillThere: (expDom?.items ?? 0) >= 1, // 判定只改状态不删数据（F10：不静默删）
+              mascotTogglesPanel: expPanelClosed?.open === false && expPanelReopen?.open === true,
+            },
+          };
+          log('P2.1 判定项:', JSON.stringify(retentionProbe));
+          await shotNamed(probeSid, 'visual-retention-expired.png');
+        }
       }
     }
 
@@ -1068,7 +1165,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -1194,6 +1291,25 @@ async function main() {
         (regenProbe?.regenUi?.sumLen ?? 0) > 50 && // 审查 P2-9：面板已用新摘要重渲染
         (regenProbe?.regenUi?.outline ?? 0) >= 6 && // 新大纲就位（Schema 6–12 条）
         regenProbe?.regenUi?.notes === 0, // 无残留展开注记卡
+      // P2.1 保留期（F10）：GRACE 倒计时（toast+挂载+秒级走动+closedAt 基准）/ 59min 内恢复续算 /
+      // 超 1h → EXPIRED_PENDING_CONFIRM（文案+无开始/恢复按钮+数据不删+豆包仍可开面板）
+      retentionGraceCountdown:
+        retentionProbe?.grace?.state === true &&
+        retentionProbe?.grace?.toast === true &&
+        retentionProbe?.grace?.hasCountdown === true &&
+        retentionProbe?.grace?.cdTicking === true &&
+        retentionProbe?.grace?.closedAtFresh === true,
+      retentionRestoreUnder1h:
+        retentionProbe?.restoreUnder1h?.state === true &&
+        retentionProbe?.restoreUnder1h?.statusHasRetain === true &&
+        retentionProbe?.restoreUnder1h?.cdResumed === true &&
+        retentionProbe?.restoreUnder1h?.itemsKept === true,
+      retentionExpiredOver1h:
+        retentionProbe?.expiredOver1h?.state === true &&
+        retentionProbe?.expiredOver1h?.statusText === true &&
+        retentionProbe?.expiredOver1h?.noStartNoResume === true &&
+        retentionProbe?.expiredOver1h?.itemsStillThere === true &&
+        retentionProbe?.expiredOver1h?.mascotTogglesPanel === true,
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

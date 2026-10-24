@@ -12,7 +12,7 @@ import { MascotController } from '../src/content/mascot/mascot';
 import type { UiSessionState } from '../src/content/mascot/logic';
 import { openOnboarding } from '../src/content/onboarding/onboarding';
 import { PanelController } from '../src/content/panel/panel';
-import { fmtSec } from '../src/content/panel/view-models';
+import { clockOf, fmtSec } from '../src/content/panel/view-models';
 import { LOGIN_BUBBLE_TEXT, loginBubble } from '../src/content/login';
 import { shouldConsumeSeek } from '../src/content/seek';
 import { setupFullscreenMigration } from '../src/content/ui/fullscreen';
@@ -32,6 +32,12 @@ export default defineContentScript({
       try {
         const r = await bridge.request<{ ok: boolean; reason?: string }>({ type: 'SESSION_START' });
         if (r?.ok) return; // 表情/气泡/头部按钮由 SESSION_STATE 广播统一驱动（跨标签页一致）
+        if (r?.reason === 'EXPIRED_CONFIRM') {
+          // P2.1：超期待确认期不开新会话（旧数据须先经确认链路处置）→ 引导到面板
+          panel?.open();
+          toast(ui, '上次陪看数据已超保留期，请先在面板中确认处理');
+          return;
+        }
         if (r?.reason === 'NEED_ONBOARDING') {
           // F1/F9：未配置 LLM 强制引导，无法跳过（关闭弹窗=保持未激活）
           openOnboarding({
@@ -50,7 +56,11 @@ export default defineContentScript({
     };
     const requestSessionEnd = async (): Promise<void> => {
       try {
-        await bridge.request({ type: 'SESSION_END' });
+        // P2.1：结束成功 toast 倒计时口径（原型同文案；只在发起结束的标签页提示）
+        const r = await bridge.request<{ ok: boolean; retainUntil?: number }>({ type: 'SESSION_END' });
+        if (r?.ok && r.retainUntil) {
+          toast(ui, `已结束陪看，数据保留 1 小时（至 ${clockOf(r.retainUntil)}）`, 3200);
+        }
       } catch {
         /* SW 未就绪：忽略，重试成本低 */
       }

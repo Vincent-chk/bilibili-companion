@@ -309,9 +309,10 @@ export class MascotController {
     });
   }
 
-  /** 点击路由：未激活 → 激活流程；激活/保留期 → 开合面板（F3：单击 ≤300ms，拖拽不误触）。 */
+  /** 点击路由：未激活 → 激活流程；激活/保留期/超期待确认 → 开合面板（F3：单击 ≤300ms，拖拽不误触）。
+   *  P2.1：EXPIRED_PENDING_CONFIRM 也走面板——数据处置（清除确认弹窗）在面板里，点身体必须可达。 */
   #onClick(): void {
-    if (this.#session === 'ACTIVE' || this.#session === 'GRACE') this.deps.onBodyClickActive();
+    if (this.#session !== 'INACTIVE') this.deps.onBodyClickActive();
     else this.deps.onStartClick();
   }
 }

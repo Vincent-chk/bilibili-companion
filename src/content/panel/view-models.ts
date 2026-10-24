@@ -115,6 +115,23 @@ export function fmtSec(sec: number): string {
   return h > 0 ? `${h}:${pad2(m)}:${pad2(s % 60)}` : `${pad2(m)}:${pad2(s % 60)}`;
 }
 
+// ---- P2.1 · 保留期倒计时（F10：GRACE 态「数据保留至 HH:MM」） --------------------
+
+/** 剩余毫秒 → hh:mm:ss（原型 fmtCountdown 1:1；负值钳 0）。 */
+export function fmtCountdown(ms: number): string {
+  const t = Math.max(0, ms);
+  const h = Math.floor(t / 3_600_000);
+  const m = Math.floor((t % 3_600_000) / 60_000);
+  const s = Math.floor((t % 60_000) / 1000);
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
+}
+
+/** 时间戳 → 本机 HH:MM（「数据保留至 HH:MM」口径；原型 clockOf）。 */
+export function clockOf(ts: number): string {
+  const d = new Date(ts);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
 /** 时间戳 → 「刚刚 / N 分钟前 / N 小时前 / 昨天」（列表副标题）。 */
 export function relativeTimeLabel(ts: number, now = Date.now()): string {
   const diff = Math.max(0, now - ts);

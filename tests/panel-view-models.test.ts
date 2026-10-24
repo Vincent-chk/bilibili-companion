@@ -7,8 +7,10 @@ import {
   SOURCE_LABEL,
   STAGE_LABEL,
   badgeFor,
+  clockOf,
   excerptOf,
   extractStreamingSummary,
+  fmtCountdown,
   fmtSec,
   relativeTimeLabel,
   sortListItems,
@@ -164,5 +166,21 @@ describe('ListQueryItem 形状（background 组装契约）', () => {
   it('visit/video/summary/job 四槽位', () => {
     const item: ListQueryItem = { visit: visit(), video: undefined, summary: undefined, job: undefined };
     expect(item.visit.videoKey).toBe('BV1x:111');
+  });
+});
+
+describe('P2.1 保留期倒计时格式化（F10）', () => {
+  it('fmtCountdown：hh:mm:ss 补零 / 负值钳 0（原型 fmtCountdown 同款）', () => {
+    expect(fmtCountdown(0)).toBe('00:00:00');
+    expect(fmtCountdown(59_000)).toBe('00:00:59');
+    expect(fmtCountdown(60_000)).toBe('00:01:00');
+    expect(fmtCountdown(59 * 60_000 + 59_000)).toBe('00:59:59');
+    expect(fmtCountdown(3_600_000)).toBe('01:00:00');
+    expect(fmtCountdown(-5_000)).toBe('00:00:00'); // 已到点：钳 0（到点即触发重判，不闪负数）
+  });
+  it('clockOf：时间戳 → 本机 HH:MM（「数据保留至 HH:MM」口径）', () => {
+    const d = new Date(2026, 9, 24, 9, 5, 0); // 本机时区构造，clockOf 读同源字段
+    expect(clockOf(d.getTime())).toBe('09:05');
+    expect(clockOf(new Date(2026, 9, 24, 23, 59).getTime())).toBe('23:59');
   });
 });

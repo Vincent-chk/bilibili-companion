@@ -19,6 +19,8 @@ import {
   type VideoRow,
 } from '../src/lib/storage';
 import { browserKv } from '../src/lib/storage/browserKv';
+import { applyRetention, retainUntilOf, sessionStartBlockedReason, type RetentionResult } from '../src/lib/session';
+import type { SessionPointer } from '../src/lib/storage';
 import { excerptOf } from '../src/content/panel/view-models';
 import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
 import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/content/seek';
@@ -44,6 +46,44 @@ function broadcastToUi(msg: Record<string, unknown>): void {
       /* 断口由 onDisconnect 清理 */
     }
   }
+}
+
+// ---- P2.1 · 会话保留期判定（架构 §3.7 / 02-数据模型 §6） ------------------------
+// 三时机判定：①SW 启动 ②面板打开（LIST_QUERY 静默判定）③content 首连（Port 回放）；
+// chrome.alarms(30min) 兜底唤醒补判。判定只更新状态（EXPIRED_PENDING_CONFIRM），
+// 绝不静默删数据——删除仅经 2.2 的 WIPE_CONFIRM/WIPE_NOW 清除链路。
+
+/** SESSION_STATE 消息形状（02-数据模型 §3：{state, closedAt, retainUntil}，面板倒计时数据源）。 */
+function sessionStateMsg(pointer?: SessionPointer): Record<string, unknown> {
+  const retainUntil = pointer ? retainUntilOf(pointer) : undefined;
+  return {
+    type: 'SESSION_STATE',
+    state: pointer?.state ?? 'INACTIVE',
+    ...(pointer?.closedAt !== undefined ? { closedAt: pointer.closedAt } : {}),
+    ...(retainUntil !== undefined ? { retainUntil } : {}),
+  };
+}
+
+/** 最近一次经广播下发的会话态：SESSION_STATE 只在变化时广播——LIST_QUERY 高频触发
+ *  的静默判定若每次都广播，会被面板的 refresh→LIST_QUERY→广播 循环放大成广播风暴。 */
+let lastBroadcastSession: { sessionId: string; state: string } | null = null;
+
+/** 判定保留期；broadcast=true 时仅在会话态变化时广播（审查 P2-3：无第三种语义）。 */
+async function runRetention(broadcast = false): Promise<RetentionResult> {
+  const r = await applyRetention(db, browserKv);
+  if (!r.pointer) return r;
+  if (broadcast) {
+    const memo = { sessionId: r.pointer.sessionId, state: r.pointer.state };
+    const changed =
+      lastBroadcastSession === null ||
+      lastBroadcastSession.sessionId !== memo.sessionId ||
+      lastBroadcastSession.state !== memo.state;
+    if (changed) {
+      lastBroadcastSession = memo;
+      broadcastToUi(sessionStateMsg(r.pointer));
+    }
+  }
+  return r;
 }
 
 // ---- P1.4 · pipeline：执行体=offscreen（LLM SSE 长任务不在 SW 跑） -----------------
@@ -231,8 +271,16 @@ export default defineBackground(() => {
   void checkLoginState(true)
     .then((s) => applyLoginState(s))
     .catch(() => {});
+  // P2.1 时机①：扩展启动即判保留期（GRACE 超期 → EXPIRED_PENDING_CONFIRM；仅状态，不删数据）
+  void runRetention(true).catch(() => {});
+  // P2.1 兜底：30min 周期闹钟在 SW 被唤醒时补一次判定（MV3 定时器不可靠，判定以时间戳比较为准）
+  void browser.alarms.create('doubao-retention', { periodInMinutes: 30 });
+  browser.alarms.onAlarm.addListener((a) => {
+    if ((a as { name?: string }).name === 'doubao-retention') void runRetention(true);
+  });
 
   // P1.5：面板 Port。连接即回放当前会话状态（新标签页初始化；P1.6 豆包消费）
+  // P2.1 时机③：content 首连即判保留期（浏览器重开后的第一个连接点），回放判定后的最新态
   browser.runtime.onConnect.addListener((port) => {
     if ((port as { name?: string }).name !== 'doubao-port') return;
     const p = port as unknown as UiPort;
@@ -241,10 +289,10 @@ export default defineBackground(() => {
     (port as unknown as { onDisconnect: { addListener: (cb: () => void) => void } }).onDisconnect.addListener(() =>
       uiPorts.delete(p),
     );
-    void getSessionPointer(browserKv)
-      .then((pointer) => {
+    void runRetention()
+      .then((r) => {
         try {
-          p.postMessage({ type: 'SESSION_STATE', state: pointer?.state ?? 'INACTIVE' });
+          p.postMessage(sessionStateMsg(r.pointer));
         } catch {
           /* 端口即断 */
         }
@@ -303,19 +351,25 @@ export default defineBackground(() => {
   });
 });
 
-// ---- P1.6 · 会话最小切片（完整状态机/保留期判定是任务 2.1） ---------------------
+// ---- P1.6 · 会话最小切片 + P2.1 保留期状态机 ------------------------------------
 
 const rand4 = () => Math.random().toString(36).slice(2, 6);
 
 /**
  * SESSION_START（开始/恢复陪看）：未配置 LLM → NEED_ONBOARDING（F1/F9，content 弹 onboarding）。
  * GRACE 内重开 = 恢复同一会话（保留列表与进度）；无 pointer 才新建 session 行。
+ * P2.1：EXPIRED_PENDING_CONFIRM 期禁止直接开新会话——旧数据还躺在库里未被处置，
+ * 静默换 pointer 会把整段旧陪看数据变成永远不可见的死数据（F10：处置必须经确认链路）。
  */
 async function handleSessionStart(): Promise<Record<string, unknown>> {
   const cfg = await readStoredLlmConfig(browserKv);
   if (!cfg) return { ok: false, reason: 'NEED_ONBOARDING' };
   const now = Date.now();
-  const existing = await getSessionPointer(browserKv);
+  // 审查 P2-1：读 pointer 前先判保留期（判定收口到唯一入口）——SW 冷启动被 SESSION_START
+  // 唤醒时，若直接读 pointer 会与 unawaited 的启动判定竞态：过期 GRACE 可在写回前被静默恢复
+  const { pointer: existing } = await runRetention();
+  const blocked = sessionStartBlockedReason(existing);
+  if (blocked) return { ok: false, reason: blocked };
   const resumable = existing?.state === 'ACTIVE' || existing?.state === 'GRACE';
   // shortcut: 双标签页无 pointer 并发点开始会各建一会话行（输家成孤儿行，2.1 保留期清理时收口）
   let sessionId: string;
@@ -331,28 +385,32 @@ async function handleSessionStart(): Promise<Record<string, unknown>> {
     sessionId = `s_${now}_${rand4()}`;
     await db.sessions.put({ id: sessionId, state: 'ACTIVE', startedAt: now, lastActiveAt: now });
   }
-  await setSessionPointer(browserKv, {
+  const pointer: SessionPointer = {
     sessionId,
     state: 'ACTIVE',
     startedAt: existing && resumable ? existing.startedAt : now,
     lastActiveAt: now,
     ...(existing?.state === 'GRACE' ? { restoredAt: now } : {}),
-  });
+  };
+  await setSessionPointer(browserKv, pointer);
   console.log(`[doubao] session ${resumable ? 'resumed' : 'started'}: ${sessionId}`);
-  broadcastToUi({ type: 'SESSION_STATE', state: 'ACTIVE' });
+  lastBroadcastSession = { sessionId, state: 'ACTIVE' };
+  broadcastToUi(sessionStateMsg(pointer));
   return { ok: true, sessionState: 'ACTIVE', resumed: resumable };
 }
 
-/** SESSION_END（结束陪看）：ACTIVE → GRACE（closedAt=现在，1h 保留基准）。 */
+/** SESSION_END（结束陪看）：ACTIVE → GRACE（closedAt=现在，1h 保留基准；响应带倒计时数据）。 */
 async function handleSessionEnd(): Promise<Record<string, unknown>> {
   const pointer = await getSessionPointer(browserKv);
   if (!pointer || pointer.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
   const now = Date.now();
+  const next: SessionPointer = { ...pointer, state: 'GRACE', closedAt: now, lastActiveAt: now };
   await db.sessions.update(pointer.sessionId, { state: 'GRACE', closedAt: now, lastActiveAt: now });
-  await setSessionPointer(browserKv, { ...pointer, state: 'GRACE', closedAt: now, lastActiveAt: now });
+  await setSessionPointer(browserKv, next);
   console.log(`[doubao] session ended (GRACE): ${pointer.sessionId}`);
-  broadcastToUi({ type: 'SESSION_STATE', state: 'GRACE' });
-  return { ok: true, sessionState: 'GRACE' };
+  lastBroadcastSession = { sessionId: pointer.sessionId, state: 'GRACE' };
+  broadcastToUi(sessionStateMsg(next));
+  return { ok: true, sessionState: 'GRACE', closedAt: now, retainUntil: retainUntilOf(next) };
 }
 
 // ---- P1.2 · watcher 服务端 ---------------------------------------------------
@@ -481,13 +539,18 @@ async function readSettings(): Promise<{ triggerSeconds?: number; persona?: stri
   return ((await browser.storage.local.get('settings'))['settings'] as { triggerSeconds?: number; persona?: string }) ?? {};
 }
 
-/** LIST_QUERY：visits+videos+summaries+jobs 联查快照（02-数据模型 §3，列表数据源）。 */
+/** LIST_QUERY：visits+videos+summaries+jobs 联查快照（02-数据模型 §3，列表数据源）。
+ *  P2.1 时机②：面板打开触发本查询——先静默判定保留期（不广播：LIST_QUERY 高频，
+ *  广播会与面板 refresh 互触发成风暴；倒计时数据随本应答下发，状态变化经应答自然到达）。 */
 async function handleListQuery(): Promise<Record<string, unknown>> {
-  const pointer = await getSessionPointer(browserKv);
+  const { pointer } = await runRetention();
   const settings = await readSettings();
+  const retainUntil = pointer ? retainUntilOf(pointer) : undefined;
   const base = {
     ok: true as const,
     sessionState: pointer?.state ?? 'INACTIVE',
+    ...(pointer?.closedAt !== undefined ? { closedAt: pointer.closedAt } : {}),
+    ...(retainUntil !== undefined ? { retainUntil } : {}),
     triggerSeconds: clamp(settings.triggerSeconds ?? 20, 5, 300),
     // P1.10：引导卡数据源（30s 缓存零网络；强制刷新走 LOGIN_CHECK force=1，面板打开时机）
     loggedIn: loginCache?.loggedIn ?? null,

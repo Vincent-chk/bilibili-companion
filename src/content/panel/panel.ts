@@ -12,8 +12,10 @@ import {
   BADGE_HTML,
   SOURCE_LABEL,
   STAGE_LABEL,
+  clockOf,
   excerptOf,
   extractStreamingSummary,
+  fmtCountdown,
   fmtSec,
   isJobActive,
   relativeTimeLabel,
@@ -30,6 +32,9 @@ export interface ListQueryResponse {
   ok: boolean;
   items: ListQueryItem[];
   sessionState: string;
+  /** P2.1：GRACE 倒计时数据（面板打开时经 LIST_QUERY 静默判定后的最新值）。 */
+  closedAt?: number;
+  retainUntil?: number;
   triggerSeconds: number;
   loggedIn: boolean | null; // P1.10 引导卡数据源（SW 30s 缓存）
 }
@@ -71,6 +76,10 @@ export class PanelController {
   /** P1.11 F13：分段解读注记视图状态（segIndex → 流式/成品/失败）与展开集合。 */
   #segNotes = new Map<number, SegNoteVM>();
   #segOpen = new Set<number>();
+  /** P2.1：保留截止时刻（GRACE 倒计时数据源；来自 LIST_QUERY 应答/SESSION_STATE 广播）。 */
+  #retainUntil: number | null = null;
+  /** P2.1：倒计时 1s 滴答句柄（面板开且 GRACE 态才跑，递归 setTimeout 链）。 */
+  #cdTimer: unknown = null;
 
   readonly #setTimeout: (cb: () => void, ms?: number) => unknown;
 
@@ -111,6 +120,7 @@ export class PanelController {
 
   close(): void {
     this.#open = false;
+    this.#stopCountdown(); // P2.1：面板关=倒计时停（数据保留判定在 SW，与面板无关）
     this.deps.ui.root.getElementById('panel')?.classList.remove('open');
   }
 
@@ -161,6 +171,7 @@ export class PanelController {
       if (!r?.ok) return;
       this.#items = sortListItems((r.items ?? []).map(toListItemVM));
       this.#sessionState = r.sessionState ?? 'INACTIVE';
+      this.#retainUntil = r.retainUntil ?? null; // P2.1 倒计时（应答经 SW 静默判定后的最新值）
       this.#triggerSeconds = r.triggerSeconds ?? 20;
       this.setLoginState(r.loggedIn ?? null); // P1.10 引导卡（SW 缓存值；强制复核在 open()）
       this.#renderStatus();
@@ -175,21 +186,61 @@ export class PanelController {
     const acts = this.deps.ui.root.getElementById('p-head-actions');
     if (!el) return;
     acts?.classList.toggle('hidden', false);
+    this.#stopCountdown();
     if (this.#sessionState === 'ACTIVE') {
-      el.innerHTML = '<span class="dot-live"></span> 陪看中 · 仅记录本次激活期间看过的视频';
+      // F1-③：激活期状态行的保留期「占位」——倒计时本体在 GRACE 态（结束后起算），此处预告规则
+      el.innerHTML = '<span class="dot-live"></span> 陪看中 · 仅记录激活期间的视频 · 结束后保留 1 小时';
       this.#renderActions(acts, '<button class="btn btn-ghost" id="btn-end" style="flex:1">⏻ 结束陪看</button>', () =>
         this.deps.onSessionEnd(),
       );
     } else if (this.#sessionState === 'GRACE') {
-      el.innerHTML = '<span class="countdown-pill">⏳ 陪看已结束 · 数据保留中</span>';
+      // P2.1 F10：倒计时续算（retainUntil 来自持久化 closedAt+1h，与刷新/重开无关）
+      const ru = this.#retainUntil;
+      el.innerHTML =
+        ru !== null
+          ? `<span class="countdown-pill">⏳ 本次陪看数据保留至 ${clockOf(ru)}（<b id="cd">${fmtCountdown(ru - Date.now())}</b>）</span>`
+          : '<span class="countdown-pill">⏳ 陪看已结束 · 数据保留中</span>';
+      this.#startCountdown();
       this.#renderActions(acts, '<button class="btn btn-primary" id="btn-resume" style="flex:1">▶ 恢复陪看</button>', () =>
         this.deps.onSessionStart(),
       );
+    } else if (this.#sessionState === 'EXPIRED_PENDING_CONFIRM') {
+      // P2.1：超期待确认（清除确认弹窗属 2.2）；不再提供「开始陪看」——须先经确认链路处置数据
+      el.innerHTML = '<span class="countdown-pill">⏸ 陪看数据已超保留期 · 待确认清除</span>';
+      this.#renderActions(acts, '', () => undefined);
     } else {
       el.textContent = '未激活 · 点豆包「开始陪看」';
       this.#renderActions(acts, '<button class="btn btn-primary" id="btn-start2" style="flex:1">▶ 开始陪看</button>', () =>
         this.deps.onSessionStart(),
       );
+    }
+  }
+
+  /** P2.1：GRACE 倒计时滴答（面板开时每秒刷 #cd；到 0 触发 LIST_QUERY 重判 → EXPIRED 态）。
+   *  审查 P2-5：到点 refresh 失败（SW 瞬时不可达，refresh 内部吞错）也要慢速重试——否则停在 00:00:00 不自愈。 */
+  #startCountdown(): void {
+    this.#stopCountdown();
+    const tick = () => {
+      const ru = this.#retainUntil;
+      if (ru === null || this.#sessionState !== 'GRACE') return; // 重判成功（EXPIRED）后自行退出
+      const left = ru - Date.now();
+      if (left <= 0) {
+        void this.refresh();
+        this.#cdTimer = this.#setTimeout(tick, 5000);
+        return;
+      }
+      const cd = this.deps.ui.root.getElementById('cd');
+      if (cd) cd.textContent = fmtCountdown(left);
+      else return; // 面板已切走（详情态/重渲染无 #cd）
+      this.#cdTimer = this.#setTimeout(tick, 1000);
+    };
+    this.#cdTimer = this.#setTimeout(tick, 1000);
+  }
+
+  #stopCountdown(): void {
+    if (this.#cdTimer !== null) {
+      clearTimeout(this.#cdTimer as ReturnType<typeof setTimeout>);
+      this.#cdTimer = null;
     }
   }
 
@@ -461,6 +512,9 @@ export class PanelController {
       return;
     }
     if (e.type === 'SESSION_STATE') {
+      // P2.1：SESSION_STATE 随带倒计时数据（SESSION_END 广播/清除等变化时无需等 LIST_QUERY）
+      if (e.retainUntil !== undefined) this.#retainUntil = e.retainUntil;
+      else if (e.state === 'ACTIVE' || e.state === 'INACTIVE') this.#retainUntil = null;
       // 重连补偿（审查 P2-6）：SW 每次 Port 连接都回放 SESSION_STATE → 顺带全量刷新，
       // 兜住断线退避窗口内丢失的终态广播（徽章滞留「生成中」自愈）
       if (this.#open) void this.refresh();

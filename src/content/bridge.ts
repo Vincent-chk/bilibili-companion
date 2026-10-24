@@ -27,6 +27,8 @@ export interface UiEvent {
   text?: string; // SEGMENT_NOTE_DONE 终态文本
   error?: { code: string; msg: string }; // SEGMENT_NOTE_FAILED
   truncated?: boolean; // 超长段截断标注
+  closedAt?: number; // SESSION_STATE（P2.1）：GRACE 基准时刻
+  retainUntil?: number; // SESSION_STATE（P2.1）：保留截止时刻（面板倒计时数据源）
 }
 
 export interface BridgeDeps {
