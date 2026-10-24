@@ -93,13 +93,17 @@ export async function mapReduceSummarize(
   opts: MapReduceOptions = {},
 ): Promise<SummarizeOutcome> {
   const chunks = chunkCues(cues, { chunkChars: opts.chunkChars });
+  // 审查 P1-2：Map(N 块并发≤3)+Reduce 共享 timeoutMs 总预算——否则最坏 (N+1)×timeoutMs 击穿 SW 600s 看门狗
+  const deadline = opts.timeoutMs !== undefined ? Date.now() + opts.timeoutMs : undefined;
+  const remaining = (): number | undefined =>
+    deadline === undefined ? undefined : Math.max(1_000, deadline - Date.now());
   const notes: string[] = [];
   let next = 0;
   const worker = async (): Promise<void> => {
     for (;;) {
       const i = next++;
       if (i >= chunks.length) return;
-      const note = await runMap(cfg, videoMeta.title, chunks[i]!, opts);
+      const note = await runMap(cfg, videoMeta.title, chunks[i]!, { ...opts, timeoutMs: remaining() });
       notes[i] = note;
       opts.onMapComplete?.(i, note);
     }
@@ -116,6 +120,6 @@ export async function mapReduceSummarize(
       persona: opts.persona,
       bodyLabel: '各段要点（[mm:ss]文本，已按时间合并）',
     }),
-    { fetchImpl: opts.fetchImpl, timeoutMs: opts.timeoutMs, onDelta: opts.onDelta },
+    { fetchImpl: opts.fetchImpl, timeoutMs: remaining(), onDelta: opts.onDelta },
   );
 }

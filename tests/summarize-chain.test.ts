@@ -404,4 +404,81 @@ describe('2.7a force 重新生成（REGENERATE 执行体语义）', () => {
       srv.close();
     }
   });
+
+  it('force + 字幕轨消失(no-track)：不覆盖旧 done 行为 need_asr，返回 failed 保留旧内容（审查 P0-1）', async () => {
+    const db = freshDb();
+    await seedDone(db);
+    const server = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    servers.push(server);
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob(
+      { db, bili: fakeBili({ subtitles: [] }), llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } },
+      { videoKey: VIDEO_KEY },
+      ctx,
+      { force: true },
+    );
+    expect(outcome.result).toBe('failed');
+    if (outcome.result === 'failed') expect(outcome.error.code).toBe('NO_SUBTITLE');
+    const row = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
+    expect(row?.status).toBe('done');
+    expect(row?.summary).toBe('旧摘要');
+    expect(row?.segmentNotes?.[0]?.text).toBe('旧注记');
+    expect(server.calls).toHaveLength(0); // 零 LLM
+    await db.delete();
+  });
+
+  it('force + 字幕为空(NO_CONTENT)：不覆盖旧 done 行（审查 P0-1）', async () => {
+    const db = freshDb();
+    await seedDone(db);
+    const server = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    servers.push(server);
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob(
+      { db, bili: fakeBili({ cues: [] }), llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } },
+      { videoKey: VIDEO_KEY },
+      ctx,
+      { force: true },
+    );
+    expect(outcome.result).toBe('failed');
+    if (outcome.result === 'failed') expect(outcome.error.code).toBe('NO_CONTENT');
+    const row = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
+    expect(row?.status).toBe('done');
+    expect(row?.summary).toBe('旧摘要');
+    await db.delete();
+  });
+
+  it('多模型口径（审查 P1-1）：B 模型 force 失败不顶掉展示中的 A 模型 done 行', async () => {
+    const db = freshDb();
+    await db.videos.put({
+      key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: '测试视频',
+      cover: 'c', owner: 'up', duration: 600, page: 1, fetchedAt: Date.now(),
+    });
+    await db.summaries.put({
+      key: summaryKey(VIDEO_KEY, 'mA'), videoKey: VIDEO_KEY, source: 'ai_sub',
+      summary: 'A摘要', outline: [{ time: 0, text: 'A大纲' }], evaluation: 'A点评', rating: 4,
+      modelId: 'mA', persona: 'spicy', status: 'done', createdAt: 1,
+    });
+    const srv = http.createServer(() => {
+      /* 收下请求但永不响应 */
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    try {
+      const { ctx } = ctxLog();
+      const outcome = await runSummarizeJob(
+        { db, bili: fakeBili({}), llm: { baseUrl: url, model: 'mB', apiKey: 'k' }, timeoutMs: 30 },
+        { videoKey: VIDEO_KEY },
+        ctx,
+        { force: true },
+      );
+      expect(outcome.result).toBe('failed');
+      expect(await db.summaries.get(summaryKey(VIDEO_KEY, 'mB'))).toBeUndefined(); // 不写 failed 行
+      const latest = (await db.summaries.where('videoKey').equals(VIDEO_KEY).sortBy('createdAt')).pop();
+      expect(latest?.modelId).toBe('mA'); // latestSummary 口径仍指向 A 的 done
+      expect(latest?.status).toBe('done');
+      await db.delete();
+    } finally {
+      srv.close();
+    }
+  });
 });

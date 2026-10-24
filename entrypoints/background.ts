@@ -197,7 +197,7 @@ async function broadcastSegmentTerminal(j: JobRow): Promise<void> {
       videoKey: j.videoKey,
       segIndex: j.segIndex,
       text: note?.text ?? '',
-      error: note?.error ?? j.error, // 执行体未写注记（NO_OUTLINE/NO_VIDEO 早退）时回退 job 行，终态广播不丢错误码
+      error: j.error ?? note?.error, // j.error 与 failed 终态同 tick 落行、永远最新（审查 P2-1：重试走早退不写注记时不得带出旧注记错误码）；note 兜底历史行
       truncated: note?.truncated,
     });
   } catch {

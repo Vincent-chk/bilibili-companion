@@ -18,6 +18,7 @@ export interface SummaryInfo {
   evaluation: string;
   rating: number;
   error?: { code: string; msg: string };
+  segmentNotes?: SummaryRow['segmentNotes']; // 行本体随 LIST_QUERY/SUMMARY_OPEN 全量下发；面板据其判定注记内存态是否失效（审查 P2-5）
 }
 
 export interface ListQueryItem {

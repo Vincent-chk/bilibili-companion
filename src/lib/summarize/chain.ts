@@ -120,6 +120,16 @@ export async function runSummarizeJob(
   // F5 幂等：done 摘要直接完成，零 LLM/字幕请求（换模型=换 key 自然重跑）；force=2.7a 重新生成绕过
   if (!opts.force && (await db.summaries.get(skey))?.status === 'done') return { result: 'done' };
 
+  // 2.7a 审查 P0-1/P1-1/P2-4：force 时锁定「旧 done 行是否须保留」——口径 = videoKey 下 createdAt
+  // 最新行（与 latestSummary/broadcastSegmentTerminal/runSegmentJob 取行一致；按当前模型 skey 会在
+  // 多模型场景误顶掉展示中的旧模型 done 行）。所有非成功出口（need_asr/NO_CONTENT/degraded/异常）
+  // 一律保留旧行：旧摘要与分段注记是不可逆数据；错误只落 job 行，busy 守卫随终态解除、可重试。
+  let keepDone = false;
+  if (opts.force) {
+    const prev = (await db.summaries.where('videoKey').equals(job.videoKey).sortBy('createdAt')).pop();
+    keepDone = prev?.status === 'done';
+  }
+
   const baseSummary: Omit<SummaryRow, 'status'> = {
     key: skey,
     videoKey: job.videoKey,
@@ -160,13 +170,20 @@ export async function runSummarizeJob(
     // 字幕缓存 24h；未命中→选轨→抓取→归一落库（P1.11 起与分段解读共用 ensureTranscript）
     const tr = await ensureTranscript(db, bili, job.videoKey, video);
     if (tr.kind === 'no-track') {
+      // 审查 P0-1：force+旧 done → 不得整行覆盖成 need_asr（旧摘要+注记不可逆丢失，且 need_confirm
+      // 属活动态会卡死 busy 守卫）——返回 failed 保留旧行
+      if (keepDone) {
+        return { result: 'failed', error: { code: 'NO_SUBTITLE', msg: '字幕轨当前不可用，未能重新生成（旧摘要已保留）' } };
+      }
       // F6：无字幕轨 → 橙色待确认。source 暂记 'asr'（用户确认后实际来源即 asr）
       await db.summaries.put({ ...baseSummary, source: 'asr', status: 'need_asr' });
       return { result: 'need_confirm' };
     }
     if (tr.kind === 'empty') {
-      const err = { code: 'NO_CONTENT', msg: '字幕轨内容为空' };
-      await db.summaries.put({ ...baseSummary, status: 'failed', error: err });
+      const err = keepDone
+        ? { code: 'NO_CONTENT', msg: '字幕轨内容为空，未能重新生成（旧摘要已保留）' }
+        : { code: 'NO_CONTENT', msg: '字幕轨内容为空' };
+      if (!keepDone) await db.summaries.put({ ...baseSummary, status: 'failed', error: err }); // 审查 P0-1
       return { result: 'failed', error: err };
     }
     const transcript = tr.transcript;
@@ -194,6 +211,10 @@ export async function runSummarizeJob(
     await ctx.update({ stage: 'llm_reduce', progress: 90 });
 
     if (outcome.degraded || !outcome.summaryResult) {
+      // 审查 P2-4：force+旧 done → 不以降级纯文本（outline=[]）换掉旧结构化摘要+注记
+      if (keepDone) {
+        return { result: 'failed', error: { code: 'DEGRADED', msg: '重生成输出未通过校验，旧摘要已保留，可稍后重试' } };
+      }
       // 降级纯文本（F5：不白屏）：summary=前600字、outline 置空
       await db.summaries.put({
         ...baseSummary,
@@ -216,9 +237,9 @@ export async function runSummarizeJob(
     return { result: 'done' };
   } catch (e) {
     const error = mapLlmError(e);
-    // 2.7a：force 重生成失败不覆盖旧 done 摘要（F11 友好：面板保留旧内容，错误只落 job 行/徽章）；
-    // 成功路径的 put 为整行替换——segmentNotes 不在 baseSummary 中，分段缓存随重生成自然失效清空
-    if (!(opts.force && (await db.summaries.get(skey))?.status === 'done')) {
+    // 2.7a：force 重生成失败不覆盖旧 done 摘要（keepDone，审查 P0-1/P1-1：口径=videoKey 最新行，
+    // 多模型安全）；成功路径的 put 为整行替换——segmentNotes 不在 baseSummary 中，分段缓存随重生成自然失效清空
+    if (!keepDone) {
       await db.summaries.put({ ...baseSummary, status: 'failed', error });
     }
     return { result: 'failed', error };

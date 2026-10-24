@@ -218,6 +218,12 @@ describe('llm client + summary', () => {
     } finally {
       delete g.__POC_LLM_TIMEOUT_MS__;
     }
+    g.__POC_LLM_TIMEOUT_MS__ = '999999';
+    try {
+      expect(resolveConfig().timeoutMs).toBe(540_000); // 审查 P1-2：clamp 上限，落在 SW 600s 看门狗内
+    } finally {
+      delete g.__POC_LLM_TIMEOUT_MS__;
+    }
   });
 });
 

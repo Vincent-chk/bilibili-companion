@@ -164,6 +164,12 @@ export class Pipeline {
   }
 
   async #set(row: JobRow): Promise<void> {
+    // 审查 P2-3：error 只在 failed 终态随行——done/need_confirm/重排 pending 一律清除，
+    // 防重试成功的 done 行带着旧 error（语义陷阱；单点在 #set 收口覆盖所有迁移路径）
+    if (row.status !== 'failed' && row.error !== undefined) {
+      const { error: _stale, ...rest } = row;
+      row = rest as JobRow;
+    }
     await this.#db.jobs.put(row);
     this.#emit(row);
   }

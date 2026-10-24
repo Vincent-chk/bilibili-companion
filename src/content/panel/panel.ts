@@ -284,8 +284,10 @@ export class PanelController {
       // 任务在跑 → 进入流式模式（重置累计）；否则直接渲染成品
       this.#stream = isJobActive(r.item.job) && r.item.job?.status !== 'need_confirm' ? { videoKey, acc: '' } : null;
       // F13 注记状态仅随「视频真切换」重置（审查 P1-3：SUMMARY_* 广播重开同视频详情时
-      // 保留已展开/流式中的段卡；缓存本体在 DB，切走的视频零请求可再取）
-      if (this.#detailKey !== videoKey) {
+      // 保留已展开/流式中的段卡；缓存本体在 DB，切走的视频零请求可再取）；
+      // 收口轮审查 P2-5：行上已无 segmentNotes 而内存仍有注记（重新生成覆盖旧行后）同样清空，
+      // 防旧文本挂到新大纲条目下（分段流式中不受影响：runSegmentJob 先写 streaming 占位注记）
+      if (this.#detailKey !== videoKey || (this.#segNotes.size > 0 && !r.item.summary?.segmentNotes)) {
         this.#segNotes = new Map();
         this.#segOpen = new Set();
       }

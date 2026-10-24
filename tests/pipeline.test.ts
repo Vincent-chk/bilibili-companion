@@ -138,6 +138,22 @@ describe('自动重试 ≤1', () => {
     expect(row.status).toBe('failed');
     await db.delete();
   });
+
+  it('error 只在 failed 终态随行：重排与 done 迁移清除旧 error（审查 P2-3）', async () => {
+    let fail = true;
+    const { db, p } = mkPipeline(async () =>
+      fail ? { result: 'failed', error: { code: 'X', msg: 'x' } } : { result: 'done' },
+    );
+    await db.jobs.put(mkJob({ id: 'je', retries: 1, status: 'failed', error: { code: 'X', msg: 'x' } }));
+    await p.retry('je');
+    expect((await db.jobs.get('je'))!.error).toBeUndefined(); // 重排即清
+    fail = false;
+    await p.drain();
+    const row = (await db.jobs.get('je'))!;
+    expect(row.status).toBe('done');
+    expect(row.error).toBeUndefined(); // done 行不带旧 error
+    await db.delete();
+  });
 });
 
 describe('need_confirm（need_asr，F6）', () => {

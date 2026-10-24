@@ -145,10 +145,12 @@ export async function completeStructured(
   baseMessages: LlmMessage[],
   opts: SummarizeOptions = {},
 ): Promise<SummarizeOutcome> {
+  // 审查 P1-2：带错重发的两轮共享 timeoutMs 总预算——否则最坏 2×timeoutMs 击穿 SW 600s 看门狗
+  const deadline = opts.timeoutMs !== undefined ? Date.now() + opts.timeoutMs : undefined;
   const run = (messages: LlmMessage[]) =>
     streamChatCompletion(cfg, messages, {
       fetchImpl: opts.fetchImpl,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs: deadline === undefined ? undefined : Math.max(1_000, deadline - Date.now()),
       onDelta: opts.onDelta,
     });
 
@@ -213,11 +215,14 @@ export interface ResolvedConfig {
 }
 
 export const LLM_DEFAULT_TIMEOUT_MS = 60_000;
+/** 注入超时上限（审查 P1-2）：completeStructured 两轮共享 timeoutMs 总预算，clamp 后连同字幕抓取
+ *  仍落在 SW 600s 看门狗内并留 ~60s 余量。 */
+export const LLM_MAX_TIMEOUT_MS = 540_000;
 
-/** 思考型模型（reasoning）全片摘要整流可远超 60s：真实 LLM 构建经 POC_LLM_TIMEOUT_MS 放宽（须 < SW 600s 看门狗）。 */
+/** 思考型模型（reasoning）全片摘要整流可远超 60s：真实 LLM 构建经 POC_LLM_TIMEOUT_MS 放宽（clamp 见 LLM_MAX_TIMEOUT_MS）。 */
 export function resolveLlmTimeoutMs(): number {
   const raw = typeof __POC_LLM_TIMEOUT_MS__ === 'string' ? Number.parseInt(__POC_LLM_TIMEOUT_MS__, 10) : NaN;
-  return Number.isFinite(raw) && raw > 0 ? raw : LLM_DEFAULT_TIMEOUT_MS;
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, LLM_MAX_TIMEOUT_MS) : LLM_DEFAULT_TIMEOUT_MS;
 }
 
 /**

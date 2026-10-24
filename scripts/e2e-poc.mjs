@@ -70,7 +70,7 @@ async function main() {
     log('mock LLM server ready on', mockPort);
     llmCfg = { baseUrl: `http://127.0.0.1:${mockPort}`, modelId: 'mock-seed-lite', apiKey: 'e2e-mock-key' };
   } else {
-    log('REAL LLM mode:', llmCfg.baseUrl, llmCfg.modelId, `(Key 打码 ${llmCfg.apiKey.slice(0, 8)}****)`);
+    log('REAL LLM mode:', llmCfg.baseUrl, llmCfg.modelId, `(Key 不打印，长度 ${llmCfg.apiKey.length})`); // 审查 P2-2：前缀也不打，红线零例外
   }
 
   // 2) 带 LLM 环境重新构建（Key 只进构建 env，绝不入仓库）
@@ -684,7 +684,15 @@ async function main() {
           }
           const regenAfter = await regenDb();
           const regenSumAfter = lines.filter((l) => l.text.includes('offscreen run job') && !l.text.includes('seg=')).length;
-          regenProbe = { regenDone, before: regenBefore, after: regenAfter, sumBefore: regenSumBefore, sumAfter: regenSumAfter };
+          // 审查 P2-9：面板确已用新内容重渲染（SUMMARY_DONE→#openDetail 链路），不只 DB+console
+          await sleep(1500);
+          const regenUi = await pageEval(`(() => {
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify({ sumLen: (sr.getElementById('d-summary')?.textContent ?? '').trim().length,
+              outline: sr.querySelectorAll('.d-outline li[data-sec]').length,
+              notes: sr.querySelectorAll('.seg-note:not(.hidden)').length });
+          })()`);
+          regenProbe = { regenDone, before: regenBefore, after: regenAfter, sumBefore: regenSumBefore, sumAfter: regenSumAfter, regenUi };
           log('2.7a 重新生成探针:', JSON.stringify(regenProbe));
         } else {
           uiProbe = { list };
@@ -1166,11 +1174,12 @@ async function main() {
         String(p19Probe?.follow?.firstKey ?? '').startsWith('BV1DUnB61ErU:') &&
         p19Probe?.follow?.open === true &&
         (p19Probe?.follow?.count ?? 0) >= 2,
-      // F12/3.5 前移切片：扩展自身（SW+offscreen）出网 host 全在白名单（B 站系 + LLM 端点）
+      // F12/3.5 前移切片：扩展自身（SW+offscreen）出网 host 全在白名单（B 站系 + LLM 端点）；
+      // 127.0.0.1 仅 mock 模式放行（审查 P2-8：真实模式本机端口不留审计豁口）
       networkWhitelist: netUrls.length > 0 && netUrls.every((u) => {
         try {
           const h = new URL(u).hostname;
-          return h === '127.0.0.1' ||
+          return (!REAL && h === '127.0.0.1') ||
             /(^|\.)(bilibili\.com|hdslb\.com|bilivideo\.com|bilivideo\.cn)$/.test(h) ||
             h === new URL(llmCfg.baseUrl).hostname;
         } catch { return false; }
@@ -1181,7 +1190,10 @@ async function main() {
         regenProbe?.sumAfter === regenProbe?.sumBefore + 1 &&
         (regenProbe?.after?.createdAt ?? 0) > (regenProbe?.before?.createdAt ?? 0) &&
         regenProbe?.after?.status === 'done' &&
-        regenProbe?.after?.notes === 0,
+        regenProbe?.after?.notes === 0 &&
+        (regenProbe?.regenUi?.sumLen ?? 0) > 50 && // 审查 P2-9：面板已用新摘要重渲染
+        (regenProbe?.regenUi?.outline ?? 0) >= 6 && // 新大纲就位（Schema 6–12 条）
+        regenProbe?.regenUi?.notes === 0, // 无残留展开注记卡
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
