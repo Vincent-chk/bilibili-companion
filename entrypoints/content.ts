@@ -75,7 +75,13 @@ export default defineContentScript({
       }
       panel?.handleEvent(e);
       if (e.type === 'SESSION_STATE' && e.state) {
+        uiSessionState = e.state;
         mascot?.setSessionState(e.state as UiSessionState);
+        // P2.5：隐藏豆包只在陪看会话内生效——回 INACTIVE 自动解除（激活入口必须可见）
+        if (e.state === 'INACTIVE' && mascotHidden) {
+          mascotHidden = false;
+          mascot?.setHidden(false);
+        }
         // P1.10 时机：激活/恢复后复核登录态（force 绕缓存）
         if (e.state === 'ACTIVE') void requestLoginCheck(1);
       }
@@ -160,6 +166,11 @@ export default defineContentScript({
         false,
     });
 
+    // P2.5：隐藏豆包（本次会话）——content 内存态（刷新即回归）；开关在设置页。
+    // INACTIVE 下忽略隐藏（审查 P2-4：隐藏+关面板=激活入口锁死，唯一自愈是刷新）
+    let mascotHidden = false;
+    let uiSessionState: string | null = null;
+
     panel = new PanelController({
       ui,
       bridge,
@@ -178,6 +189,18 @@ export default defineContentScript({
           onSaved: () => toast(ui, 'ASR 已配置，回到卡片点【调用 ASR 解析】', 3200),
           asrOnly: true,
         });
+      },
+      // P2.5/2.7b：当前视频（人设切换联动询问对象）+ 隐藏豆包开关（内存态）
+      getCurrentVideoKey: () => currentVideoKey,
+      mascotHidden: () => mascotHidden,
+      onMascotHiddenChange: (h) => {
+        if (h && (uiSessionState ?? 'INACTIVE') === 'INACTIVE') {
+          toast(ui, '未激活时豆包需保持可见（这是激活入口）');
+          return; // 审查 P2-4：INACTIVE 忽略隐藏
+        }
+        mascotHidden = h;
+        mascot?.setHidden(h);
+        if (h) toast(ui, '豆包已隐藏（记录照常），刷新页面或本次陪看数据清除后回归', 3200);
       },
     });
 
@@ -275,7 +298,13 @@ async function startWatcher(bvid: string | null): Promise<void> {
       durationSec: duration,
       thresholdSec: triggerSeconds,
       onTick: (p) => {
-        void browser.runtime.sendMessage({ type: 'WATCH_TICK', ...p }).catch(() => {});
+        void browser.runtime
+          .sendMessage({ type: 'WATCH_TICK', ...p })
+          .then((r) => {
+            // 审查 P2-2：SW 拒收（暂停）→ dispose 本地计时，暂停窗口时长不追溯补记
+            if ((r as { ok?: boolean; reason?: string } | undefined)?.reason === 'paused') watchSession?.dispose();
+          })
+          .catch(() => {});
       },
       onTrigger: (p) => {
         // 首次真实触发（去重后）→ 豆包 note 态 + 气泡（F2）；deduped=幂等重放不打扰

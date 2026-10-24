@@ -24,6 +24,7 @@ import { applyRetention, retainUntilOf, sessionStartBlockedReason, type Retentio
 import type { SessionPointer } from '../src/lib/storage';
 import { excerptOf } from '../src/content/panel/view-models';
 import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
+import { clampThreshold, maskApiKey, resolveApiKey, sanitizePersona } from '../src/content/panel/settings-logic';
 import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/content/seek';
 import { parseVideoKey } from '../src/lib/summarize/chain';
 import { buildRefererRules, DNR_RULE_IDS } from '../src/lib/dnr';
@@ -264,6 +265,12 @@ interface InMsg {
   llm?: ModelConfigMsg;
   asr?: ModelConfigMsg;
   kind?: 'llm' | 'asr'; // TEST_CONNECTION：探活对象（P2.3 起 asr 走 /models 探活）
+  // P2.5 设置页：偏好部分保存 + LLM 配置显式清除（F9「清空 Key 保存→回到未激活态」）
+  triggerSeconds?: number;
+  persona?: string;
+  bubbles?: boolean;
+  paused?: boolean;
+  llmClear?: boolean;
 }
 
 // ---- P2.3 · DNR 音频防盗链（架构 §3.8） -------------------------------------------
@@ -286,10 +293,10 @@ async function ensureDnrRules(): Promise<void> {
 
 export default defineBackground(() => {
   console.log('[doubao-poc] background ready');
-  // SW 启动：恢复 stale running → 清空 pending（断网挂起/重启后续跑，F11）
+  // SW 启动：恢复 stale running → 清空 pending（断网挂起/重启后续跑，F11；P2.5 暂停中则挂起）
   void pipeline.recover().then(async (n) => {
     if (n) console.log(`[doubao] recovered ${n} stale job(s)`);
-    await pipeline.drain();
+    drainUnlessPaused();
   });
   // P1.10 时机①：扩展启动即探登录态（架构 §3.9）
   void checkLoginState(true)
@@ -378,6 +385,8 @@ export default defineBackground(() => {
         return handleTestConnection(m);
       case 'SETTINGS_SAVE':
         return handleSettingsSave(m);
+      case 'SETTINGS_GET':
+        return handleSettingsGet(); // P2.5：设置页数据源（Key 打码，F9）
       default:
         return undefined; // 未识别消息交给其它 listener（SUMMARY_PROGRESS 由 executeViaOffscreen 处理）
     }
@@ -474,10 +483,12 @@ async function handleWipe(): Promise<Record<string, unknown>> {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-/** VIDEO_ENTER：view 元信息（videos 24h 缓存）+ 多 P 选 cid + 建/刷 visit，回 watcher 所需参数。 */
+/** VIDEO_ENTER：view 元信息（videos 24h 缓存）+ 多 P 选 cid + 建/刷 visit，回 watcher 所需参数。
+ *  P2.5「暂停陪看」：直接拒绝（不取 view=零网络请求、不建 visit=零采集，F12）。 */
 async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
   const { bvid, url } = m;
   if (!bvid || !url) return { ok: false, error: 'VIDEO_ENTER 缺 bvid/url' };
+  if (await isPaused()) return { ok: false, reason: 'paused' };
   try {
     let wantedPage = 1;
     try {
@@ -533,6 +544,7 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
 async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey, watchedSeconds = 0, progressPct = 0 } = m;
   if (!videoKey) return { ok: false };
+  if (await isPaused()) return { ok: false, reason: 'paused' }; // P2.5：暂停=零采集（不建行不记进度）
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, reason: 'inactive' };
   const sessionId = pointer.sessionId;
@@ -555,7 +567,7 @@ async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
       await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId });
     });
     console.log(`[doubao] summary job queued (tick sweep): ${videoKey}`);
-    void pipeline.drain();
+    drainUnlessPaused();
   }
   return { ok: true, ...(existing ? {} : { created: true }) };
 }
@@ -567,6 +579,7 @@ async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
 async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
   if (!videoKey) return { ok: false };
+  if (await isPaused()) return { ok: false, reason: 'paused' }; // P2.5：暂停不触发不置位（恢复后照常）
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, reason: 'inactive' };
   const visit = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
@@ -578,7 +591,7 @@ async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> 
     await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
   });
   console.log(`[doubao] summary job queued: ${videoKey}`);
-  void pipeline.drain();
+  drainUnlessPaused();
   return { ok: true };
 }
 
@@ -601,11 +614,26 @@ interface StoredSettings {
   triggerSeconds?: number;
   persona?: string;
   asrMaxMB?: number;
+  bubbles?: boolean;
+  paused?: boolean; // P2.5：「暂停陪看」总开关（F12：开启后不再有任何采集与请求）
+  llm?: { baseUrl: string; modelId: string; apiKey: string };
   asr?: { baseUrl: string; modelId: string; apiKey: string };
 }
 
 async function readSettings(): Promise<StoredSettings> {
   return ((await browser.storage.local.get('settings'))['settings'] as StoredSettings) ?? {};
+}
+
+/** P2.5：暂停中？（各采集/生成入口的门禁；F12「不再有任何采集与请求」）。 */
+async function isPaused(): Promise<boolean> {
+  return (await readSettings()).paused === true;
+}
+
+/** P2.5：暂停时不清空 pending 队列（挂起待恢复）；解除暂停的保存路径自行 drain。 */
+function drainUnlessPaused(): void {
+  void isPaused().then((paused) => {
+    if (!paused) void pipeline.drain();
+  });
 }
 
 /** LIST_QUERY：visits+videos+summaries+jobs 联查快照（02-数据模型 §3，列表数据源）。
@@ -621,6 +649,8 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
     ...(pointer?.closedAt !== undefined ? { closedAt: pointer.closedAt } : {}),
     ...(retainUntil !== undefined ? { retainUntil } : {}),
     triggerSeconds: clamp(settings.triggerSeconds ?? 20, 5, 300),
+    // P2.5：「暂停陪看」总开关随列表应答下发（面板状态行与设置开关的数据源）
+    paused: settings.paused === true,
     // P1.10：引导卡数据源（30s 缓存零网络；强制刷新走 LOGIN_CHECK force=1，面板打开时机）
     loggedIn: loginCache?.loggedIn ?? null,
   };
@@ -647,6 +677,7 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
  * 广播刷新（面板事件驱动的重开）不带 retry：失败后不自动重新入队——
  * 否则失败+详情打开 = 「失败→刷新→入队→失败」无限自动重试环（2026-10-23 E2E 实测），
  * 重试必须由用户发起（F11）。
+ * P2.5「暂停陪看」：缓存/详情照常可见（零网络），但**不入队**（F12 无任何生成请求）。
  */
 async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
@@ -662,10 +693,10 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   const lastJobRow = (await db.jobs.where('videoKey').equals(videoKey).sortBy('updatedAt')).pop();
   const untouched = !summary && !lastJobRow; // 从未生成过也从未排过队
   const failedBefore = summary?.status === 'failed' || lastJobRow?.status === 'failed';
-  if (!job && (untouched || (failedBefore && m.retry === 1))) {
+  if (!job && (untouched || (failedBefore && m.retry === 1)) && !(await isPaused())) {
     await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
     job = await activeJob(videoKey);
-    void pipeline.drain();
+    drainUnlessPaused();
   }
   const transcript = excerptOf(await db.transcripts.get(videoKey));
   // P2.3 审查 P1-1：need_asr 卡片要能显示上次 ASR 尝试的失败原因——音频链失败保留 need_asr 行、
@@ -677,16 +708,17 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
  * 2.7a REGENERATE（F7/F8【重新生成】）：用户从详情页发起强制重跑。
  * 成功整行覆盖旧摘要（segmentNotes 随之清空=分段缓存失效策略，chain force 语义）；
  * 失败不覆盖旧 done 行（旧摘要保留，错误只落 job 行）。同视频任何任务在途 → busy 拒绝。
- * 人设切换后的联动询问属 2.5 设置页（2.7b）。
+ * 人设切换后的联动询问属 2.5 设置页（2.7b，P2.5 已接入：personaChanged 随保存应答）。
  */
 async function handleRegenerate(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
   if (!videoKey) return { ok: false, error: 'REGENERATE 缺 videoKey' };
+  if (await isPaused()) return { ok: false, error: 'paused' }; // P2.5：暂停期间不烧 LLM
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, error: 'no-session' };
   if (await activeJob(videoKey)) return { ok: false, error: 'busy' };
   await pipeline.enqueue({ type: 'REGENERATE', videoKey, sessionId: pointer.sessionId });
-  void pipeline.drain();
+  drainUnlessPaused();
   return { ok: true, started: true };
 }
 
@@ -701,6 +733,7 @@ async function handleRegenerate(m: InMsg): Promise<Record<string, unknown>> {
 async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
   if (!videoKey) return { ok: false, error: 'ASR_CONFIRM 缺 videoKey' };
+  if (await isPaused()) return { ok: false, error: 'paused' }; // P2.5：暂停期间不下载音频不转写
   const settings = await readSettings();
   const asr = settings.asr;
   if (!asr?.baseUrl || !asr.modelId || !asr.apiKey) return { ok: false, reason: 'NEED_ASR_CONFIG' };
@@ -718,7 +751,7 @@ async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
     await pipeline.enqueue({ type: 'ASR_SUMMARIZE', videoKey, sessionId: pointer.sessionId });
   });
   console.log(`[doubao] asr job queued (user confirmed): ${videoKey}`);
-  void pipeline.drain();
+  drainUnlessPaused();
   return { ok: true, started: true };
 }
 
@@ -804,9 +837,10 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
   }
   if (!active) {
     const allow =
-      cached === undefined ||
-      cached.status === 'streaming' || // 残留 streaming（SW 死亡）→ 点击重建
-      (cached.status === 'failed' && retry === 1); // 用户显式重试
+      (cached === undefined ||
+        cached.status === 'streaming' || // 残留 streaming（SW 死亡）→ 点击重建
+        (cached.status === 'failed' && retry === 1)) && // 用户显式重试
+      !(await isPaused()); // P2.5：暂停期间分段解读只读缓存，不发 LLM 请求
     if (allow) {
       const pointer = await getSessionPointer(browserKv);
       await pipeline.enqueue({
@@ -815,7 +849,7 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
         sessionId: pointer?.sessionId ?? 'no-session',
         segIndex,
       });
-      void pipeline.drain();
+      drainUnlessPaused();
       // 审查 P1-1：本次入了队就回合成 streaming 占位（started 标记让面板清空旧增量残留）——
       // 若回旧 failed 注记，面板会把重试的流式占位覆盖回失败卡并丢弃全部增量（「重试秒败」假象）
       return { ok: true, note: { text: '', status: 'streaming', createdAt: Date.now() }, started: true };
@@ -838,6 +872,9 @@ let loginInflight: Promise<boolean | null> | null = null;
 
 async function checkLoginState(force = false): Promise<boolean | null> {
   if (!force && loginCache && Date.now() - loginCache.at < LOGIN_CACHE_MS) return loginCache.loggedIn;
+  // P2.5「暂停陪看」：暂停期间连登录探测也不发（F12「不再有任何采集与请求」）——
+  // 回缓存值（无缓存=未知 null），解除暂停后下次探测自愈
+  if (await isPaused()) return loginCache?.loggedIn ?? null;
   if (!loginInflight) {
     loginInflight = loginClient.checkLogin().finally(() => {
       loginInflight = null;
@@ -878,7 +915,7 @@ async function applyLoginState(loggedIn: boolean | null): Promise<void> {
     }
     if (n) {
       console.log(`[doubao] login restored: requeued ${n} NEED_LOGIN job(s)`);
-      void pipeline.drain();
+      drainUnlessPaused();
     }
   }
 }
@@ -927,7 +964,9 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   const cfg = m.llm ?? {};
   const baseUrl = (cfg.baseUrl ?? '').trim();
   const model = (cfg.modelId ?? '').trim();
-  const apiKey = (cfg.apiKey ?? '').trim();
+  // P2.5：设置页 Key 打码——空/打码哨兵沿用已存 Key（面板永不见明文，探活仍用真 Key）
+  const prevCfg = (m.kind === 'asr' ? (await readSettings()).asr : (await readSettings()).llm) ?? undefined;
+  const apiKey = resolveApiKey(prevCfg?.apiKey, cfg.apiKey ?? '').trim();
   if (!baseUrl || !model || !apiKey) return { ok: false, msg: '请先填写完整配置再测试' };
   const v = validateEndpointUrl(baseUrl);
   if (!v.ok) return { ok: false, msg: v.error ?? 'Base URL 不合法' };
@@ -981,52 +1020,118 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
 }
 
 /**
- * SETTINGS_SAVE（onboarding 保存，02-数据模型 §2 settings 形状）：
- * 后台二次校验（信任边界）→ 写 settings + onboarded → 按 origin 申请权限 → 返回授权结果。
- * tts 预留位置灰保存；triggerSeconds/persona/bubbles 首次保存时落默认值。
- * llm/asr 的 `ok`（已验证）标记不在此写——语义属「测试连接通过」，由 2.5 设置页消费时再定义。
- * ASR 清空保存 = 清除旧配置（防旧 Key 残留，审查 P2）。
+ * P2.5 · SETTINGS_GET：设置页数据源。Key 打码（F9「仅尾 4 位」）——明文永不出 SW。
+ * prefs 全量随发；llm/asr 未配置时不带键（面板按 undefined 渲染「未配置」）。
+ */
+async function handleSettingsGet(): Promise<Record<string, unknown>> {
+  const s = await readSettings();
+  const mask = (c?: { baseUrl: string; modelId: string; apiKey: string }) =>
+    c && c.baseUrl && c.modelId && c.apiKey
+      ? { baseUrl: c.baseUrl, modelId: c.modelId, apiKeyMasked: maskApiKey(c.apiKey) }
+      : undefined;
+  return {
+    ok: true,
+    ...(s.llm ? { llm: mask(s.llm) } : {}),
+    ...(s.asr ? { asr: mask(s.asr) } : {}),
+    triggerSeconds: clampThreshold(s.triggerSeconds),
+    persona: sanitizePersona(s.persona),
+    bubbles: s.bubbles !== false,
+    paused: s.paused === true,
+    asrMaxMB: s.asrMaxMB ?? 25,
+  };
+}
+
+/**
+ * SETTINGS_SAVE（onboarding + P2.5 设置页，02-数据模型 §2 settings 形状）：
+ * 后台二次校验（信任边界）→ 写 settings → 按 origin 申请权限 → 返回授权结果。
+ * P2.5 语义（部分保存，各键缺省=保持原值）：
+ *  - llm 缺省=沿用（P2.3 asr-only 补配模式）；带 llm 时 apiKey 空或为旧 Key 打码形态=沿用旧 Key
+ *    （设置页打码占位不改配置），三件套齐才落库并补 onboarded=true；
+ *  - llmClear=true：显式清除 LLM 配置（F9「清空 Key 保存→回到未激活态」）——onboarded=false
+ *    + 活动会话 ACTIVE→GRACE（数据按保留规则走 F10 确认链路，不产生不可见死数据）；
+ *  - asr 缺省=沿用（不再隐式删除）；全空保存=显式清除旧 ASR 配置（含旧 Key）；
+ *  - prefs（triggerSeconds/persona/bubbles/paused）随带随存。
  */
 async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
-  const llm = m.llm ?? {};
+  const llm = m.llm;
   const asr = m.asr;
-  const prev =
-    ((await browser.storage.local.get('settings'))['settings'] as Record<string, unknown> | undefined) ?? {};
-
-  // P2.3：ASR 补配模式（m.llm 缺省）——LLM 三件套不重填、沿用已存配置（Key 只留在 SW 侧，
-  // 面板永不见明文；没有已存 LLM 却不带 llm 保存 = 非法路径，拒绝）
-  const asrOnly = m.llm === undefined;
-  const prevLlm = prev['llm'] as { baseUrl?: string; modelId?: string; apiKey?: string } | undefined;
-  if (asrOnly && !(prevLlm?.baseUrl && prevLlm.modelId && prevLlm.apiKey)) {
-    return { ok: false, error: 'LLM 尚未配置，请完整填写 LLM 三项' };
-  }
+  const prev = (await readSettings()) as unknown as Record<string, unknown>;
   const next: Record<string, unknown> = { ...prev };
   const patterns: string[] = [];
-  if (!asrOnly) {
-    const v = validateLlm({ baseUrl: llm.baseUrl ?? '', modelId: llm.modelId ?? '', apiKey: llm.apiKey ?? '' });
+  let llmCleared = false;
+
+  // F9 清空 LLM Key 保存：显式清除 + 会话收口（ACTIVE→GRACE，走 F10 保留/确认链路）
+  if (m.llmClear === true) {
+    delete next['llm'];
+    llmCleared = true;
+    const pointer = await getSessionPointer(browserKv);
+    if (pointer?.state === 'ACTIVE') {
+      const now = Date.now();
+      const grace: SessionPointer = { ...pointer, state: 'GRACE', closedAt: now, lastActiveAt: now };
+      await db.sessions.update(pointer.sessionId, { state: 'GRACE', closedAt: now, lastActiveAt: now });
+      await setSessionPointer(browserKv, grace);
+      lastBroadcastSession = { sessionId: grace.sessionId, state: 'GRACE' };
+      broadcastToUi(sessionStateMsg(grace));
+    }
+    console.log('[doubao] llm config cleared (session gated, data kept per retention rules)');
+  } else if (llm !== undefined) {
+    const prevLlm = prev['llm'] as { baseUrl?: string; modelId?: string; apiKey?: string } | undefined;
+    // 打码哨兵：空/旧 Key 打码形态 = 沿用旧 Key（设置页不改 Key 只改 baseUrl/model 的场景）
+    const apiKey = resolveApiKey(prevLlm?.apiKey, llm.apiKey ?? '');
+    const v = validateLlm({ baseUrl: llm.baseUrl ?? '', modelId: llm.modelId ?? '', apiKey });
     if (!v.ok) return { ok: false, error: v.error ?? `必填项缺失：${v.missing.join(' / ')}` };
-    next['llm'] = { baseUrl: llm.baseUrl!.trim(), modelId: llm.modelId!.trim(), apiKey: llm.apiKey!.trim() };
+    next['llm'] = { baseUrl: llm.baseUrl!.trim(), modelId: llm.modelId!.trim(), apiKey };
     const oL = validateEndpointUrl(llm.baseUrl!);
     if (oL.ok && oL.origin) patterns.push(`${oL.origin}/*`);
+  } else if (
+    llm === undefined &&
+    asr !== undefined &&
+    !((prev['llm'] as { baseUrl?: string; modelId?: string; apiKey?: string } | undefined)?.apiKey)
+  ) {
+    // P2.3 asr-only 补配模式：不带 llm 存 ASR 须已有 LLM（否则摘要链无配置）；
+    // 纯 prefs 保存（滑杆/开关）不要求已配置 LLM——onboarding 前也可调偏好
+    return { ok: false, error: 'LLM 尚未配置，请完整填写 LLM 三项' };
   }
 
-  const a = asr
-    ? validateAsr({ baseUrl: asr.baseUrl ?? '', modelId: asr.modelId ?? '', apiKey: asr.apiKey ?? '' })
-    : { kind: 'skip' as const };
-  if (a.kind === 'error') return { ok: false, error: a.error };
-  if (a.kind === 'ok') {
-    next.asr = { baseUrl: asr!.baseUrl!.trim(), modelId: asr!.modelId!.trim(), apiKey: asr!.apiKey!.trim() };
-    const oA = validateEndpointUrl(asr!.baseUrl!);
-    if (oA.ok && oA.origin) patterns.push(`${oA.origin}/*`);
-  } else {
-    delete next.asr; // 清空保存 = 移除旧 ASR 配置（含旧 Key），与「部分填写报错」对称
+  if (asr !== undefined) {
+    // P1-1（审查）：全空判定必须看原始输入——哨兵解析会把空 Key 还原成旧 Key，
+    // validateAsr 随即报「部分填写」，用户按提示全空保存却永远清不掉 ASR Key
+    const rawAllEmpty = !(asr.baseUrl ?? '').trim() && !(asr.modelId ?? '').trim() && !(asr.apiKey ?? '').trim();
+    if (rawAllEmpty) {
+      delete next.asr; // 显式带 asr 全空保存 = 清除旧 ASR 配置（含旧 Key）
+    } else {
+      const prevAsr = prev['asr'] as { apiKey?: string } | undefined;
+      const a = validateAsr({
+        baseUrl: asr.baseUrl ?? '',
+        modelId: asr.modelId ?? '',
+        apiKey: resolveApiKey(prevAsr?.apiKey, asr.apiKey ?? ''),
+      });
+      if (a.kind === 'error') return { ok: false, error: a.error };
+      next.asr = { baseUrl: asr.baseUrl!.trim(), modelId: asr.modelId!.trim(), apiKey: resolveApiKey(prevAsr?.apiKey, asr.apiKey ?? '') };
+      const oA = validateEndpointUrl(asr.baseUrl!);
+      if (oA.ok && oA.origin) patterns.push(`${oA.origin}/*`);
+    }
+  } // asr 缺省 = 沿用（P2.5 起不再隐式删除）
+
+  // P2.5 prefs：随带随存（滑杆/人设/气泡/暂停）
+  if (m.triggerSeconds !== undefined) next['triggerSeconds'] = clampThreshold(m.triggerSeconds);
+  if (m.persona !== undefined) next['persona'] = sanitizePersona(m.persona);
+  if (m.bubbles !== undefined) next['bubbles'] = m.bubbles === true;
+  if (m.paused !== undefined) {
+    next['paused'] = m.paused === true;
+    if (m.paused !== true) void pipeline.drain(); // 解除暂停：立即续跑挂起的采集/生成
   }
   if (typeof next['triggerSeconds'] !== 'number') next['triggerSeconds'] = 20;
   if (typeof next['persona'] !== 'string') next['persona'] = 'spicy';
   if (typeof next['bubbles'] !== 'boolean') next['bubbles'] = true;
   if (typeof next['asrMaxMB'] !== 'number') next['asrMaxMB'] = 25; // P2.3：音频上限默认 25MB（≈50 分钟）
 
-  await browser.storage.local.set({ settings: next, onboarded: true });
+  const personaChanged = typeof m.persona === 'string' && sanitizePersona(m.persona) !== String(prev['persona'] ?? 'spicy');
+  const setOnboarded = llmCleared ? false : llm !== undefined ? true : undefined;
+  await browser.storage.local.set({
+    settings: next,
+    ...(setOnboarded === undefined ? {} : { onboarded: setOnboarded }),
+  });
 
   const granted: string[] = [];
   const denied: string[] = [];
@@ -1034,8 +1139,8 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
     (await ensureOriginPermission(p) ? granted : denied).push(p);
   }
   console.log(
-    `[doubao] settings saved (${asrOnly ? 'llm kept' : 'llm ok'}, asr ${a.kind === 'ok' ? 'provided' : 'cleared/skipped'}; origins granted=${granted.length} denied=${denied.length})`,
+    `[doubao] settings saved (${llmCleared ? 'llm cleared' : llm !== undefined ? 'llm ok' : 'llm kept'}, asr ${asr === undefined ? 'kept' : 'provided'}, paused=${String(next['paused'] === true)}; origins granted=${granted.length} denied=${denied.length})`,
   );
-  return { ok: true, granted, denied };
+  return { ok: true, granted, denied, ...(llmCleared ? { llmCleared: true } : {}), personaChanged };
 }
 

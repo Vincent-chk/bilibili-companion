@@ -43,6 +43,8 @@ const STATES: MascotState[] = ['idle', 'happy', 'thinking', 'note', 'sleep'];
 export class MascotController {
   #state: MascotState = 'idle';
   #session: UiSessionState = 'INACTIVE';
+  /** P2.5：隐藏豆包（本次会话）——content 内存态，不落盘。 */
+  #hidden = false;
   #typeTimer: ReturnType<typeof setInterval> | null = null;
   #hideTimer: unknown = null;
   #pulseTimer: unknown = null;
@@ -148,6 +150,22 @@ export class MascotController {
     else void this.say('那我先睡一觉…数据帮你留着哦 zZ', 4200);
   }
 
+  /**
+   * P2.5 准则#6 可消失性：「隐藏豆包（本次会话）」开关（content 内存，不落盘）。
+   * 隐藏≠结束会话：观看计时/生成照常；气泡与表情一并静默；解除途径=设置关闭开关/
+   * 页面刷新（内存态自然回归）/会话回到 INACTIVE（自动解除，激活入口必须可见）。
+   */
+  setHidden(hidden: boolean): void {
+    this.#hidden = hidden;
+    this.#el.wrap.classList.toggle('hidden', hidden);
+    if (hidden) this.hideBubble();
+    else if (this.#session === 'INACTIVE') this.showStartBubble(); // 解除隐藏即恢复激活入口
+  }
+
+  get hidden(): boolean {
+    return this.#hidden;
+  }
+
   /** 瞬时表情：切到 st 并在 ms 后回落 idle（happy/note 等事件表情，原型同款节奏）。
    *  回落句柄独立于气泡定时器（say 打断不应取消 happy→idle 回落），但同表情连发时清旧防提前回落。 */
   pulse(st: MascotState, ms = 4200): void {
@@ -167,6 +185,7 @@ export class MascotController {
    * kind 缺省=用户动作直接后果（开始/结束/恢复），不限频。
    */
   async say(text: string, ms = BUBBLE_MS, kind?: string): Promise<void> {
+    if (this.#hidden) return; // P2.5：隐藏豆包期间气泡静默（计时/生成不受影响）
     if (!(await this.deps.bubblesEnabled())) return;
     if (isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
     if (kind) {
@@ -201,6 +220,7 @@ export class MascotController {
 
   /** 常驻「开始陪看」按钮气泡（未激活态，F1）。准则#3 输入聚焦不弹；准则#4 以 kind='start' 限频（重连回放不轰炸）。 */
   showStartBubble(): void {
+    if (this.#hidden) return; // P2.5：隐藏期间不弹常驻 CTA
     if (isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
     const now = Date.now();
     if (bubbleThrottled(this.#lastKindAt.get('start'), now)) return;

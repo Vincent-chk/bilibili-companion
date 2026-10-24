@@ -189,6 +189,29 @@ export const UI_STYLES = `
   .rule-box { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 12px; color: var(--text2); line-height: 1.8; }
   .rule-box b { color: var(--text); }
 
+  /* ---- 设置页（P2.5，原型 renderSettings 1:1 + 偏好开关扩展） ---- */
+  .p-icon-btn { width: 32px; height: 32px; border-radius: 8px; font-size: 16px; color: var(--text2); transition: background .15s; flex: none; }
+  .p-icon-btn:hover { background: #f1f2f4; }
+  .set-danger { border: 1px solid #fecaca; }
+  .set-sec .set-tag { margin-left: auto; }
+  .slider-row { display: flex; align-items: center; gap: 12px; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--pink); }
+  .slider-val { flex: none; font-size: 13px; font-weight: 700; color: var(--pink); min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
+  .switch-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px dashed var(--line); font-size: 12.5px; color: var(--text2); }
+  .switch-row:first-of-type { border-top: none; }
+  .switch-row .sw-label { flex: 1; min-width: 0; }
+  .switch-row .sw-label b { display: block; font-size: 12.5px; color: var(--text); font-weight: 600; }
+  .switch-row .sw-label span { font-size: 11px; color: var(--text3); }
+  .switch { position: relative; width: 40px; height: 22px; flex: none; cursor: pointer; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch i { position: absolute; inset: 0; border-radius: 99px; background: #d5d9e0; transition: background .18s; }
+  .switch i::after { content: ''; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: left .18s; }
+  .switch input:checked + i { background: var(--pink); }
+  .switch input:checked + i::after { left: 21px; }
+  .persona-row { display: flex; gap: 8px; margin-top: 8px; }
+  .persona-pill { flex: 1; text-align: center; font-size: 12px; padding: 7px 4px; border: 1.5px solid var(--line); border-radius: 10px; cursor: pointer; transition: all .15s; color: var(--text2); background: #fff; }
+  .persona-pill.on { border-color: var(--pink); color: var(--pink); background: #fff0f5; font-weight: 600; }
+
   /* ============ 弹窗 ============ */
   #modal-root { position: fixed; inset: 0; z-index: 2147483200; display: none; align-items: center; justify-content: center; background: rgba(15,17,26,.5); backdrop-filter: blur(2px); animation: fadeIn .2s ease; }
   #modal-root.show { display: flex; }

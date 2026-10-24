@@ -27,12 +27,14 @@ export function mountDoubaoUi(doc: Document = document): DoubaoUi {
         <div class="p-head-row">
           <div class="p-mascot-avatar"><img alt="豆包"></div>
           <div class="p-titles"><div class="p-title">豆包的陪看小本本</div><div class="p-sub" id="p-status"></div></div>
+          <button class="p-icon-btn" id="btn-settings" title="设置">⚙</button>
         </div>
         <div class="p-head-actions hidden" id="p-head-actions"></div>
       </header>
       <div class="p-body" id="p-body">
         <div id="login-card" class="login-card hidden"></div>
         <section id="view-list"></section>
+        <section id="view-settings" class="hidden"></section>
       </div>
     </aside>
     <div id="modal-root"></div>

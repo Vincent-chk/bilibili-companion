@@ -545,6 +545,7 @@ async function main() {
     let wipeProbe = null; // P2.2：F10 清除链路探针（超期弹窗/稍后提醒重弹/立即清除/手动清除）
     let asrProbe = null; // P2.3：F6 ASR 确认流探针（need_asr 卡片/未配置引导/三段进度/done ASR转写）
     let dnrProbe = null; // P2.4：DNR 头级验证探针（bilivideo 实发 Referer + getDynamicRules 形状审计）
+    let settingsProbe = null; // P2.5：设置页探针（视图/打码/2.7b 人设联动/阈值/暂停/气泡/清 Key/隐藏+清除迁移）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -1250,10 +1251,13 @@ async function main() {
             }
           }
 
+          // P2.5：手动清除入口已迁设置页（P2.2 列表头 🗑 移除）——齿轮→危险操作→【立即清除全部数据】
+          const wipeEntry = async () => { await click('#btn-settings'); await sleep(700); await click('#btn-clear'); await sleep(400); };
+
           // c2) 立即清除（或上面回归路径已清除）→ 六表 0 行 + pointer 移除 + settings/onboarded 保留 + 未激活空态
           const wipeNeeded = !midFlight?.wipedClean;
           if (wipeNeeded) {
-            if (!(await modalState())?.shown) { await click('#wipe-entry'); await sleep(400); }
+            if (!(await modalState())?.shown) { await wipeEntry(); }
             await click('#wipe-now');
             await sleep(1400);
           }
@@ -1264,14 +1268,13 @@ async function main() {
           await click('#btn-start2');
           await sleep(1000);
           const activeState = await modalState();
-          await click('#wipe-entry');
-          await sleep(500);
+          await wipeEntry();
+          await sleep(300);
           const mCancel = await modalState();
           await click('#wipe-later'); // 取消
           await sleep(500);
           const afterCancel = await modalState();
-          await click('#wipe-entry');
-          await sleep(400);
+          await wipeEntry();
           await click('#wipe-now');
           await sleep(1400);
           const afterManual = await modalState();
@@ -1488,6 +1491,284 @@ async function main() {
               ),
           };
           log('P2.4 判定项:', JSON.stringify(dnrProbe));
+
+          // ============================================================
+          // 8.996) P2.5 设置页完整版探针：
+          //   基础视图+Key 打码+测试连接哨兵+保存不改 Key / 人设切换联动询问(2.7b+F8) /
+          //   阈值滑杆真实生效（F2：60s 不触发→5s 触发）/ 暂停陪看（F12：零采集零请求）/
+          //   气泡开关 / 清空 LLM Key（F9：确认→门槛回锁）/ 隐藏豆包+手动清除迁移设置页
+          // ============================================================
+          const srOf = (expr) => pageEval(`(() => { const sr = document.getElementById('doubao-ui-root').shadowRoot; ${expr} })()`);
+          const swStore = () => swEval(`(async () => { const s = await chrome.storage.local.get(['settings','onboarded']); return JSON.stringify({ settings: s.settings ?? null, onboarded: s.onboarded === true }); })()`);
+          const jobsOf = (vk) => swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const js = await new Promise((res) => { const q = db.transaction('jobs','readonly').objectStore('jobs').getAll(); q.onsuccess = () => res(q.result); });
+            const sm = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
+            return JSON.stringify({ jobs: js.filter((j) => String(j.videoKey).startsWith(${JSON.stringify(vk + ':')})).length,
+              sum: sm.filter((x) => String(x.videoKey).startsWith(${JSON.stringify(vk + ':')})).sort((a, b) => a.createdAt - b.createdAt).map((s) => ({ status: s.status, persona: s.persona, createdAt: s.createdAt })) });
+          })()`);
+          const visitsFor = (vk) => swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const vs = await new Promise((res) => { const q = db.transaction('visits','readonly').objectStore('visits').getAll(); q.onsuccess = () => res(q.result); });
+            return JSON.stringify(vs.filter((v) => String(v.videoKey).startsWith(${JSON.stringify(vk + ':')})).length); })()`);
+
+          // ---- a) 设置视图基础 + Key 打码 + 测试连接（打码哨兵）+ 保存不改 Key ----
+          await pageEval(`(async () => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); try { v?.pause(); } catch (e) {} return 'paused'; })()`).catch(() => {}); // 防自动播放切走视频
+          await pclick('#btn-settings');
+          await sleep(900);
+          const stDom = await srOf(`return JSON.stringify({
+            shown: !sr.getElementById('view-settings')?.classList.contains('hidden'),
+            listHidden: sr.getElementById('view-list')?.classList.contains('hidden') === true,
+            llmTag: sr.querySelector('#sec-llm .set-tag')?.textContent ?? '',
+            asrTag: sr.querySelector('#sec-asr .set-tag')?.textContent ?? '',
+            ttsDisabled: !!sr.querySelector('#sec-tts.set-disabled input[disabled]'),
+            sliderVal: sr.getElementById('set-threshold')?.value ?? '',
+            pills: [...sr.querySelectorAll('.persona-pill')].map((p) => p.getAttribute('data-persona')),
+            sws: ['sw-bubbles','sw-hide','sw-pause'].map((id) => !!sr.getElementById(id)),
+            danger: !!sr.getElementById('btn-clear'),
+            llmKey: sr.querySelector('#sec-llm input[data-k="apiKey"]')?.value ?? '',
+            asrKey: sr.querySelector('#sec-asr input[data-k="apiKey"]')?.value ?? '',
+          })`);
+          const maskOk = (v) => v === '****' + String(llmCfg.apiKey).slice(-4);
+          await pclick('[data-test="sec-llm"]');
+          let testOk = false;
+          for (let i = 0; i < 20 && !testOk; i++) {
+            await sleep(400);
+            const t = await srOf(`return JSON.stringify({ t: sr.querySelector('[data-status="sec-llm"]')?.textContent ?? '' })`);
+            testOk = String(t?.t ?? '').includes('连接成功');
+          }
+          await pclick('[data-save="sec-llm"]');
+          await sleep(1000);
+          const storeAfterSave = await swStore();
+
+          // ---- b) 人设切换联动询问（2.7b+F8）：当前视频=ASR 页，已有 done 点评 ----
+          const sumBefore = (await jobsOf(ASR_BVID)) ?? {};
+          await srOf(`(() => { const p = [...sr.querySelectorAll('.persona-pill')].find((x) => x.getAttribute('data-persona') === 'gentle'); p?.click(); })()`);
+          let regenModal = false;
+          for (let i = 0; i < 12 && !regenModal; i++) {
+            await sleep(400);
+            const m = await srOf(`return JSON.stringify({ shown: sr.getElementById('modal-root')?.classList.contains('show'), owner: sr.getElementById('modal-root')?.dataset.owner ?? '' })`);
+            regenModal = m?.shown === true && m?.owner === 'persona-regen';
+          }
+          await pclick('#pr-yes');
+          let regenDone = false;
+          let sumAfterPersona = null;
+          for (let i = 0; i < 60 && !regenDone; i++) {
+            await sleep(500);
+            sumAfterPersona = (await jobsOf(ASR_BVID)) ?? {};
+            const last = (sumAfterPersona?.sum ?? []).slice(-1)[0];
+            regenDone = last?.status === 'done' && last?.persona === 'gentle' && last?.createdAt > (sumBefore?.sum ?? []).slice(-1)[0]?.createdAt;
+          }
+          const regenUi0 = await srOf(`return JSON.stringify({ sumLen: (sr.getElementById('d-summary')?.textContent ?? '').length, inDetail: !!sr.getElementById('d-back') })`);
+          const storePersona = await swStore();
+
+          // ---- c) 暂停陪看（F12）：主视频先暂停进入（应零 visit/零请求/状态行提示）----
+          await pclick('#d-back');
+          await sleep(600);
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const c = sr.getElementById('sw-pause'); c.checked = true; c.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(900);
+          const pausedStore = await swStore();
+          const pausedStatus = await srOf(`return JSON.stringify({ t: sr.getElementById('p-status')?.textContent ?? '' })`);
+          const viewReqBefore = netUrls.filter((u) => u.includes('/x/web-interface/view')).length;
+          await cdp('Page.navigate', { url: `${PAGE_URL}?p2=paused` }, probeSid);
+          await sleep(3000);
+          const playMuted = `(async () => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (!v) return 'no-video'; v.muted = true; try { await v.play(); } catch (e) {} return 'ok'; })()`;
+          await pageEval(`(async () => ${playMuted})()`).catch(() => {});
+          await cdp('Page.bringToFront', {}, probeSid).catch(() => {});
+          await sleep(20000); // 暂停窗口：>20s 有效观看（若采集未停会累计并跨过 20s 阈值）
+          const pausedVisits = await visitsFor(BVID);
+          const pausedJobs = (await jobsOf(BVID)) ?? {};
+          const viewReqAfter = netUrls.filter((u) => u.includes('/x/web-interface/view')).length;
+          await pclick('#mascot'); // 导航后面板已关：先开面板（ACTIVE=开合面板）
+          await sleep(700);
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const c = sr.getElementById('sw-pause'); c.checked = false; c.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(900);
+          const unpausedStore = await swStore();
+
+          // ---- d) 阈值滑杆真实生效（F2）：60s 不触发 → 5s 触发 ----
+          // 滑杆拨 60 必须在导航前：watcher 在 VIDEO_ENTER 时快照阈值（实时生效口径=
+          // 影响之后进入的视频与 SW tick sweep，不追溯正在播放的会话——c) 尾部设置视图仍开着）
+          await srOf(`(() => { const s = sr.getElementById('set-threshold'); s.value = '60'; s.dispatchEvent(new Event('input', { bubbles: true })); s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(1500);
+          const th60Store = await swStore();
+          await cdp('Page.navigate', { url: PAGE_URL }, probeSid);
+          await sleep(3000);
+          await pageEval(`(async () => ${playMuted})()`).catch(() => {});
+          await cdp('Page.bringToFront', {}, probeSid).catch(() => {});
+          // 等真实进入（VIDEO_ENTER 成功 → visit 建立，阈值 60 已随应答下发 watcher）
+          let entered = 0;
+          for (let i = 0; i < 30 && entered === 0; i++) {
+            await sleep(500);
+            entered = Number(await visitsFor(BVID) ?? 0);
+          }
+          await sleep(20000); // 阈值 60 窗口：累计 ~20s 不应触发（若按旧值 5/20 会触发）
+          const th60Jobs = (await jobsOf(BVID)) ?? {};
+          // 滑杆拨到 5 → watch tick 幂等阈值扫描应立即触发（watchedSeconds 已 >5）
+          await pclick('#mascot'); // 导航后面板已关：先开面板
+          await sleep(700);
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const s = sr.getElementById('set-threshold'); s.value = '5'; s.dispatchEvent(new Event('input', { bubbles: true })); s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(800);
+          await pclick('#s-back');
+          let th5Queued = false;
+          for (let i = 0; i < 30 && !th5Queued; i++) {
+            await sleep(500);
+            th5Queued = lines.some((l) => l.text.includes(`summary job queued`) && l.text.includes(BVID));
+          }
+          let th5Done = false;
+          for (let i = 0; i < 60 && !th5Done; i++) {
+            await sleep(500);
+            const j = (await jobsOf(BVID)) ?? {};
+            th5Done = (j?.sum ?? []).some((s) => s.status === 'done');
+          }
+          // 阈值恢复 20（后续探针的默认口径）
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const s = sr.getElementById('set-threshold'); s.value = '20'; s.dispatchEvent(new Event('input', { bubbles: true })); s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+
+          // ---- e) 气泡开关：关→结束陪看不弹「先睡一觉」；开→恢复陪看弹「开始陪看」 ----
+          await srOf(`(() => { const c = sr.getElementById('sw-bubbles'); c.checked = false; c.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(800);
+          const bubblesOffStore = await swStore();
+          await pclick('#s-back');
+          await sleep(600);
+          // 等旧气泡自然消失（d 的 done 气泡挂 9s，不等待会污染「关闭后不再出现」断言）
+          for (let i = 0; i < 24; i++) {
+            const b = await srOf(`return JSON.stringify({ hidden: sr.getElementById('mascot-bubble')?.classList.contains('hidden') })`);
+            if (b?.hidden === true) break;
+            await sleep(500);
+          }
+          await pclick('#btn-end');
+          await sleep(2600);
+          const bubbleSuppressed = await srOf(`return JSON.stringify({ hidden: sr.getElementById('mascot-bubble')?.classList.contains('hidden'), focus: document.activeElement?.tagName + ':' + (document.activeElement?.type ?? '') })`);
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const c = sr.getElementById('sw-bubbles'); c.checked = true; c.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(800);
+          await pclick('#s-back');
+          await sleep(600);
+          await pclick('#btn-resume');
+          await sleep(2600);
+          const bubbleResumed = await srOf(`return JSON.stringify({ hidden: sr.getElementById('mascot-bubble')?.classList.contains('hidden'), text: sr.getElementById('mascot-bubble')?.textContent ?? '', focus: document.activeElement?.tagName + ':' + (document.activeElement?.type ?? '') })`);
+
+          // ---- f) 清空 LLM Key（F9）：确认弹窗→门槛回锁；重配 LLM→恢复 ----
+          await pclick('#btn-settings');
+          await sleep(700);
+          await srOf(`(() => { const i = sr.querySelector('#sec-llm input[data-k="apiKey"]'); i.value = ''; })()`);
+          await pclick('[data-save="sec-llm"]');
+          await sleep(800);
+          const clearModal = await srOf(`return JSON.stringify({ shown: sr.getElementById('modal-root')?.classList.contains('show'), owner: sr.getElementById('modal-root')?.dataset.owner ?? '' })`);
+          await pclick('#llm-clear-yes');
+          await sleep(1200);
+          const clearedStore = await swStore();
+          const clearedPointer = await swEval(`(async () => { const s = await chrome.storage.local.get('sessionPointer'); return JSON.stringify(s.sessionPointer?.state ?? 'none'); })()`);
+          // 重配 LLM（明文经表单→SW，onboarded 恢复）→ 恢复陪看
+          await srOf(`(() => {
+            const sec = sr.getElementById('sec-llm');
+            const set = (k, v) => { const i = sec.querySelector('input[data-k="' + k + '"]'); if (i) i.value = v; };
+            set('baseUrl', ${JSON.stringify(llmCfg.baseUrl)}); set('modelId', ${JSON.stringify(llmCfg.modelId)}); set('apiKey', ${JSON.stringify(llmCfg.apiKey)});
+          })()`);
+          await pclick('[data-save="sec-llm"]');
+          await sleep(1200);
+          const reconfigured = await swStore();
+          // 审查 P1-1 回归：ASR 全空保存=显式清除（哨兵解析曾把空 Key 还原成旧 Key 致路径死亡）
+          await srOf(`(() => {
+            const sec = sr.getElementById('sec-asr');
+            sec.querySelectorAll('input[data-k]').forEach((i) => { i.value = ''; });
+          })()`);
+          await pclick('[data-save="sec-asr"]');
+          await sleep(1200);
+          const asrClearedStore = await swStore();
+
+          // ---- g) 隐藏豆包 + 手动清除迁移设置页（危险操作 + Esc + INACTIVE 自动解除隐藏） ----
+          await srOf(`(() => { const c = sr.getElementById('sw-hide'); c.checked = true; c.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+          await sleep(500);
+          const wrapHidden = await srOf(`return JSON.stringify({ hidden: sr.getElementById('mascot-wrap')?.classList.contains('hidden') })`);
+          await pclick('#btn-clear');
+          await sleep(600);
+          await cdp('Runtime.evaluate', { expression: `document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))`, returnByValue: true }, probeSid).catch(() => {});
+          await sleep(600);
+          const escClosed = await srOf(`return JSON.stringify({ shown: sr.getElementById('modal-root')?.classList.contains('show') })`);
+          await pclick('#btn-clear');
+          await sleep(600);
+          await pclick('#wipe-later');
+          await sleep(800);
+          const cancelNoop = await swEval(`(async () => { const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const q = await new Promise((res) => { const x = db.transaction('visits','readonly').objectStore('visits').count(); x.onsuccess = () => res(x.result); }); return JSON.stringify(q); })()`);
+          await pclick('#btn-clear');
+          await sleep(600);
+          await pclick('#wipe-now');
+          await sleep(1500);
+          const wipedFinal = await swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const names = ['visits','summaries','transcripts','videos','jobs','sessions'];
+            const counts = {};
+            for (const n of names) counts[n] = await new Promise((res) => { const x = db.transaction(n,'readonly').objectStore(n).count(); x.onsuccess = () => res(x.result); });
+            const s = await chrome.storage.local.get(['settings','sessionPointer']);
+            return JSON.stringify({ counts, pointer: s.sessionPointer ?? null, hasLlm: !!s.settings?.llm?.apiKey });
+          })()`);
+          const wrapUnhidden = await srOf(`return JSON.stringify({ hidden: sr.getElementById('mascot-wrap')?.classList.contains('hidden') })`);
+          // 审查 P1-2 回归：清除后视图容器必须回收（列表可见/设置隐藏/未激活空态），不得滞留陈旧设置
+          const containerReset = await srOf(`return JSON.stringify({
+            listHidden: sr.getElementById('view-list')?.classList.contains('hidden'),
+            settingsHidden: sr.getElementById('view-settings')?.classList.contains('hidden'),
+            status: sr.getElementById('p-status')?.textContent ?? '' })`);
+          await shotNamed(probeSid, 'visual-settings.png');
+
+          const stDomObj = stDom ?? {};
+          settingsProbe = {
+            // a) 视图与打码
+            viewRendered: stDomObj.shown === true && stDomObj.listHidden === true && stDomObj.ttsDisabled === true && stDomObj.danger === true,
+            modelTags: (stDomObj.llmTag ?? '').includes('已配置') && (stDomObj.asrTag ?? '').includes('已配置'),
+            keyMasked: maskOk(stDomObj.llmKey) && maskOk(stDomObj.asrKey),
+            prefsPresent: (stDomObj.pills ?? []).join() === 'spicy,gentle,academic' && stDomObj.sws.every(Boolean) && stDomObj.sliderVal === '5',
+            testConnMaskedKey: testOk,
+            saveKeepsKey: storeAfterSave?.settings?.llm?.apiKey === llmCfg.apiKey,
+            // b) 2.7b 人设联动
+            personaPromptAndRegen: regenModal === true && regenDone === true && (regenUi0?.sumLen ?? 0) > 50 && regenUi0?.inDetail === true && storePersona?.settings?.persona === 'gentle',
+            // c) 暂停陪看
+            pauseBlocksCollection:
+              pausedStore?.settings?.paused === true &&
+              String(pausedStatus?.t ?? '').includes('已暂停') &&
+              Number(pausedVisits ?? 1) === 0 &&
+              (pausedJobs?.jobs ?? 1) === 0 &&
+              viewReqAfter === viewReqBefore &&
+              unpausedStore?.settings?.paused !== true,
+            // d) 阈值滑杆（F2）
+            thresholdSliderLive:
+              th60Store?.settings?.triggerSeconds === 60 &&
+              (th60Jobs?.jobs ?? 1) === 0 &&
+              th5Queued === true && th5Done === true,
+            // e) 气泡开关
+            bubblesToggle:
+              bubblesOffStore?.settings?.bubbles === false &&
+              bubbleSuppressed?.hidden === true &&
+              !String(bubbleSuppressed?.text ?? '').includes('先睡') && // 结束陪看的 say 被抑制（非旧气泡残留）
+              bubbleResumed?.hidden === false,
+            // f) 清空 LLM Key（F9）
+            llmClearGates:
+              clearModal?.shown === true && clearModal?.owner === 'llm-clear' &&
+              clearedStore?.settings?.llm === undefined && clearedStore?.onboarded === false &&
+              (clearedPointer ?? '').includes('GRACE') &&
+              reconfigured?.settings?.llm?.apiKey === llmCfg.apiKey && reconfigured?.onboarded === true &&
+              asrClearedStore?.settings?.asr === undefined, // P1-1：全空保存显式清除 ASR（含旧 Key）
+            // g) 隐藏豆包 + 手动清除迁移 + Esc + INACTIVE 解除隐藏
+            hideMascotAndWipe:
+              wrapHidden?.hidden === true &&
+              escClosed?.shown === false &&
+              Number(cancelNoop ?? 0) > 0 &&
+              Object.values(wipedFinal?.counts ?? {}).every((n) => n === 0) &&
+              wipedFinal?.pointer === null &&
+              wipedFinal?.hasLlm === true &&
+              wrapUnhidden?.hidden === false &&
+              containerReset?.listHidden === false && containerReset?.settingsHidden === true &&
+              String(containerReset?.status ?? '').includes('未激活'),
+          };
+          log('P2.5 判定项:', JSON.stringify(settingsProbe));
         }
       }
     }
@@ -1510,7 +1791,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, settingsProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -1686,6 +1967,16 @@ async function main() {
       //（真实模式不跑 ASR 链无音频请求，以日志判定项兜——与 asrNeedConfirmBadge 同口径）
       dnrRefererHeader: REAL || dnrProbe?.headerOk === true,
       dnrRulesShapeAudited: REAL || dnrProbe?.ruleShapeOk === true,
+      // P2.5 设置页：视图+打码+测试连接哨兵+保存不改 Key / 2.7b 人设联动重生成 /
+      // 暂停零采集零请求 / 阈值滑杆真实生效 / 气泡开关 / 清空 Key 门槛回锁 / 隐藏豆包+手动清除迁移
+      settingsViewRendered: REAL || settingsProbe?.viewRendered === true,
+      settingsKeyMasked: REAL || (settingsProbe?.keyMasked === true && settingsProbe?.saveKeepsKey === true && settingsProbe?.testConnMaskedKey === true),
+      settingsPersonaRegen: REAL || settingsProbe?.personaPromptAndRegen === true,
+      settingsPauseBlocks: REAL || settingsProbe?.pauseBlocksCollection === true,
+      settingsThresholdLive: REAL || settingsProbe?.thresholdSliderLive === true,
+      settingsBubblesToggle: REAL || settingsProbe?.bubblesToggle === true,
+      settingsLlmClearGates: REAL || settingsProbe?.llmClearGates === true,
+      settingsHideAndWipe: REAL || settingsProbe?.hideMascotAndWipe === true,
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

@@ -28,6 +28,7 @@ import {
   type SummaryOpenResponse,
   type TranscriptExcerpt,
 } from './view-models';
+import { renderSettingsView, type SaveResult, type SettingsData } from './settings';
 
 export interface ListQueryResponse {
   ok: boolean;
@@ -37,6 +38,8 @@ export interface ListQueryResponse {
   closedAt?: number;
   retainUntil?: number;
   triggerSeconds: number;
+  /** P2.5：「暂停陪看」总开关（状态行提示与设置开关数据源）。 */
+  paused?: boolean;
   loggedIn: boolean | null; // P1.10 引导卡数据源（SW 30s 缓存）
 }
 
@@ -58,17 +61,23 @@ export interface PanelDeps {
   onSeek: (videoKey: string, timeSec: number) => void;
   /** P2.3 F6-③：未配置 ASR 时点【调用 ASR 解析】→ 打开 onboarding 的 ASR 补配模式（content 侧持有弹窗流程）。 */
   onNeedAsrConfig: () => void;
+  /** P2.5/2.7b：本页当前视频（人设切换联动询问的对象）；隐藏豆包开关（content 内存态）。 */
+  getCurrentVideoKey?: () => string | null;
+  mascotHidden?: () => boolean;
+  onMascotHiddenChange?: (hidden: boolean) => void;
   /** 测试可注入的定时器。 */
   setTimeout?: typeof setTimeout;
 }
 
 export class PanelController {
   #open = false;
-  #view: 'list' | 'detail' = 'list';
+  #view: 'list' | 'detail' | 'settings' = 'list';
   #detailKey: string | null = null;
   #items: ListItemVM[] = [];
   #triggerSeconds = 20;
   #sessionState = 'INACTIVE';
+  /** P2.5：暂停陪看（状态行提示）。 */
+  #paused = false;
   /** 当前详情的流式累计（LLM 原始 JSON token 流）。 */
   #stream: { videoKey: string; acc: string; stage?: string } | null = null;
   #refreshTimer: unknown = null;
@@ -94,7 +103,23 @@ export class PanelController {
         setTimeout(cb, ms);
       });
     deps.ui.root.ownerDocument.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && this.#open && !this.#modalShown()) this.close();
+      if (e.key !== 'Escape' || !this.#open) return;
+      const modalRoot = this.deps.ui.root.getElementById('modal-root');
+      // P2.5（P2.2 审查 N-1 收口）：可取消的二级确认弹窗 Esc=取消（原型 showModal 口径）；
+      // 超期清除确认（expired-confirm）不可 Esc——F10 必须显式二选一
+      if (modalRoot?.classList.contains('show')) {
+        if (modalRoot.dataset.owner === 'manual-wipe' || modalRoot.dataset.owner === 'llm-clear' || modalRoot.dataset.owner === 'persona-regen') {
+          modalRoot.classList.remove('show');
+          modalRoot.replaceChildren();
+          delete modalRoot.dataset.owner;
+        }
+        return;
+      }
+      this.close();
+    });
+    // P2.5：面板头部齿轮 → 设置视图（原型 #btn-settings）
+    deps.ui.root.getElementById('btn-settings')?.addEventListener('click', () => {
+      if (this.#open) void this.#showSettings();
     });
   }
 
@@ -128,6 +153,12 @@ export class PanelController {
     this.#open = false;
     this.#stopCountdown(); // P2.1：面板关=倒计时停（数据保留判定在 SW，与面板无关）
     this.deps.ui.root.getElementById('panel')?.classList.remove('open');
+    // 审查 P1-2：设置视图开着时关面板——重开会滞留陈旧设置 DOM；复位回列表（open() 自会 refresh）
+    if (this.#view === 'settings') {
+      this.#view = 'list';
+      this.deps.ui.root.getElementById('view-settings')?.classList.add('hidden');
+      this.deps.ui.root.getElementById('view-list')?.classList.remove('hidden');
+    }
   }
 
   /** P1.10：登录态 → 面板顶部引导卡显隐。null=未知态：保持上一确定态（审查 P1-2——
@@ -179,6 +210,7 @@ export class PanelController {
       this.#sessionState = r.sessionState ?? 'INACTIVE';
       this.#retainUntil = r.retainUntil ?? null; // P2.1 倒计时（应答经 SW 静默判定后的最新值）
       this.#triggerSeconds = r.triggerSeconds ?? 20;
+      this.#paused = r.paused === true; // P2.5：状态行「已暂停」提示
       this.setLoginState(r.loggedIn ?? null); // P1.10 引导卡（SW 缓存值；强制复核在 open()）
       this.#renderStatus();
       if (this.#view === 'list') this.#renderList();
@@ -196,6 +228,92 @@ export class PanelController {
       /* SW 未就绪等瞬时错误：面板下次打开/事件到达时再刷 */
     }
   }
+
+  // ---- P2.5 · 设置视图（齿轮入口；数据=SETTINGS_GET，Key 打码） ----------------------
+
+  /** 打开设置：取 SETTINGS_GET 渲染；列表/详情容器隐藏（返回时恢复）。 */
+  async #showSettings(): Promise<void> {
+    try {
+      const data = await this.deps.bridge.request<SettingsData>({ type: 'SETTINGS_GET' });
+      if (!data?.ok) {
+        toast(this.deps.ui, '设置加载失败，稍后再试');
+        return;
+      }
+      this.#view = 'settings';
+      this.#stream = null;
+      this.deps.ui.root.getElementById('view-list')?.classList.add('hidden');
+      const box = this.deps.ui.root.getElementById('view-settings');
+      box?.classList.remove('hidden');
+      renderSettingsView({
+        ui: this.deps.ui,
+        bridge: this.deps.bridge,
+        data,
+        mascotHidden: this.deps.mascotHidden?.() ?? false,
+        onBack: () => this.#backToList(),
+        onSaved: (r) => void this.#onSettingsSaved(r),
+        onWipe: () => this.#showWipeModal('manual'),
+        onMascotHiddenChange: (h) => this.deps.onMascotHiddenChange?.(h),
+      });
+    } catch {
+      toast(this.deps.ui, '设置加载失败，稍后再试');
+    }
+  }
+
+  /** 设置保存成功：刷新（状态行「已暂停」/列表徽章都要新数据）；人设切换 → 2.7b 联动询问；
+   *  LLM 清除 → 收口提示。E2E 实测教训：不刷新会拿旧 #items（need_asr 期徽章）误判联动条件。 */
+  async #onSettingsSaved(r: SaveResult): Promise<void> {
+    if (r.llmCleared) {
+      toast(this.deps.ui, 'LLM 配置已清除，重新配置后可继续陪看', 3200);
+      await this.refresh();
+      if (this.#view === 'settings') await this.#showSettings(); // 审查 P2-1：重渲染防陈旧打码 Key 再保存
+      return;
+    }
+    await this.refresh(); // 刷新 #items/#paused（persona 联动与状态行依据；设置视图 DOM 不动）
+    if (r.personaChanged) {
+      // 2.7b（F8「切换后【重新生成】」）：当前视频已有点评 → 询问是否立即用新人设重生成；
+      // 不静默重跑（成本护栏）；无当前视频/无点评 → 仅提示后续生效
+      const cur = this.deps.getCurrentVideoKey?.() ?? null;
+      const item = cur ? this.#items.find((i) => i.videoKey === cur) : undefined;
+      if (cur && item && item.badge === 'summarized') {
+        this.#showPersonaRegenPrompt(cur);
+        return;
+      }
+      toast(this.deps.ui, '人设已切换，之后的点评将使用新人设');
+    }
+  }
+
+  /** 2.7b：人设切换联动询问弹窗（确认=跳当前视频详情并发起 REGENERATE=2.7a 链路）。 */
+  #showPersonaRegenPrompt(videoKey: string): void {
+    const root = this.deps.ui.root;
+    const modalRoot = root.getElementById('modal-root');
+    if (!modalRoot) return;
+    modalRoot.dataset.owner = 'persona-regen';
+    const m = root.ownerDocument.createElement('div');
+    m.className = 'modal';
+    m.innerHTML =
+      `<div class="modal-head"><div class="m-emoji"><img src="${browser.runtime.getURL('/mascot/mascot-happy.png')}" alt="豆包" style="width:52px;height:52px;border-radius:12px;display:block"></div>` +
+      `<div><h2>用新人设重新生成本视频的点评？</h2><p>当前视频已有旧人设的点评。摘要内容保持客观不变，点评会按新人设重写。</p></div></div>` +
+      `<div class="modal-foot"><button class="btn btn-ghost" id="pr-no">暂不</button>` +
+      `<button class="btn btn-primary" id="pr-yes">重新生成</button></div>`;
+    modalRoot.replaceChildren(m);
+    modalRoot.classList.add('show');
+    const close = () => {
+      modalRoot.classList.remove('show');
+      modalRoot.replaceChildren();
+      delete modalRoot.dataset.owner;
+    };
+    m.querySelector('#pr-no')?.addEventListener('click', close);
+    m.querySelector('#pr-yes')?.addEventListener('click', () => {
+      close();
+      void this.#regenAfterPersonaSwitch(videoKey);
+    });
+  }
+
+  async #regenAfterPersonaSwitch(videoKey: string): Promise<void> {
+    await this.#openDetail(videoKey); // 回详情（#detailKey 就位）
+    await this.#onRegenerate(); // 2.7a 链路：force 重跑（新 persona 随 job 下发）
+  }
+
 
   #renderStatus(): void {
     const el = this.deps.ui.root.getElementById('p-status');
@@ -229,6 +347,10 @@ export class PanelController {
       this.#renderActions(acts, '<button class="btn btn-primary" id="btn-start2" style="flex:1">▶ 开始陪看</button>', () =>
         this.deps.onSessionStart(),
       );
+    }
+    // P2.5：「暂停陪看」状态行提示（任何会话态都可叠加；解除后消失）
+    if (this.#paused) {
+      el.innerHTML = `${el.innerHTML}<span class="countdown-pill" style="margin-left:6px">⏸ 已暂停 · 不采集不请求（设置中可恢复）</span>`;
     }
   }
 
@@ -309,10 +431,14 @@ export class PanelController {
         return;
       }
       toast(this.deps.ui, '已清除全部陪看数据（配置保留）');
-      this.#view = 'list';
       this.#detailKey = null;
       this.#stream = null;
-      await this.refresh(); // SESSION_STATE(INACTIVE) 广播也会刷；直刷兜 SW 广播竞态
+      this.#segNotes = new Map();
+      this.#segOpen = new Set();
+      // 审查 P1-2：从设置视图发起的清除必须回收容器（#view-list 仍挂 hidden 会渲染进隐形容器，
+      // 面板滞留陈旧设置视图）；#backToList 含全部复位
+      this.#backToList();
+      return;
     } catch {
       toast(this.deps.ui, '清除失败，稍后再试');
     }
@@ -329,8 +455,8 @@ export class PanelController {
   #renderList(): void {
     const box = this.deps.ui.root.getElementById('view-list');
     if (!box) return;
-    // P2.2 F10-⑤：手动清除入口（设置页属 2.5，先挂列表头；2.5 落地后迁入设置危险区）
-    const head = `<div class="list-head"><b>本次陪看 · ${this.#items.length} 个视频</b><span style="display:flex;align-items:center;gap:6px">点击条目查看摘要<button id="wipe-entry" title="清除全部陪看数据" style="border:none;background:none;cursor:pointer;font-size:14px;padding:2px 4px;color:#9499a0">🗑</button></span></div>`;
+    // P2.5：手动清除入口已迁设置页危险操作（P2.2 过渡位 🗑 移除，验收记录 §2 N-2 收口）
+    const head = `<div class="list-head"><b>本次陪看 · ${this.#items.length} 个视频</b><span>点击条目查看摘要</span></div>`;
     const body =
       this.#items.length === 0
         ? `<div class="d-sec" style="text-align:center;padding:36px 16px;color:#9499a0;font-size:13px"><img class="empty-mascot" src="${browser.runtime.getURL('/mascot/mascot-idle.png')}" alt=""><br>还没有陪看记录<br>点击豆包「开始陪看」，<br>播放超过 ${this.#triggerSeconds} 秒我就会记笔记</div>`
@@ -356,7 +482,6 @@ export class PanelController {
         })
         .join('');
     box.innerHTML = head + body;
-    box.querySelector('#wipe-entry')?.addEventListener('click', () => this.#showWipeModal('manual'));
     this.#bindCoverFallback(box);
     box.querySelectorAll<HTMLElement>('.v-item').forEach((el) => {
       el.addEventListener('click', () => void this.#onItemClick(el.getAttribute('data-video-key')!));
@@ -402,6 +527,9 @@ export class PanelController {
         return;
       }
       this.#view = 'detail';
+      // P2.5：详情与列表共用 #view-list 容器——从设置视图（人设联动重生成）进入时须切回
+      this.deps.ui.root.getElementById('view-settings')?.classList.add('hidden');
+      this.deps.ui.root.getElementById('view-list')?.classList.remove('hidden');
       // 任务在跑 → 进入流式模式（重置累计）；否则直接渲染成品
       this.#stream = isJobActive(r.item.job) && r.item.job?.status !== 'need_confirm' ? { videoKey, acc: '' } : null;
       // F13 注记状态仅随「视频真切换」重置（审查 P1-3：SUMMARY_* 广播重开同视频详情时
@@ -426,6 +554,9 @@ export class PanelController {
     this.#stream = null;
     this.#segNotes = new Map();
     this.#segOpen = new Set();
+    // P2.5：详情/设置共用返回路径——确保列表容器可见、设置容器隐藏
+    this.deps.ui.root.getElementById('view-settings')?.classList.add('hidden');
+    this.deps.ui.root.getElementById('view-list')?.classList.remove('hidden');
     void this.refresh();
   }
 
@@ -443,7 +574,14 @@ export class PanelController {
         videoKey,
       });
       if (!r?.ok || !r.started) {
-        toast(this.deps.ui, r?.error === 'busy' ? '已有任务进行中，稍后再试重新生成' : '重新生成发起失败，稍后再试');
+        toast(
+          this.deps.ui,
+          r?.error === 'busy'
+            ? '已有任务进行中，稍后再试重新生成'
+            : r?.error === 'paused'
+              ? '已暂停陪看，先在设置中恢复后再生成'
+              : '重新生成发起失败，稍后再试',
+        );
         return;
       }
       this.#segNotes = new Map();
@@ -471,7 +609,14 @@ export class PanelController {
         return;
       }
       if (!r?.ok || !r.started) {
-        toast(this.deps.ui, r?.error === 'no-session' ? '会话未激活' : '已有任务进行中，稍后再试');
+        toast(
+          this.deps.ui,
+          r?.error === 'no-session'
+            ? '会话未激活'
+            : r?.error === 'paused'
+              ? '已暂停陪看，先在设置中恢复'
+              : '已有任务进行中，稍后再试',
+        );
         return;
       }
       this.#segNotes = new Map();
