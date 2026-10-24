@@ -34,6 +34,11 @@ const bump = (k) => {
   return n;
 };
 
+// P2.2 测试钩子：GET /__test/slow?count=N&ms=T → 接下来 N 个 chat 请求先挂 T ms 再流式
+// （E2E 用它制造「生成中手动清除」窗口，验证 wipe 掐死在途执行体后数据不复活）
+let slowNext = 0;
+let slowMs = 0;
+
 function sse(res, text) {
   res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   const chunks = text.match(/.{1,40}/gs) ?? []; // ≥5 个 data: chunk
@@ -61,12 +66,21 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { ...CORS, 'Content-Type': 'text/plain' });
     return res.end('ok');
   }
+  if (req.method === 'GET' && req.url.startsWith('/__test/slow')) {
+    const q = new URL(req.url, 'http://x').searchParams;
+    slowNext = Number(q.get('count') ?? 1);
+    slowMs = Number(q.get('ms') ?? 8000);
+    console.log(`slow-llm armed: next ${slowNext} request(s) hold ${slowMs}ms`);
+    res.writeHead(200, { ...CORS, 'Content-Type': 'text/plain' });
+    return res.end('armed');
+  }
   if (req.method === 'POST' && req.url === '/chat/completions') {
     const auth = req.headers.authorization ?? '';
     if (!auth.startsWith('Bearer ') || auth.slice(7).trim() === '') {
       res.writeHead(401, { ...CORS, 'Content-Type': 'application/json' });
       return res.end('{"error":{"message":"missing or invalid Bearer token"}}');
     }
+    const held = slowNext > 0 ? (slowNext -= 1, slowMs) : 0;
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
@@ -76,11 +90,18 @@ const server = http.createServer((req, res) => {
       } catch {
         text = body;
       }
-      // 失败分支优先（审查 P2-8：段解读失败用例的标记可能被标题/字幕带入，不得被成功 payload 抢答）
-      if (text.includes('ALWAYS_BAD')) return sse(res, badPayload());
-      if (text.includes('BADJSON') && bump('BADJSON') === 1) return sse(res, badPayload());
-      if (text.includes('分段解读')) return sse(res, segmentPayload());
-      sse(res, validPayload());
+      const respond = () => {
+        // 失败分支优先（审查 P2-8：段解读失败用例的标记可能被标题/字幕带入，不得被成功 payload 抢答）
+        if (text.includes('ALWAYS_BAD')) return sse(res, badPayload());
+        if (text.includes('BADJSON') && bump('BADJSON') === 1) return sse(res, badPayload());
+        if (text.includes('分段解读')) return sse(res, segmentPayload());
+        sse(res, validPayload());
+      };
+      if (held > 0) {
+        console.log(`slow-llm holding request ${held}ms`);
+        return setTimeout(respond, held);
+      }
+      respond();
     });
     return;
   }

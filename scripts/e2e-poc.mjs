@@ -518,6 +518,7 @@ async function main() {
     let p19Probe = null; // P1.9：浮层七准则探针（overlay/全屏/闲时/输入聚焦/跟随）
     let regenProbe = null; // 2.7a：【重新生成】REGENERATE 探针
     let retentionProbe = null; // P2.1：保留期判定探针（GRACE 倒计时/59min 恢复/超期 EXPIRED）
+    let wipeProbe = null; // P2.2：F10 清除链路探针（超期弹窗/稍后提醒重弹/立即清除/手动清除）
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -1144,6 +1145,147 @@ async function main() {
           log('P2.1 判定项:', JSON.stringify(retentionProbe));
           await shotNamed(probeSid, 'visual-retention-expired.png');
         }
+
+        // 8.99) P2.2 F10 清除链路：超期确认弹窗（打开面板即弹）→ 稍后提醒（重开再弹）→
+        //   立即清除（六表 0 行 + pointer 移除 + settings/onboarded 保留 + 面板回未激活空态）
+        //   → 手动清除入口（🗑：取消不动作 / 确认清除同上）
+        {
+          const modalState = () => pageEval(`(() => {
+            const mr = document.getElementById('doubao-ui-root').shadowRoot.getElementById('modal-root');
+            const sr = document.getElementById('doubao-ui-root').shadowRoot;
+            return JSON.stringify({ shown: mr.classList.contains('show'), owner: mr.dataset.owner ?? '',
+              title: mr.querySelector('h2')?.textContent ?? '', desc: mr.querySelector('.modal-head p')?.textContent ?? '',
+              hasLater: !!mr.querySelector('#wipe-later'), hasNow: !!mr.querySelector('#wipe-now'),
+              panelStatus: sr.getElementById('p-status')?.textContent ?? '', items: sr.querySelectorAll('.v-item').length,
+              empty: !!sr.querySelector('.empty-mascot'), startBtn: !!sr.getElementById('btn-start2'),
+              toasts: [...sr.querySelectorAll('#toast-root .toast')].map((x) => x.textContent ?? '') });
+          })()`);
+          const dbCounts = () => swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const names = ['sessions','videos','visits','transcripts','summaries','jobs'];
+            const counts = {};
+            for (const n of names) counts[n] = await new Promise((res) => { const q = db.transaction(n,'readonly').objectStore(n).count(); q.onsuccess = () => res(q.result); });
+            const st = await chrome.storage.local.get(['sessionPointer','onboarded','settings']);
+            return JSON.stringify({ counts, pointer: st.sessionPointer ?? null, onboarded: st.onboarded ?? null, hasSettings: !!st.settings });
+          })()`);
+          const click = (sel) => pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('${sel}')?.click()`);
+
+          // a) 超期确认弹窗：P2.1 探针最后一次重开面板已触发（EXPIRED 态开面板即弹）
+          await sleep(600);
+          const m1 = await modalState();
+          await shotNamed(probeSid, 'visual-wipe-modal.png');
+
+          // b) 稍后提醒 → 弹窗关 + toast；重开面板 → 再弹（F10-④ 同一浏览器会话重提醒）；数据仍在（表级断言）
+          await click('#wipe-later');
+          await sleep(500);
+          const afterLater = await modalState();
+          const ptrLater = await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`);
+          const keepDb = await dbCounts();
+          await click('#mascot'); // 关面板
+          await sleep(400);
+          await click('#mascot'); // 重开 → EXPIRED 态开面板应再弹
+          await sleep(800);
+          const reopen = await modalState();
+
+          // c) 【立即清除】（审查 P1-1 回归：生成中清除不复活）——mock 模式先武装慢 LLM（挂 9s），
+          //    在超期弹窗仍展示时经 DOM 直点发起 REGENERATE（旧 done 摘要在库），job 进入 running
+          //    后点弹窗【立即清除】→ wipe 应掐死在途 offscreen 执行体；随后观察 10s 无孤儿写入。
+          let midFlight = null;
+          if (!REAL) {
+            await fetch(`${llmCfg.baseUrl}/__test/slow?count=1&ms=9000`).catch(() => {});
+            const jobsState = () => swEval(`(async () => {
+              const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+              const rows = await new Promise((res) => { const q = db.transaction('jobs','readonly').objectStore('jobs').getAll(); q.onsuccess = () => res(q.result); });
+              return JSON.stringify(rows.map((j) => ({ type: j.type, status: j.status })));
+            })()`);
+            await click('.v-item'); // 进详情（EXPIRED 态数据仍在，直点 DOM 不受弹窗遮罩影响）
+            let dRegen = false;
+            for (let i = 0; i < 12 && !dRegen; i++) { await sleep(300); dRegen = await pageEval(`!!document.getElementById('doubao-ui-root').shadowRoot.getElementById('d-regen')`); }
+            if (dRegen) await click('#d-regen');
+            let running = null;
+            for (let i = 0; i < 30 && !(running ?? []).some((j) => j.status === 'running' || j.status === 'pending'); i++) {
+              await sleep(300);
+              running = await jobsState();
+            }
+            const jobSeen = (running ?? []).some((j) => j.status === 'running' || j.status === 'pending');
+            if (jobSeen) {
+              await click('#wipe-now'); // 清除确认弹窗仍展示——生成中按下立即清除
+              await sleep(1600);
+              const midWipeDb = await dbCounts();
+              await sleep(9500); // 慢 LLM 挂窗结束：修复缺失时执行体会在此后落孤儿行
+              const lateDb = await dbCounts();
+              midFlight = { jobSeen: true,
+                wipedClean: midWipeDb && Object.values(midWipeDb.counts ?? {}).every((n) => n === 0),
+                noResurrect: lateDb && Object.values(lateDb.counts ?? {}).every((n) => n === 0) && lateDb.pointer === null };
+              log('P2.2 生成中清除回归:', JSON.stringify(midFlight));
+            } else {
+              midFlight = { jobSeen: false, wipedClean: null, noResurrect: null };
+              log('P2.2 生成中清除回归：job 未观察到（降级为直接清除路径）');
+            }
+          }
+
+          // c2) 立即清除（或上面回归路径已清除）→ 六表 0 行 + pointer 移除 + settings/onboarded 保留 + 未激活空态
+          const wipeNeeded = !midFlight?.wipedClean;
+          if (wipeNeeded) {
+            if (!(await modalState())?.shown) { await click('#wipe-entry'); await sleep(400); }
+            await click('#wipe-now');
+            await sleep(1400);
+          }
+          const afterWipe = await modalState();
+          const wipeDb = await dbCounts();
+
+          // d) 手动清除（🗑 列表头入口）：新会话 → 取消（不动作）→ 确认（清除）
+          await click('#btn-start2');
+          await sleep(1000);
+          const activeState = await modalState();
+          await click('#wipe-entry');
+          await sleep(500);
+          const mCancel = await modalState();
+          await click('#wipe-later'); // 取消
+          await sleep(500);
+          const afterCancel = await modalState();
+          await click('#wipe-entry');
+          await sleep(400);
+          await click('#wipe-now');
+          await sleep(1400);
+          const afterManual = await modalState();
+          const manualDb = await dbCounts();
+
+          wipeProbe = {
+            expiredModal: {
+              shown: m1?.shown === true,
+              owner: m1?.owner === 'expired-confirm',
+              copy:
+                (m1?.title ?? '').includes('已超过保留时间') &&
+                (m1?.desc ?? '').includes('超过 1 小时') &&
+                (m1?.desc ?? '').includes('列表、摘要与转写') &&
+                m1?.hasLater === true &&
+                m1?.hasNow === true,
+            },
+            laterRemindReprompts: {
+              closed: afterLater?.shown === false,
+              toast: (afterLater?.toasts ?? []).some((t) => t.includes('稍后再提醒')),
+              dataKept: ptrLater?.state === 'EXPIRED_PENDING_CONFIRM' && keepDb && Object.values(keepDb.counts ?? {}).some((n) => n > 0),
+              reprompts: reopen?.shown === true && reopen?.owner === 'expired-confirm',
+            },
+            wipeMidFlightNoResurrect: REAL || (midFlight?.jobSeen === true && midFlight?.wipedClean === true && midFlight?.noResurrect === true),
+            wipeConfirmClears: {
+              uiReset: afterWipe?.shown === false && (afterWipe?.panelStatus ?? '').includes('未激活') && afterWipe?.items === 0 && afterWipe?.empty === true && afterWipe?.startBtn === true,
+              dbEmpty: wipeDb && Object.values(wipeDb.counts ?? {}).every((n) => n === 0),
+              pointerGone: wipeDb?.pointer === null,
+              settingsKept: wipeDb?.onboarded === true && wipeDb?.hasSettings === true,
+            },
+            manualWipeDoubleConfirm: {
+              startsActive: (activeState?.panelStatus ?? '').includes('陪看中'),
+              cancelNoop: mCancel?.shown === true && (mCancel?.title ?? '').includes('清除全部陪看数据') && afterCancel?.shown === false && (afterCancel?.panelStatus ?? '').includes('陪看中'),
+              confirmWipes:
+                (afterManual?.panelStatus ?? '').includes('未激活') &&
+                manualDb && Object.values(manualDb.counts ?? {}).every((n) => n === 0) &&
+                manualDb?.pointer === null && manualDb?.onboarded === true && manualDb?.hasSettings === true,
+            },
+          };
+          log('P2.2 判定项:', JSON.stringify(wipeProbe));
+        }
       }
     }
 
@@ -1165,7 +1307,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -1310,6 +1452,27 @@ async function main() {
         retentionProbe?.expiredOver1h?.noStartNoResume === true &&
         retentionProbe?.expiredOver1h?.itemsStillThere === true &&
         retentionProbe?.expiredOver1h?.mascotTogglesPanel === true,
+      // P2.2 F10 清除链路：超期弹窗文案+双按钮 / 稍后提醒重弹+数据保留 / 立即清除六表+pointer+settings 保留 / 手动入口二次确认
+      expiredConfirmModal:
+        wipeProbe?.expiredModal?.shown === true &&
+        wipeProbe?.expiredModal?.owner === true &&
+        wipeProbe?.expiredModal?.copy === true,
+      laterRemindReprompts:
+        wipeProbe?.laterRemindReprompts?.closed === true &&
+        wipeProbe?.laterRemindReprompts?.toast === true &&
+        wipeProbe?.laterRemindReprompts?.dataKept === true &&
+        wipeProbe?.laterRemindReprompts?.reprompts === true,
+      // 审查 P1-1 回归：生成中（慢 LLM 挂窗）手动/超期清除 → 在途执行体被掐死，10s 观察窗无孤儿写入
+      wipeMidFlightNoResurrect: wipeProbe?.wipeMidFlightNoResurrect === true,
+      wipeConfirmClears:
+        wipeProbe?.wipeConfirmClears?.uiReset === true &&
+        wipeProbe?.wipeConfirmClears?.dbEmpty === true &&
+        wipeProbe?.wipeConfirmClears?.pointerGone === true &&
+        wipeProbe?.wipeConfirmClears?.settingsKept === true,
+      manualWipeDoubleConfirm:
+        wipeProbe?.manualWipeDoubleConfirm?.startsActive === true &&
+        wipeProbe?.manualWipeDoubleConfirm?.cancelNoop === true &&
+        wipeProbe?.manualWipeDoubleConfirm?.confirmWipes === true,
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');

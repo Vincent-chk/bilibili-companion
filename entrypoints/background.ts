@@ -13,6 +13,7 @@ import {
   setSessionPointer,
   updateVisitProgress,
   upsertVisit,
+  wipeAllData,
   type JobRow,
   type JobStage,
   type SummaryRow,
@@ -341,6 +342,9 @@ export default defineBackground(() => {
         return handleSessionStart();
       case 'SESSION_END':
         return handleSessionEnd();
+      case 'WIPE_CONFIRM':
+      case 'WIPE_NOW':
+        return handleWipe(); // P2.2 F10 清除链路（超期确认【立即清除】/ 手动清除）
       case 'TEST_CONNECTION':
         return handleTestConnection(m);
       case 'SETTINGS_SAVE':
@@ -411,6 +415,30 @@ async function handleSessionEnd(): Promise<Record<string, unknown>> {
   lastBroadcastSession = { sessionId: pointer.sessionId, state: 'GRACE' };
   broadcastToUi(sessionStateMsg(next));
   return { ok: true, sessionState: 'GRACE', closedAt: now, retainUntil: retainUntilOf(next) };
+}
+
+/**
+ * P2.2 · WIPE_CONFIRM / WIPE_NOW（F10 清除链路）：事务清空六表 + 移除 sessionPointer
+ * （settings/mascotPos/onboarded 保留）→ 广播 INACTIVE（面板清空、豆包回未激活+开始气泡）。
+ * 「稍后提醒」是面板本地行为（保持 EXPIRED_PENDING_CONFIRM，不删数据），不产生消息。
+ * 审查 P1-1：清除前先掐死在途执行体（offscreen）——否则生成中的 job 会在 wipe 后落一行
+ * 孤儿 summary，且 latestSummary 按 videoKey 取行，重看同视频会「复活」已清数据（F10-③ 违背）；
+ * 执行体死后 sendToOffscreen 拒绝 → tick 落 failed 但 job 行已删（pipeline 双守卫）不复活。
+ * 残余窗口：掐死前最后 ms 级已提交的 put——极窄，记账接受。
+ */
+async function handleWipe(): Promise<Record<string, unknown>> {
+  try {
+    await browser.offscreen.closeDocument();
+    offscreenReady = false;
+    console.log('[doubao] wipe: offscreen executor killed (in-flight job aborted)');
+  } catch {
+    /* offscreen 未开（无可掐）——继续清除 */
+  }
+  await wipeAllData(db, browserKv);
+  lastBroadcastSession = null;
+  broadcastToUi(sessionStateMsg(undefined)); // {type:'SESSION_STATE', state:'INACTIVE'}
+  console.log('[doubao] wipe all data done (six tables + pointer cleared; settings kept)');
+  return { ok: true, sessionState: 'INACTIVE' };
 }
 
 // ---- P1.2 · watcher 服务端 ---------------------------------------------------
@@ -488,6 +516,11 @@ async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
   const threshold = clamp((await readSettings()).triggerSeconds ?? 20, 5, 300);
   const row = await db.visits.where({ sessionId, videoKey }).first();
   if (row && !row.triggered && row.watchedSeconds >= threshold) {
+    // 审查 P2-1（2.2 轮）：读 pointer（:507）到入队之间可能插入手动清除——复验仍属同会话
+    // 才入队，否则 wipe 后的迟到 tick 会重建 visit+烧一次 LLM（visit 行刚被随表清空，
+    // where 查无行本会跳过；此复验收口 pointer 被清除/换新的窗口）
+    const live = await getSessionPointer(browserKv);
+    if (live?.sessionId !== sessionId) return { ok: true, staleSession: true };
     await db.transaction('rw', [db.visits, db.jobs], async () => {
       await db.visits.put({ ...row, triggered: 1, lastSeenAt: Date.now() });
       await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId });

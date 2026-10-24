@@ -80,6 +80,8 @@ export class PanelController {
   #retainUntil: number | null = null;
   /** P2.1：倒计时 1s 滴答句柄（面板开且 GRACE 态才跑，递归 setTimeout 链）。 */
   #cdTimer: unknown = null;
+  /** P2.2：本次面板打开是否已弹过超期清除确认（F10-④「稍后提醒」= 本开口内不再打扰，重开再弹）。 */
+  #expiredPrompted = false;
 
   readonly #setTimeout: (cb: () => void, ms?: number) => unknown;
 
@@ -107,6 +109,7 @@ export class PanelController {
 
   open(): void {
     this.#open = true;
+    this.#expiredPrompted = false; // P2.2：每次打开面板重置——「稍后提醒」后重开面板要再弹（F10-④）
     this.deps.ui.root.getElementById('panel')?.classList.add('open');
     // P1.10 时机②：面板打开强制复核登录态（绕 SW 30s 缓存；翻转经 LOGIN_STATE 广播回卡）
     void this.deps.bridge
@@ -176,6 +179,16 @@ export class PanelController {
       this.setLoginState(r.loggedIn ?? null); // P1.10 引导卡（SW 缓存值；强制复核在 open()）
       this.#renderStatus();
       if (this.#view === 'list') this.#renderList();
+      // P2.2 F10-②：超期待确认 → 打开面板即弹清除确认（本次开口只弹一次；「稍后提醒」重开再弹）
+      if (
+        this.#open &&
+        this.#sessionState === 'EXPIRED_PENDING_CONFIRM' &&
+        !this.#expiredPrompted &&
+        !this.#modalShown()
+      ) {
+        this.#expiredPrompted = true;
+        this.#showWipeModal('expired');
+      }
     } catch {
       /* SW 未就绪等瞬时错误：面板下次打开/事件到达时再刷 */
     }
@@ -244,6 +257,64 @@ export class PanelController {
     }
   }
 
+  // ---- P2.2 · F10 清除确认弹窗（超期确认 / 手动清除） ------------------------------
+
+  /**
+   * 清除确认弹窗（原型 showExpiredModal 1:1；手动清除=同构危险区文案）。
+   * mode='expired'：不可取消——只有【稍后提醒】【立即清除】两个出口（F10：不自动删、必须确认）；
+   * mode='manual'：【取消】可退出（二次确认=按钮点击+弹窗确认）。
+   */
+  #showWipeModal(mode: 'expired' | 'manual'): void {
+    const root = this.deps.ui.root;
+    const modalRoot = root.getElementById('modal-root');
+    if (!modalRoot) return;
+    const expired = mode === 'expired';
+    modalRoot.dataset.owner = expired ? 'expired-confirm' : 'manual-wipe';
+    const m = root.ownerDocument.createElement('div');
+    m.className = 'modal';
+    m.innerHTML =
+      `<div class="modal-head"><div class="m-emoji">${expired ? '💤' : '⚠️'}</div>` +
+      `<div><h2>${expired ? '本次陪看数据已超过保留时间' : '清除全部陪看数据？'}</h2>` +
+      `<p>${expired ? '你结束陪看已超过 1 小时。按数据保留规则，需要确认后清除本次陪看的列表、摘要与转写。' : '将删除列表、摘要与转写全部本地数据（模型配置与 Key 保留）。此操作不可恢复。'}</p></div></div>` +
+      `<div class="modal-foot">` +
+      `<button class="btn btn-ghost" id="wipe-later">${expired ? '稍后提醒' : '取消'}</button>` +
+      `<button class="btn btn-danger" id="wipe-now">立即清除${expired ? '' : '全部数据'}</button>` +
+      `</div>`;
+    modalRoot.replaceChildren(m);
+    modalRoot.classList.add('show');
+    const close = () => {
+      modalRoot.classList.remove('show');
+      modalRoot.replaceChildren();
+      delete modalRoot.dataset.owner;
+    };
+    m.querySelector('#wipe-later')?.addEventListener('click', () => {
+      close();
+      toast(this.deps.ui, expired ? '好的，稍后再提醒你处理' : '已取消');
+    });
+    m.querySelector('#wipe-now')?.addEventListener('click', () => {
+      close();
+      void this.#doWipe(expired ? 'WIPE_CONFIRM' : 'WIPE_NOW');
+    });
+  }
+
+  /** F10 清除执行：SW 事务清六表+pointer → INACTIVE 广播/直接刷新双路兜底。 */
+  async #doWipe(msgType: 'WIPE_CONFIRM' | 'WIPE_NOW'): Promise<void> {
+    try {
+      const r = await this.deps.bridge.request<{ ok: boolean }>({ type: msgType, confirm: true });
+      if (!r?.ok) {
+        toast(this.deps.ui, '清除失败，稍后再试');
+        return;
+      }
+      toast(this.deps.ui, '已清除全部陪看数据（配置保留）');
+      this.#view = 'list';
+      this.#detailKey = null;
+      this.#stream = null;
+      await this.refresh(); // SESSION_STATE(INACTIVE) 广播也会刷；直刷兜 SW 广播竞态
+    } catch {
+      toast(this.deps.ui, '清除失败，稍后再试');
+    }
+  }
+
   #renderActions(acts: HTMLElement | null, html: string, onClick: () => void): void {
     if (!acts) return;
     acts.innerHTML = html;
@@ -255,14 +326,12 @@ export class PanelController {
   #renderList(): void {
     const box = this.deps.ui.root.getElementById('view-list');
     if (!box) return;
-    const head = `<div class="list-head"><b>本次陪看 · ${this.#items.length} 个视频</b><span>点击条目查看摘要</span></div>`;
-    if (this.#items.length === 0) {
-      box.innerHTML = `${head}<div class="d-sec" style="text-align:center;padding:36px 16px;color:#9499a0;font-size:13px"><img class="empty-mascot" src="${browser.runtime.getURL('/mascot/mascot-idle.png')}" alt=""><br>还没有陪看记录<br>点击豆包「开始陪看」，<br>播放超过 ${this.#triggerSeconds} 秒我就会记笔记</div>`;
-      return;
-    }
-    box.innerHTML =
-      head +
-      this.#items
+    // P2.2 F10-⑤：手动清除入口（设置页属 2.5，先挂列表头；2.5 落地后迁入设置危险区）
+    const head = `<div class="list-head"><b>本次陪看 · ${this.#items.length} 个视频</b><span style="display:flex;align-items:center;gap:6px">点击条目查看摘要<button id="wipe-entry" title="清除全部陪看数据" style="border:none;background:none;cursor:pointer;font-size:14px;padding:2px 4px;color:#9499a0">🗑</button></span></div>`;
+    const body =
+      this.#items.length === 0
+        ? `<div class="d-sec" style="text-align:center;padding:36px 16px;color:#9499a0;font-size:13px"><img class="empty-mascot" src="${browser.runtime.getURL('/mascot/mascot-idle.png')}" alt=""><br>还没有陪看记录<br>点击豆包「开始陪看」，<br>播放超过 ${this.#triggerSeconds} 秒我就会记笔记</div>`
+        : this.#items
         .map((it) => {
           const badge = BADGE_HTML[it.badge];
           const spinner = it.badge === 'generating' ? '<span class="spinner"></span>' : '';
@@ -283,6 +352,8 @@ export class PanelController {
           </div>`;
         })
         .join('');
+    box.innerHTML = head + body;
+    box.querySelector('#wipe-entry')?.addEventListener('click', () => this.#showWipeModal('manual'));
     this.#bindCoverFallback(box);
     box.querySelectorAll<HTMLElement>('.v-item').forEach((el) => {
       el.addEventListener('click', () => void this.#onItemClick(el.getAttribute('data-video-key')!));
