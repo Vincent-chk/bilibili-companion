@@ -10,6 +10,7 @@ export default defineConfig({
       __POC_LLM_BASE_URL__: inject(process.env.POC_LLM_BASE_URL),
       __POC_LLM_MODEL__: inject(process.env.POC_LLM_MODEL),
       __POC_LLM_KEY__: inject(process.env.POC_LLM_API_KEY),
+      __POC_LLM_TIMEOUT_MS__: inject(process.env.POC_LLM_TIMEOUT_MS), // 思考型真实模型整流耗时远超默认 60s
     },
   }),
   manifest: {

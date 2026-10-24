@@ -107,6 +107,7 @@ describe('自动重试 ≤1', () => {
     const row = (await db.jobs.toArray())[0]!;
     expect(row.status).toBe('failed');
     expect(row.retries).toBe(1);
+    expect(row.error).toEqual({ code: 'X', msg: '失败' }); // 终态 error 落行：分段早退等不写注记路径的广播兜底数据源
     await db.delete();
   });
 

@@ -208,6 +208,16 @@ export interface ResolvedConfig {
   config: LlmConfig | null;
   source: 'storage' | 'build-inject' | 'none';
   error?: string;
+  /** 整流超时（ms）：POC_LLM_TIMEOUT_MS 构建期注入；缺省 60s（见 resolveLlmTimeoutMs）。 */
+  timeoutMs: number;
+}
+
+export const LLM_DEFAULT_TIMEOUT_MS = 60_000;
+
+/** 思考型模型（reasoning）全片摘要整流可远超 60s：真实 LLM 构建经 POC_LLM_TIMEOUT_MS 放宽（须 < SW 600s 看门狗）。 */
+export function resolveLlmTimeoutMs(): number {
+  const raw = typeof __POC_LLM_TIMEOUT_MS__ === 'string' ? Number.parseInt(__POC_LLM_TIMEOUT_MS__, 10) : NaN;
+  return Number.isFinite(raw) && raw > 0 ? raw : LLM_DEFAULT_TIMEOUT_MS;
 }
 
 /**
@@ -215,18 +225,20 @@ export interface ResolvedConfig {
  * → 构建期注入 __POC_LLM_BASE_URL__/__POC_LLM_MODEL__/__POC_LLM_KEY__ → 都没有返回 null + 可读错误。
  */
 export function resolveConfig(stored?: StoredLlmConfig): ResolvedConfig {
+  const timeoutMs = resolveLlmTimeoutMs();
   if (stored?.baseUrl && stored.model && stored.apiKey) {
-    return { config: { baseUrl: stored.baseUrl, model: stored.model, apiKey: stored.apiKey }, source: 'storage' };
+    return { config: { baseUrl: stored.baseUrl, model: stored.model, apiKey: stored.apiKey }, source: 'storage', timeoutMs };
   }
   const baseUrl = typeof __POC_LLM_BASE_URL__ === 'string' ? __POC_LLM_BASE_URL__ : '';
   const model = typeof __POC_LLM_MODEL__ === 'string' ? __POC_LLM_MODEL__ : '';
   const apiKey = typeof __POC_LLM_KEY__ === 'string' ? __POC_LLM_KEY__ : '';
   if (baseUrl && model && apiKey) {
-    return { config: { baseUrl, model, apiKey }, source: 'build-inject' };
+    return { config: { baseUrl, model, apiKey }, source: 'build-inject', timeoutMs };
   }
   return {
     config: null,
     source: 'none',
+    timeoutMs,
     error: '未配置 LLM：请在设置中填写 baseUrl / model / apiKey，或经 POC_LLM_BASE_URL / POC_LLM_MODEL / POC_LLM_API_KEY 环境变量在构建期注入',
   };
 }

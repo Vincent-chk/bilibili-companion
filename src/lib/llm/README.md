@@ -8,13 +8,18 @@ PoC 的 LLM 层：OpenAI-compatible `/chat/completions` SSE 流式客户端 + �
 
 ## 真实火山方舟一键补验
 
+**✅ 补验已完成（2026-10-24，`02-开发方案/10-真实LLM补验报告.md`：真实模式 E2E 40/40）**。关键事实：临时 Key 为 **plan 端点作用域**（baseUrl 用 `…/api/plan/v3`，标准 `/api/v3` 对其 401）；模型须**全 id**（`seed-2.1-lite` → UnsupportedModel）；思考型模型整流慢（全片摘要实测 ~79s），必须注入 `POC_LLM_TIMEOUT_MS`（缺省 60s 会 abort）。
+
 ```bash
-POC_LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 \
+E2E_REAL_LLM=1 \
+POC_LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3 \
 POC_LLM_MODEL=doubao-seed-2-1-lite-260915 \
-POC_LLM_API_KEY=<有效Key> pnpm build
+POC_LLM_API_KEY=<有效Key> \
+POC_LLM_TIMEOUT_MS=300000 \
+node scripts/e2e-poc.mjs   # 脚本内部会以同一 env 重跑 pnpm build
 ```
 
-（模型 id 以需求方给定为准；Key 只进构建环境变量，不进仓库；运行期优先读 chrome.storage.local 的 llm 三件套，均无则 `resolveConfig` 返回可读错误。07 报告 §9.1：当前 Key 被服务端判 401，换有效 Key 重新 build 即真验。）
+（Key 只进进程 env，不入仓库；运行期优先读 chrome.storage.local 的 llm 三件套，均无则 `resolveConfig` 返回可读错误。⚠️ ARK 端点 CORS 预检**不放行 Authorization 头**——浏览器端必须经 onboarding 的按 origin 授权（host 权限豁免 CORS）才能调通；headless E2E 弹不出授权窗，以 `--disable-web-security` 模拟授权后语义。详见 10 报告 §1/§3。）
 
 ## mock 服务器
 

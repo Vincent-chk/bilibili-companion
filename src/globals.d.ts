@@ -2,3 +2,4 @@
 declare const __POC_LLM_BASE_URL__: string;
 declare const __POC_LLM_MODEL__: string;
 declare const __POC_LLM_KEY__: string;
+declare const __POC_LLM_TIMEOUT_MS__: string;

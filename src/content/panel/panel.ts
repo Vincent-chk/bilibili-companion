@@ -2,7 +2,8 @@
 // 列表（封面/进度/五态徽章）· 详情（摘要流式/大纲/豆包说/转写节选）· 空态。
 // 数据：LIST_QUERY（列表快照）/ SUMMARY_OPEN（按需生成或取缓存 + 详情载荷）；
 // 推送：SUMMARY_PROGRESS(deltaText 流式打字) / SUMMARY_DONE|FAILED|NEED_ASR|UPDATED（终态刷新）。
-// 大纲/转写行点击 seek 已于 1.8 接入（SEEK_TO，onSeek 依赖）；【重新生成】随 REGENERATE 任务后续接入。
+// 大纲/转写行点击 seek 已于 1.8 接入（SEEK_TO，onSeek 依赖）；【重新生成】已于 2.7a 接入
+// （REGENERATE → force 覆盖；人设切换联动询问属 2.5 设置页 = 2.7b）。
 import { browser } from 'wxt/browser';
 import type { Bridge, UiEvent } from '../bridge';
 import { LOGIN_CARD_TEXT, shouldShowLoginCard } from '../login';
@@ -305,6 +306,32 @@ export class PanelController {
     void this.refresh();
   }
 
+  /**
+   * 2.7a【重新生成】（F7/F8）：REGENERATE 强制重跑；成功覆盖经 SUMMARY_DONE→#openDetail 重渲染。
+   * 旧分段注记点击即作废（新大纲语义不同；DB 缓存随成功覆盖清空）；失败时旧摘要/注记保留，
+   * 【AI 解读】再点仍从 DB 缓存取回。
+   */
+  async #onRegenerate(): Promise<void> {
+    const videoKey = this.#detailKey;
+    if (!videoKey) return;
+    try {
+      const r = await this.deps.bridge.request<{ ok: boolean; started?: boolean; error?: string }>({
+        type: 'REGENERATE',
+        videoKey,
+      });
+      if (!r?.ok || !r.started) {
+        toast(this.deps.ui, r?.error === 'busy' ? '已有任务进行中，稍后再试重新生成' : '重新生成发起失败，稍后再试');
+        return;
+      }
+      this.#segNotes = new Map();
+      this.#segOpen = new Set();
+      this.#stream = { videoKey, acc: '' };
+      this.#paintStream(); // 立即切「记笔记中」等待态；增量经 SUMMARY_PROGRESS 进 #stream
+    } catch {
+      toast(this.deps.ui, '重新生成发起失败，稍后再试');
+    }
+  }
+
   #renderDetail(item: ListQueryItem, transcript?: TranscriptExcerpt): void {
     const root = this.deps.ui.root;
     const box = root.getElementById('view-list');
@@ -364,9 +391,10 @@ export class PanelController {
       (outlineHtml ? `<div class="d-sec"><h3>🧭 要点大纲</h3><ul class="d-outline">${outlineHtml}</ul></div>` : '') +
       sayHtml +
       trHtml +
-      `<div class="d-foot"><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`;
+      `<div class="d-foot"><button class="btn btn-ghost" id="d-regen">↻ 重新生成</button><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`;
 
     root.getElementById('d-back')?.addEventListener('click', () => this.#backToList());
+    root.getElementById('d-regen')?.addEventListener('click', () => void this.#onRegenerate());
     // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）；
     // P1.11：【AI 解读】按钮与注记卡内的点击不触发 seek（两动作互不干扰，PRD F13）
     const seekKey = item.visit.videoKey;

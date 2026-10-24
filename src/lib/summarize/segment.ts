@@ -93,6 +93,8 @@ export interface SegmentJobDeps {
   bili: BiliApi;
   llm: LlmConfig;
   fetchImpl?: typeof fetch;
+  /** 整流超时（SW resolveConfig → offscreen 透传；缺省 60s）。 */
+  timeoutMs?: number;
   /** 流式增量（offscreen 转发面板内联卡片打字机）。 */
   onDelta?: (text: string) => void;
 }
@@ -155,12 +157,16 @@ export async function runSegmentJob(
     await ctx?.update({ stage: 'llm_reduce', progress: 50 });
     const r = await streamChatCompletion(llm, messages, {
       fetchImpl: deps.fetchImpl,
-      timeoutMs: 60_000,
+      timeoutMs: deps.timeoutMs ?? 60_000,
       maxTokens: SEGMENT_MAX_TOKENS,
       ...(deps.onDelta
         ? { onDelta: (ev: StreamEvent) => { if (ev.type === 'delta') deps.onDelta?.(ev.text); } }
         : {}),
     });
+    // 真实 LLM 补验指标（usage 含 reasoning_tokens：max_tokens 只限 content，思考 token 另行计费）
+    console.log(
+      `[doubao] llm segment seg=${job.segIndex} ttft=${r.ttftMs ?? -1}ms truncated=${truncated} usage=${JSON.stringify(r.usage ?? null)}`,
+    );
     const text = r.text.trim();
     if (!text) throw new Error('分段解读输出为空');
     await writeSegmentNote(db, skey, job.segIndex, { text, status: 'done', createdAt: Date.now(), ...extra });

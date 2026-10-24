@@ -340,4 +340,21 @@ describe('审查修复回归', () => {
     expect(note?.status).toBe('failed');
     expect(note?.error?.code).toBe('NEED_LOGIN');
   });
+
+  it('timeoutMs 透传：deps.timeoutMs=30 + 服务器不响应 → failed 注记 LLM_NETWORK(超时)', async () => {
+    const db = freshDb();
+    await seedDoneSummary(db);
+    const base = await start(async () => {
+      /* 收下请求但永不响应 */
+    });
+    const r = await runSegmentJob(
+      { db, bili: silentBili(), llm: { baseUrl: base, model: 'mock-model', apiKey: 'k' }, timeoutMs: 30 },
+      { videoKey: VIDEO_KEY, segIndex: 1 },
+    );
+    expect(r.result).toBe('failed');
+    const note = (await db.summaries.get(SKEY))?.segmentNotes?.[1];
+    expect(note?.status).toBe('failed');
+    expect(note?.error?.code).toBe('LLM_NETWORK');
+    expect(note?.error?.msg).toContain('超时');
+  });
 });

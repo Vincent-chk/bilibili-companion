@@ -64,6 +64,13 @@ describe('pickSeekTab', () => {
     expect(tabMatchesVideo(`https://m.bilibili.com/video/${bvid}/`, bvid, 1)).toBe(false);
     expect(tabMatchesVideo(`https://space.bilibili.com/video/${bvid}/`, bvid, 1)).toBe(false);
   });
+  it('liveTabIds 过滤：孤儿标签（URL 匹配但无活端口）不入选 → null 让调用方落 new-tab（记账项收口）', () => {
+    const tabs = [{ id: 3, windowId: 2, url: `https://www.bilibili.com/video/${bvid}/` }];
+    expect(pickSeekTab(tabs, bvid, 1, new Set([3]))).toEqual(tabs[0]);
+    expect(pickSeekTab(tabs, bvid, 1, new Set([9]))).toBeNull();
+    expect(pickSeekTab(tabs, bvid, 1, new Set())).toBeNull();
+    expect(pickSeekTab(tabs, bvid, 1), '省略 liveTabIds = 不过滤（旧行为）').toEqual(tabs[0]);
+  });
 });
 
 describe('shouldConsumeSeek（审查 P1-1/P1-2：广播消费判定）', () => {

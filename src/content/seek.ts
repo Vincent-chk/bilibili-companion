@@ -55,11 +55,24 @@ export interface SeekTabCandidate {
   url?: string;
 }
 
-/** 候选标签页中挑第一个匹配的视频页（tabs.query 结果；无 host 权限的标签页 url 为 undefined，天然被滤掉）。 */
+/**
+ * 候选标签页中挑第一个匹配的视频页（tabs.query 结果；无 host 权限的标签页 url 为 undefined，天然被滤掉）。
+ * liveTabIds：UI Port 存活的标签页 id 集（background 持有）——扩展 reload 后的孤儿标签 URL 仍匹配
+ * 但广播进空端口会静默失败，过滤掉让调用方落 new-tab 兜底（Phase 1 记账项收口，原审查 P2-1）。
+ * 省略该参数 = 不过滤（旧行为）。
+ */
 export function pickSeekTab(
   tabs: SeekTabCandidate[],
   bvid: string,
   page: number,
+  liveTabIds?: ReadonlySet<number>,
 ): SeekTabCandidate | null {
-  return tabs.find((t) => t.id !== undefined && tabMatchesVideo(t.url, bvid, page)) ?? null;
+  return (
+    tabs.find(
+      (t) =>
+        t.id !== undefined &&
+        tabMatchesVideo(t.url, bvid, page) &&
+        (liveTabIds === undefined || liveTabIds.has(t.id)),
+    ) ?? null
+  );
 }

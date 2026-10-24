@@ -201,6 +201,24 @@ describe('llm client + summary', () => {
     expect(none.source).toBe('none');
     expect(none.error).toBeTruthy();
   });
+
+  it('⑧b resolveConfig.timeoutMs：缺省 60s；POC_LLM_TIMEOUT_MS 注入优先；非法值回退', () => {
+    expect(resolveConfig().timeoutMs).toBe(60_000);
+    const g = globalThis as Record<string, unknown>;
+    g.__POC_LLM_TIMEOUT_MS__ = '300000';
+    try {
+      expect(resolveConfig().timeoutMs).toBe(300_000);
+      expect(resolveConfig({ baseUrl: 'http://x', model: 'm', apiKey: 'k' }).timeoutMs).toBe(300_000);
+    } finally {
+      delete g.__POC_LLM_TIMEOUT_MS__;
+    }
+    g.__POC_LLM_TIMEOUT_MS__ = 'garbage';
+    try {
+      expect(resolveConfig().timeoutMs).toBe(60_000);
+    } finally {
+      delete g.__POC_LLM_TIMEOUT_MS__;
+    }
+  });
 });
 
 describe('mock-llm-server.mjs（真实脚本）', () => {

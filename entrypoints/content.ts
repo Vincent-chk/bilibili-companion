@@ -195,6 +195,7 @@ export default defineContentScript({
     browser.runtime.onMessage.addListener((m: unknown) => {
       const msg = m as { type?: string; url?: string };
       if (msg?.type !== 'ROUTE_CHANGED' || !msg.url) return undefined;
+      console.log('[doubao-poc] route-changed', msg.url); // 去重前原始计数：B 站播放期 replaceState 频度真机观察（验收记录 §5.4）
       onRoute(msg.url);
       return undefined;
     });

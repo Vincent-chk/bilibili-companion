@@ -9,6 +9,8 @@
 //   → CDP 收集 page+SW+offscreen console → 标记链 + DOM 探针 + IndexedDB 终态断言 → 截图留证 → 清理。
 //
 // 用法：node scripts/e2e-poc.mjs [bvid]        （默认 BV1XynB6EEiM，样本清单内）
+//   真实 LLM 补验模式（08 报告 §7）：E2E_REAL_LLM=1 POC_LLM_BASE_URL=… POC_LLM_MODEL=…
+//   POC_LLM_API_KEY=… [POC_LLM_TIMEOUT_MS=300000] node scripts/e2e-poc.mjs
 // 前置：pnpm install 已跑；真实 Chrome 已登录 B 站；CfT 已就位（.bin/，或 E2E_BROWSER 覆盖）。
 //
 // 端口全部动态分配（debug=0 → 读 DevToolsActivePort；mock=0 → 解析 stdout），避免与残留进程抢端口。
@@ -28,40 +30,58 @@ const CFT = path.join(ROOT, '.bin', 'chrome-mac-arm64', 'Google Chrome for Testi
 const CHROME = process.env.E2E_BROWSER || (fs.existsSync(CFT) ? CFT : '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
 const BVID = process.argv[2] || 'BV1XynB6EEiM';
 const PAGE_URL = `https://www.bilibili.com/video/${BVID}`;
-const TIMEOUT_MS = 120_000;
+// 真实 LLM 补验模式：跳过 mock server，POC_LLM_* 直打真实端点（Key 仅经进程 env，不打印不落盘不入仓库）
+const REAL = process.env.E2E_REAL_LLM === '1';
+if (REAL) {
+  for (const k of ['POC_LLM_BASE_URL', 'POC_LLM_MODEL', 'POC_LLM_API_KEY']) {
+    if (!process.env[k]) throw new Error(`E2E_REAL_LLM=1 需要环境变量 ${k}`);
+  }
+}
+let llmCfg = REAL
+  ? { baseUrl: process.env.POC_LLM_BASE_URL, modelId: process.env.POC_LLM_MODEL, apiKey: process.env.POC_LLM_API_KEY }
+  : null; // mock 模式待端口分配后填
+// 思考型真实模型的全片摘要整流可远超 120s（SW 看门狗 600s 内的注入超时兜底）
+const TIMEOUT_MS = REAL ? 300_000 : 120_000;
 
 const log = (...a) => console.log(`[e2e ${new Date().toISOString().slice(11, 19)}]`, ...a);
 
 async function main() {
   requireExists(CHROME, 'Chrome（或 Chrome for Testing）');
-  requireExists(path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), 'mock-llm-server.mjs（poc-llm 交付物）');
 
-  // 1) mock LLM 服务器（CORS 就绪；port 0 动态分配，从 stdout 解析）
-  const mock = spawn(process.execPath, [path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), '0'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let mockStdout = '';
-  mock.stdout.on('data', (d) => { mockStdout += d; process.stdout.write(`[mock] ${d}`); });
-  mock.stderr.on('data', (d) => process.stderr.write(`[mock!] ${d}`));
-  const mockPort = await new Promise((res, rej) => {
-    const t0 = Date.now();
-    const timer = setInterval(() => {
-      const m = mockStdout.match(/ready port=(\d+)/);
-      if (m) { clearInterval(timer); res(Number(m[1])); }
-      else if (Date.now() - t0 > 10_000) { clearInterval(timer); rej(new Error(`mock server 启动超时: ${mockStdout.slice(-200)}`)); }
-    }, 150);
-  });
-  await waitHttp(`http://127.0.0.1:${mockPort}/health`, 10_000);
-  log('mock LLM server ready on', mockPort);
+  // 1) mock LLM 服务器（CORS 就绪；port 0 动态分配，从 stdout 解析）——真实模式跳过
+  let mock = null;
+  if (!REAL) {
+    requireExists(path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), 'mock-llm-server.mjs（poc-llm 交付物）');
+    mock = spawn(process.execPath, [path.join(ROOT, 'scripts', 'mock-llm-server.mjs'), '0'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let mockStdout = '';
+    mock.stdout.on('data', (d) => { mockStdout += d; process.stdout.write(`[mock] ${d}`); });
+    mock.stderr.on('data', (d) => process.stderr.write(`[mock!] ${d}`));
+    const mockPort = await new Promise((res, rej) => {
+      const t0 = Date.now();
+      const timer = setInterval(() => {
+        const m = mockStdout.match(/ready port=(\d+)/);
+        if (m) { clearInterval(timer); res(Number(m[1])); }
+        else if (Date.now() - t0 > 10_000) { clearInterval(timer); rej(new Error(`mock server 启动超时: ${mockStdout.slice(-200)}`)); }
+      }, 150);
+    });
+    await waitHttp(`http://127.0.0.1:${mockPort}/health`, 10_000);
+    log('mock LLM server ready on', mockPort);
+    llmCfg = { baseUrl: `http://127.0.0.1:${mockPort}`, modelId: 'mock-seed-lite', apiKey: 'e2e-mock-key' };
+  } else {
+    log('REAL LLM mode:', llmCfg.baseUrl, llmCfg.modelId, `(Key 打码 ${llmCfg.apiKey.slice(0, 8)}****)`);
+  }
 
-  // 2) 带 mock 环境重新构建（Key=占位符，绝不入仓库）
-  log('rebuilding extension with mock LLM env …');
+  // 2) 带 LLM 环境重新构建（Key 只进构建 env，绝不入仓库）
+  log(`rebuilding extension with ${REAL ? 'REAL' : 'mock'} LLM env …`);
   const env = {
     ...process.env,
     PATH: `/opt/homebrew/bin:${path.join(os.homedir(), '.npm-global/bin')}:${process.env.PATH}`,
-    POC_LLM_BASE_URL: `http://127.0.0.1:${mockPort}`,
-    POC_LLM_MODEL: 'mock-seed-lite',
-    POC_LLM_API_KEY: 'e2e-mock-key',
+    POC_LLM_BASE_URL: llmCfg.baseUrl,
+    POC_LLM_MODEL: llmCfg.modelId,
+    POC_LLM_API_KEY: llmCfg.apiKey,
+    ...(REAL ? { POC_LLM_TIMEOUT_MS: process.env.POC_LLM_TIMEOUT_MS || '300000' } : {}),
   };
   const build = spawnSync('pnpm', ['build'], { cwd: ROOT, env, encoding: 'utf8' });
   if (build.status !== 0) throw new Error(`pnpm build 失败:\n${(build.stdout || '') + (build.stderr || '')}`.slice(-2000));
@@ -75,6 +95,10 @@ async function main() {
   // 4) headless Chrome for Testing + 扩展 + CDP（debug 端口 0=动态，从 DevToolsActivePort 读回）
   const chrome = spawn(CHROME, [
     '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+    // 真实模式关 web 安全，模拟「optional host 权限已授予」后的网络语义：headless 弹不出
+    // permissions.request 对话框会被自动拒（实测 granted=0 denied=1），而真实 ARK 端点 CORS
+    // 预检不放行 Authorization 头——真实浏览器用户在 onboarding 批准授权后 fetch 即豁免 CORS。
+    ...(REAL ? ['--disable-web-security'] : []),
     `--user-data-dir=${profile}`,
     '--remote-debugging-port=0',
     `--disable-extensions-except=${EXT_DIR}`,
@@ -87,7 +111,7 @@ async function main() {
   process.on('uncaughtException', (e) => {
     console.error('[e2e] UNCAUGHT', e);
     try { chrome.kill('SIGKILL'); } catch { /* noop */ }
-    try { mock.kill('SIGKILL'); } catch { /* noop */ }
+    try { mock?.kill('SIGKILL'); } catch { /* noop */ }
     try { fs.rmSync(profile, { recursive: true, force: true }); } catch { /* noop */ }
     process.exit(1);
   });
@@ -103,6 +127,10 @@ async function main() {
     const sessionByTarget = new Map(); // targetId → sessionId（导航/Cookie 注入用）
     const attachedTargets = []; // P1.8：记录所有 attach 的 target URL（新标签页分支探针用）
     let swSessionId = null; // 扩展 background SW 的 session（storage 注入用，SW 重启自动更新）
+    // F12/3.5 前移切片：扩展自身出网审计面 = SW + offscreen（chrome-extension:// target）的
+    // Network.requestWillBeSent 全量收集，收口判 host 白名单（页面自身流量不属扩展出网，不采）
+    const netSessions = new Set();
+    const netUrls = [];
     const ws = new WebSocket(ver.webSocketDebuggerUrl);
     await onceEvent(ws, 'open');
     let msgId = 0;
@@ -130,11 +158,20 @@ async function main() {
         attachedTargets.push({ type: t.type, url: t.url, targetId: t.targetId, at: Date.now() });
         if (t.type === 'service_worker' && t.url.includes('background')) swSessionId = sessionId; // SW 可能重启，始终取最新
         cdp('Runtime.enable', {}, sessionId).catch(() => {});
+        if (t.url.startsWith('chrome-extension://')) {
+          netSessions.add(sessionId); // SW 重启/offscreen 重建会带新 session 进来
+          cdp('Network.enable', {}, sessionId).catch(() => {}); // T-3：Network.enable 在 CfT 正常（挂起的是 Cookie 命令）
+        }
         if (t.type === 'page') {
           cdp('Page.enable', {}, sessionId).catch(() => {});
           pageSessions.add(sessionId);
         }
         log(`attached: ${t.type} ${t.url.slice(0, 80)}`);
+        return;
+      }
+      if (m.method === 'Network.requestWillBeSent' && netSessions.has(m.sessionId)) {
+        const u = m.params?.request?.url;
+        if (u) netUrls.push(u);
         return;
       }
       if (m.method === 'Runtime.consoleAPICalled') {
@@ -170,6 +207,22 @@ async function main() {
     const jar = JSON.parse(ex.stdout);
     const cookiePairs = Object.entries(jar.cookies || {});
     if (!cookiePairs.some(([n]) => n === 'SESSDATA')) throw new Error('提取结果缺 SESSDATA——真实 Chrome 未登录？');
+
+    // 5.1) 登录态预检（快速失败）：提取的 Cookie 直调 nav 确认仍有效——否则跑到中途才以
+    //      「未登录链路/自动恢复」交织的形式失败，难归因（验收记录 §5：E2E 依赖真实登录态风险的收口）
+    {
+      const navChk = await fetch('https://api.bilibili.com/x/web-interface/nav', {
+        headers: {
+          cookie: cookiePairs.map(([n, v]) => `${n}=${v}`).join('; '),
+          referer: 'https://www.bilibili.com/',
+          'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        },
+      }).then((r) => r.json()).catch((e) => ({ code: -1, message: String(e).slice(0, 100) }));
+      if (navChk?.data?.isLogin !== true) {
+        throw new Error(`登录态预检失败（nav code=${navChk?.code} ${navChk?.message ?? ''}）：真实 Chrome 的 B 站登录态已失效——请在 Chrome 重新登录 bilibili.com 后重跑`);
+      }
+      log('登录态预检通过（nav isLogin=true）');
+    }
 
     const landing = await cdp('Target.createTarget', { url: 'https://www.bilibili.com/' });
     const landingId = landing.result?.targetId;
@@ -213,31 +266,33 @@ async function main() {
     log('settings 注入（仅阈值，LLM 留给 onboarding 真实填写）:', JSON.stringify(setStorageRes?.result?.result?.value ?? 'void'));
 
     await cdp('Page.navigate', { url: PAGE_URL }, landingSid);
-    await sleep(4000); // 等 content script 重注入（此时 INACTIVE：豆包应挂「开始陪看」气泡）
-    // P1.10：立即暂停 autoplay——否则激活前已累积的观看时长会让 tick sweep 在激活瞬间触发
-    // job，NEED_LOGIN 失败气泡 ~0.5s 内覆盖登录气泡（run C 教训）；暂停后触发时序=播放满 5s 确定
-    await cdp('Runtime.evaluate', {
-      expression: `(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (!v) return 'no-video'; v.pause(); return 'paused@' + Math.floor(v.currentTime); })()`,
-      returnByValue: true,
-    }, landingSid);
-
-    // 7.4) P1.7 onboarding：点「▶ 开始陪看」→ 未配置 LLM → 强制弹窗
-    let onboardingProbe = {};
-    let loginBubbleSeen = ''; // P1.10 登录气泡采样结果（7.4 保存点击后采样窗）
-    {
-      const startRes = await cdp('Runtime.evaluate', {
-        expression: `(() => {
+    // 等注入 + 暂停 autoplay 改为轮询：B 站页面在高频访问限流下加载可 >5s（mock5/6 实测注入迟到
+    // 致固定 sleep(4000) 后无 btn-start）。P1.10 语义不变：video 元素一出现即暂停——否则激活前
+    // 累积的观看时长会让 tick sweep 在激活瞬间触发 job，NEED_LOGIN 失败气泡覆盖登录气泡（run C 教训）
+    const pauseExpr = `(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (!v) return 'no-video'; v.pause(); return 'paused@' + Math.floor(v.currentTime); })()`;
+    const startClickExpr = `(() => {
           const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
           const btn = sr?.getElementById('btn-start');
           if (!btn) return 'no-btn';
           btn.click();
           return 'clicked';
-        })()`,
-        returnByValue: true,
-      }, landingSid);
-      if (String(startRes?.result?.result?.value ?? '') !== 'clicked') {
-        throw new Error('「开始陪看」气泡按钮未找到——豆包未进入未激活引导态？');
+        })()`;
+
+    // 7.4) P1.7 onboarding：点「▶ 开始陪看」→ 未配置 LLM → 强制弹窗
+    let onboardingProbe = {};
+    let loginBubbleSeen = ''; // P1.10 登录气泡采样结果（7.4 保存点击后采样窗）
+    {
+      let startClicked = '';
+      for (let i = 0; i < 60 && startClicked !== 'clicked'; i++) {
+        await sleep(500);
+        await cdp('Runtime.evaluate', { expression: pauseExpr, returnByValue: true }, landingSid).catch(() => {});
+        const startRes = await cdp('Runtime.evaluate', { expression: startClickExpr, returnByValue: true }, landingSid);
+        startClicked = String(startRes?.result?.result?.value ?? 'eval-error');
       }
+      if (startClicked !== 'clicked') {
+        throw new Error(`「开始陪看」气泡按钮未找到（${startClicked}）——豆包未进入未激活引导态？`);
+      }
+      log('「开始陪看」点击成功（注入等待轮询）');
       await sleep(1000); // SESSION_START → NEED_ONBOARDING → 弹窗渲染
       const modalOpen = await cdp('Runtime.evaluate', {
         expression: `(() => {
@@ -271,25 +326,29 @@ async function main() {
       try { onboardingProbe.noCfg = JSON.parse(noCfg?.result?.result?.value); } catch { onboardingProbe.noCfg = null; }
       log('P1.7 空保存标红探针:', JSON.stringify({ red: onboardingProbe.red, noCfg: onboardingProbe.noCfg }));
 
-      // 填入 mock LLM 三件套 → 测试连接（应连上 mock server）→ 保存并激活
-      await cdp('Runtime.evaluate', {
-        expression: `(() => {
+      // 填入 LLM 三件套（mock/真实同一表单路径；Key 只进表达式字符串，不打印）→ 测试连接 → 保存并激活
+      const fillExpr = `(() => {
           const sr = document.getElementById('doubao-ui-root').shadowRoot;
           const set = (k, v) => { sr.querySelector('#ob-llm input[data-k="' + k + '"]').value = v; };
-          set('baseUrl', 'http://127.0.0.1:${mockPort}');
-          set('modelId', 'mock-seed-lite');
-          set('apiKey', 'e2e-mock-key');
+          set('baseUrl', ${JSON.stringify(llmCfg.baseUrl)});
+          set('modelId', ${JSON.stringify(llmCfg.modelId)});
+          set('apiKey', ${JSON.stringify(llmCfg.apiKey)});
           return 'filled';
-        })()`,
-        returnByValue: true,
-      }, landingSid);
-      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-test").click()', returnByValue: true }, landingSid);
-      await sleep(1500); // TEST_CONNECTION 往返
-      const testRes = await cdp('Runtime.evaluate', {
-        expression: `document.getElementById('doubao-ui-root').shadowRoot.getElementById('ob-test-status')?.textContent ?? ''`,
-        returnByValue: true,
-      }, landingSid);
-      onboardingProbe.testStatus = String(testRes?.result?.result?.value ?? '');
+        })()`;
+      await cdp('Runtime.evaluate', { expression: fillExpr, returnByValue: true }, landingSid);
+      // userGesture:true——CDP 合成点击默认无用户激活，permissions.request（LLM origin 授权）会被拒；
+      // ARK 等端点 CORS 预检不放行 Authorization 头，无 host 权限的 fetch 一律 Failed to fetch
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-test").click()', returnByValue: true, userGesture: true }, landingSid);
+      // TEST_CONNECTION 往返：mock 秒回；真实思考型模型对 ping 也先 reasoning（实测 ~14s，端超时 35s）→ 轮询结果文案
+      for (let i = 0; i < (REAL ? 80 : 10); i++) {
+        await sleep(500);
+        const testRes = await cdp('Runtime.evaluate', {
+          expression: `document.getElementById('doubao-ui-root').shadowRoot.getElementById('ob-test-status')?.textContent ?? ''`,
+          returnByValue: true,
+        }, landingSid);
+        onboardingProbe.testStatus = String(testRes?.result?.result?.value ?? '');
+        if (/成功|失败|无效|超时|HTTP|余额|端点|配置/.test(onboardingProbe.testStatus)) break;
+      }
       log('P1.7 测试连接探针:', onboardingProbe.testStatus);
 
       // P1.10：装气泡文本流记录器（MutationObserver）——登录气泡会被随后的 SUMMARY_FAILED
@@ -305,7 +364,7 @@ async function main() {
         returnByValue: true,
       }, landingSid);
 
-      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-save").click()', returnByValue: true }, landingSid);
+      await cdp('Runtime.evaluate', { expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("ob-save").click()', returnByValue: true, userGesture: true }, landingSid);
       await sleep(600); // SETTINGS_SAVE + SESSION_START + 广播收尾
     }
 
@@ -457,6 +516,7 @@ async function main() {
     let mascotProbe = null;
     let seekProbe = null; // P1.8：同页/跨页/新标签 seek 探针
     let p19Probe = null; // P1.9：浮层七准则探针（overlay/全屏/闲时/输入聚焦/跟随）
+    let regenProbe = null; // 2.7a：【重新生成】REGENERATE 探针
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -572,7 +632,7 @@ async function main() {
           })()`);
           await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.seg-btn[data-seg="1"]')?.click()`);
           let segNote = null;
-          for (let i = 0; i < 40 && !(segNote && !segNote.hidden && !segNote.spinner && (segNote.text ?? '').length > 10); i++) {
+          for (let i = 0; i < (REAL ? 800 : 40) && !(segNote && !segNote.hidden && !segNote.spinner && (segNote.text ?? '').length > 10); i++) {
             await sleep(300);
             segNote = await pageEval(`(() => {
               const sr = document.getElementById('doubao-ui-root').shadowRoot;
@@ -605,6 +665,27 @@ async function main() {
           await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]')?.scrollIntoView({ block: 'center' })`);
           await sleep(300);
           await shotNamed(probeSid, 'visual-segment-note.png');
+
+          // 8.67) 2.7a【重新生成】：详情点击 → REGENERATE 强制重跑 → 第 2 次摘要 job →
+          //       done 整行覆盖（createdAt 更新）+ 分段注记随新大纲清空（缓存失效策略）
+          const regenDb = () => swEval(`(async () => {
+            const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+            const rows = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
+            const row = rows.find((x) => String(x.key || '').includes('${BVID}'));
+            return JSON.stringify({ createdAt: row?.createdAt ?? 0, status: row?.status ?? '', notes: row?.segmentNotes ? Object.keys(row.segmentNotes).length : 0 });
+          })()`);
+          const regenBefore = await regenDb();
+          const regenSumBefore = lines.filter((l) => l.text.includes('offscreen run job') && !l.text.includes('seg=')).length;
+          await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.getElementById('d-regen')?.click()`);
+          let regenDone = false;
+          for (let i = 0; i < (REAL ? 800 : 80) && !regenDone; i++) {
+            await sleep(500);
+            regenDone = lines.some((l) => l.text.includes('job REGENERATE') && l.text.includes('→ done'));
+          }
+          const regenAfter = await regenDb();
+          const regenSumAfter = lines.filter((l) => l.text.includes('offscreen run job') && !l.text.includes('seg=')).length;
+          regenProbe = { regenDone, before: regenBefore, after: regenAfter, sumBefore: regenSumBefore, sumAfter: regenSumAfter };
+          log('2.7a 重新生成探针:', JSON.stringify(regenProbe));
         } else {
           uiProbe = { list };
         }
@@ -796,10 +877,13 @@ async function main() {
           const tab2AfterItem = await waitState((s) => s.dBack, 3000);
           const li60 = await eval2(`(() => {
             const sr = document.getElementById('doubao-ui-root').shadowRoot;
-            const li = sr.querySelector('.d-outline li[data-sec="60"]');
-            if (!li) return JSON.stringify({ err: 'no-li-60', secs: [...sr.querySelectorAll('.d-outline li')].map((x) => x.getAttribute('data-sec')) });
+            // 真实模型的大纲时间戳不固定（mock 恒为 0/60/120…）：取第 2 条 li，目标秒读其 data-sec
+            const lis = [...sr.querySelectorAll('.d-outline li[data-sec]')];
+            const li = lis[1] ?? lis[0];
+            if (!li) return JSON.stringify({ err: 'no-li', secs: lis.map((x) => x.getAttribute('data-sec')) });
+            const sec = Number(li.getAttribute('data-sec')) || 0;
             li.click();
-            return JSON.stringify({ clicked: true });
+            return JSON.stringify({ clicked: true, sec });
           })()`);
           if (li60?.err) log('P1.8 tab2 诊断:', JSON.stringify({ tab2AfterOpen, tab2AfterItem }));
           await sleep(1500); // SEEK_TO 往返 + 聚焦切换 + 目标页 seek
@@ -822,9 +906,15 @@ async function main() {
             await sleep(250);
           }
           const attachedBefore = attachedTargets.length;
-          await eval2(`(() => {
+          const ntClick = await eval2(`(() => {
             const sr = document.getElementById('doubao-ui-root').shadowRoot;
-            sr.querySelector('.d-outline li[data-sec="120"]')?.click();
+            // 同 crossTab：取第 3 条 li（mock=120），目标秒动态读取
+            const lis = [...sr.querySelectorAll('.d-outline li[data-sec]')];
+            const li = lis[2] ?? lis[1] ?? lis[0];
+            if (!li) return JSON.stringify({ err: 'no-li' });
+            const sec = Number(li.getAttribute('data-sec')) || 0;
+            li.click();
+            return JSON.stringify({ clicked: true, sec });
           })()`);
           await sleep(1500);
           const tab2Toast = await eval2(`(() => {
@@ -836,10 +926,10 @@ async function main() {
           for (let i = 0; i < 24 && !created; i++) {
             await sleep(250);
             created = attachedTargets.slice(attachedBefore).find(
-              (t) => t.type === 'page' && t.url.includes(`/video/${BVID}`) && t.url.includes('t=120'),
+              (t) => t.type === 'page' && t.url.includes(`/video/${BVID}`) && t.url.includes(`t=${ntClick?.sec ?? '\u2205'}`),
             ) ?? null;
           }
-          seekProbe = { ...seekProbe, newTab: { createdUrl: created?.url ?? null, tab2Toast } };
+          seekProbe = { ...seekProbe, newTab: { click: ntClick, createdUrl: created?.url ?? null, tab2Toast } };
           log('P1.8 新标签页探针:', JSON.stringify(seekProbe.newTab));
 
           // 8.97) P1.9 浮层七准则探针：overlay 不推挤 / 全屏迁移 / 闲时半透明 / 输入聚焦抑制 / 上下文跟随
@@ -965,11 +1055,18 @@ async function main() {
         }
       } catch { /* 非 page session */ }
     }
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, bvid: BVID, url: PAGE_URL, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, p19: p19Probe, loginProbe, sessionProbe, lines }, null, 1));
+    // 真实 LLM 补验指标（报告 10 数据源）+ 出网审计汇总 + route-changed 原始计数（验收记录 §5.4 观察项）
+    const llmMetrics = lines.filter((l) => l.text.includes('[doubao] llm ')).map((l) => l.text);
+    const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
+    const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
+    log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
     const has = (s) => lines.some((l) => l.text.includes(s));
+    // 分段注记文本断言：mock 模式断言模拟文案；真实模式只断言有实质内容（模型输出不预设）
+    const segTextOk = (t) => (REAL ? String(t ?? '').trim().length > 10 : String(t ?? '').includes('本段为分段解读的模拟纯文本输出'));
     const verdict = {
       contentInjected: has('content script injected'),
       bvid: has(`bvid = ${BVID}`),
@@ -978,7 +1075,7 @@ async function main() {
       onboardingValidationRed: onboardingProbe?.red?.redCount === 3 && onboardingProbe?.red?.redInputs === 3 && onboardingProbe?.noCfg?.llm === false && onboardingProbe?.noCfg?.onboarded === false,
       onboardingTestConnectionOk: String(onboardingProbe?.testStatus ?? '').includes('连接成功'),
       onboardingSaveActivates:
-        sessionProbe?.pointer?.modelId === 'mock-seed-lite' &&
+        sessionProbe?.pointer?.modelId === llmCfg.modelId &&
         sessionProbe?.pointer?.onboarded === true &&
         sessionProbe?.pointer?.pointer?.state === 'ACTIVE' &&
         sessionProbe?.dom?.modalClosed === true &&
@@ -1017,11 +1114,11 @@ async function main() {
       // P1.11 F13：内联流式→done 文本 / 收起再展开缓存零请求（offscreen seg job 数不增）/ 按钮点击不 seek / DB 注记 done
       segmentNoteStreamDone:
         seekProbe?.segment?.segNote?.hidden === false &&
-        String(seekProbe?.segment?.segNote?.text ?? '').includes('本段为分段解读的模拟纯文本输出'),
+        segTextOk(seekProbe?.segment?.segNote?.text),
       segmentCacheZeroRequest:
         seekProbe?.segment?.segCollapsed?.hidden === true &&
         seekProbe?.segment?.segReopened?.hidden === false &&
-        String(seekProbe?.segment?.segReopened?.text ?? '').includes('本段为分段解读的模拟纯文本输出') &&
+        segTextOk(seekProbe?.segment?.segReopened?.text) &&
         seekProbe?.segment?.offscreenSegBefore === 1 &&
         seekProbe?.segment?.offscreenSegAfter === 1,
       segmentSeekIndependent:
@@ -1039,17 +1136,21 @@ async function main() {
         Math.abs((seekProbe?.trAfter?.t ?? -99) - seekProbe.tr.sec) <= 3,
       seekCrossTabFocus:
         seekProbe?.crossTab?.li60?.clicked === true &&
-        Math.abs((seekProbe?.crossTab?.tab1After?.t ?? -99) - 60) <= 3 &&
+        Math.abs((seekProbe?.crossTab?.tab1After?.t ?? -99) - (seekProbe?.crossTab?.li60?.sec ?? NaN)) <= 3 &&
         seekProbe?.crossTab?.tab1After?.vis === 'visible' &&
         seekProbe?.crossTab?.tab2After?.vis === 'hidden',
       seekNewTab:
-        String(seekProbe?.newTab?.createdUrl ?? '').includes('t=120') &&
+        seekProbe?.newTab?.click?.clicked === true &&
+        String(seekProbe?.newTab?.createdUrl ?? '').includes(`t=${seekProbe?.newTab?.click?.sec ?? '\u2205'}`) &&
         (seekProbe?.newTab?.tab2Toast ?? []).some((x) => x.includes('新标签页')),
       // P1.9 七准则：贴边收起（合成+真鼠标拖拽均吸右边）/ overlay 不推挤 / 全屏迁移 / 闲时半透明+唤醒 / 输入聚焦抑制 / 上下文跟随
       snapEdgeDrag: mascotProbe?.snapEdgeDrag === true,
+      // overlay 不推挤：只比布局承重指标（clientWidth+播放器 x）——body.scrollWidth 会被 B 站
+      // 页面自身的弹幕/懒加载内容瞬时改变（mock4 实测 1080→1100 而 bw/px 纹丝不动），不是浮层信号
       overlayNoPush:
         !!p19Probe?.overlayNoPush &&
-        JSON.stringify(p19Probe.overlayNoPush.mClosed) === JSON.stringify(p19Probe.overlayNoPush.mOpen),
+        p19Probe.overlayNoPush.mClosed?.bw === p19Probe.overlayNoPush.mOpen?.bw &&
+        p19Probe.overlayNoPush.mClosed?.px === p19Probe.overlayNoPush.mOpen?.px,
       fullscreenMigration:
         p19Probe?.fullscreen?.fsReq?.ok === true &&
         p19Probe?.fullscreen?.fsState?.fs === true &&
@@ -1065,6 +1166,22 @@ async function main() {
         String(p19Probe?.follow?.firstKey ?? '').startsWith('BV1DUnB61ErU:') &&
         p19Probe?.follow?.open === true &&
         (p19Probe?.follow?.count ?? 0) >= 2,
+      // F12/3.5 前移切片：扩展自身（SW+offscreen）出网 host 全在白名单（B 站系 + LLM 端点）
+      networkWhitelist: netUrls.length > 0 && netUrls.every((u) => {
+        try {
+          const h = new URL(u).hostname;
+          return h === '127.0.0.1' ||
+            /(^|\.)(bilibili\.com|hdslb\.com|bilivideo\.com|bilivideo\.cn)$/.test(h) ||
+            h === new URL(llmCfg.baseUrl).hostname;
+        } catch { return false; }
+      }),
+      // 2.7a【重新生成】：REGENERATE 强制重跑 → 第 2 次摘要 job → done 覆盖（createdAt 更新）+ 分段注记清空
+      regenerateRoundtrip:
+        regenProbe?.regenDone === true &&
+        regenProbe?.sumAfter === regenProbe?.sumBefore + 1 &&
+        (regenProbe?.after?.createdAt ?? 0) > (regenProbe?.before?.createdAt ?? 0) &&
+        regenProbe?.after?.status === 'done' &&
+        regenProbe?.after?.notes === 0,
       noExplicitFail: !lines.slice(cookieLineIdx).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
@@ -1080,7 +1197,7 @@ async function main() {
     try { chrome.kill('SIGTERM'); } catch { /* noop */ }
     await sleep(1200);
     try { chrome.kill('SIGKILL'); } catch { /* noop */ }
-    try { mock.kill('SIGTERM'); } catch { /* noop */ }
+    try { mock?.kill('SIGTERM'); } catch { /* noop */ }
     fs.rmSync(profile, { recursive: true, force: true });
     log('cleanup done (temp profile removed:', !fs.existsSync(profile), ')');
   }

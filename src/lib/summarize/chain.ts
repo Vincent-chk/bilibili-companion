@@ -31,6 +31,8 @@ export interface SummarizeChainDeps {
   llm: LlmConfig;
   persona?: string;
   fetchImpl?: typeof fetch;
+  /** 整流超时（SW resolveConfig → offscreen 透传；思考型真实模型需 > 默认 60s）。 */
+  timeoutMs?: number;
   /** 流式增量（offscreen 转发面板打字机；P1.5 接线）。 */
   onDelta?: (text: string) => void;
 }
@@ -107,6 +109,7 @@ export async function runSummarizeJob(
   deps: SummarizeChainDeps,
   job: { videoKey: string },
   ctx: ChainCtx,
+  opts: { force?: boolean } = {},
 ): Promise<JobOutcome> {
   const { db, bili, llm } = deps;
   const { bvid, cid } = parseVideoKey(job.videoKey);
@@ -114,8 +117,8 @@ export async function runSummarizeJob(
   const now = Date.now();
   const persona = deps.persona ?? 'spicy';
 
-  // F5 幂等：done 摘要直接完成，零 LLM/字幕请求（换模型=换 key 自然重跑）
-  if ((await db.summaries.get(skey))?.status === 'done') return { result: 'done' };
+  // F5 幂等：done 摘要直接完成，零 LLM/字幕请求（换模型=换 key 自然重跑）；force=2.7a 重新生成绕过
+  if (!opts.force && (await db.summaries.get(skey))?.status === 'done') return { result: 'done' };
 
   const baseSummary: Omit<SummaryRow, 'status'> = {
     key: skey,
@@ -173,6 +176,7 @@ export async function runSummarizeJob(
     const llmOpts = {
       fetchImpl: deps.fetchImpl,
       persona,
+      ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}),
       ...(deps.onDelta
         ? { onDelta: (ev: StreamEvent) => { if (ev.type === 'delta') deps.onDelta?.(ev.text); } }
         : {}),
@@ -183,6 +187,10 @@ export async function runSummarizeJob(
     } else {
       outcome = await mapReduceSummarize(llm, meta, transcript.cues, llmOpts);
     }
+    // 真实 LLM 补验指标（offscreen console → E2E console.json 采集；ttft=首 content token，不含 reasoning）
+    console.log(
+      `[doubao] llm summarize ttft=${outcome.ttftMs ?? -1}ms attempts=${outcome.attempts} degraded=${outcome.degraded} usage=${JSON.stringify(outcome.usage ?? null)}`,
+    );
     await ctx.update({ stage: 'llm_reduce', progress: 90 });
 
     if (outcome.degraded || !outcome.summaryResult) {
@@ -208,7 +216,11 @@ export async function runSummarizeJob(
     return { result: 'done' };
   } catch (e) {
     const error = mapLlmError(e);
-    await db.summaries.put({ ...baseSummary, status: 'failed', error });
+    // 2.7a：force 重生成失败不覆盖旧 done 摘要（F11 友好：面板保留旧内容，错误只落 job 行/徽章）；
+    // 成功路径的 put 为整行替换——segmentNotes 不在 baseSummary 中，分段缓存随重生成自然失效清空
+    if (!(opts.force && (await db.summaries.get(skey))?.status === 'done')) {
+      await db.summaries.put({ ...baseSummary, status: 'failed', error });
+    }
     return { result: 'failed', error };
   }
 }

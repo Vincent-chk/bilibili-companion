@@ -129,8 +129,9 @@ export class Pipeline {
     } else if (fresh.retries < this.#maxRetries) {
       await this.#set({ ...fresh, status: 'pending', retries: fresh.retries + 1, updatedAt: this.#now() });
     } else {
-      await this.#set({ ...fresh, status: 'failed', updatedAt: this.#now() });
-      // 失败详情由执行体写入 summaries.error（任务 1.4）；此处经 onTransition 透出供日志/广播
+      // error 随终态落 job 行：摘要失败的权威源仍是 summaries.error（任务 1.4），
+      // 但分段解读 NO_OUTLINE/NO_VIDEO 早退等执行体不写注记的路径，终态广播靠此兜底不丢错误码
+      await this.#set({ ...fresh, status: 'failed', error: outcome.error, updatedAt: this.#now() });
     }
     return true;
   }

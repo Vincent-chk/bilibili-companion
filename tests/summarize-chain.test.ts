@@ -2,6 +2,8 @@
 // 缓存幂等（摘要命中零请求 / 字幕命中免抓取）、无轨→need_asr、LLM 错误映射、
 // 长字幕走 Map-Reduce、videos 行兜底、进度 stage 顺序。
 import { afterEach, describe, expect, it } from 'vitest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { indexedDB, IDBKeyRange } from 'fake-indexeddb';
 import { startMockLlm, validSummaryJson, type MockLlmServer } from './helpers/mock-llm';
 import { runSummarizeJob, parseVideoKey, mapLlmError, type BiliApi } from '../src/lib/summarize/chain';
@@ -290,5 +292,116 @@ describe('runSummarizeJob 全链', () => {
     if (outcome.result === 'failed') expect(outcome.error.code).toBe('NO_CONTENT');
     expect(server.calls).toHaveLength(0); // 零 LLM
     await db.delete();
+  });
+});
+
+describe('timeoutMs 透传（POC_LLM_TIMEOUT_MS → resolveConfig → offscreen → chain）', () => {
+  it('deps.timeoutMs=30 + 服务器不响应 → failed(LLM_NETWORK 超时)，不再吃 60s 缺省', async () => {
+    const srv = http.createServer(() => {
+      /* 收下请求但永不响应 */
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    try {
+      const db = freshDb();
+      await db.videos.put({
+        key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: '测试视频',
+        cover: 'c', owner: 'up', duration: 600, page: 1, fetchedAt: Date.now(),
+      });
+      const { ctx } = ctxLog();
+      const outcome = await runSummarizeJob(
+        { db, bili: fakeBili({}), llm: { baseUrl: url, model: 'm1', apiKey: 'k' }, timeoutMs: 30 },
+        { videoKey: VIDEO_KEY },
+        ctx,
+      );
+      expect(outcome.result).toBe('failed');
+      if (outcome.result === 'failed') {
+        expect(outcome.error.code).toBe('LLM_NETWORK');
+        expect(outcome.error.msg).toContain('超时');
+      }
+      await db.delete();
+    } finally {
+      srv.close();
+    }
+  });
+});
+
+describe('2.7a force 重新生成（REGENERATE 执行体语义）', () => {
+  const seedDone = async (db: CompanionDB) => {
+    await db.videos.put({
+      key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: '测试视频',
+      cover: 'c', owner: 'up', duration: 600, page: 1, fetchedAt: Date.now(),
+    });
+    await db.summaries.put({
+      key: summaryKey(VIDEO_KEY, 'm1'), videoKey: VIDEO_KEY, source: 'ai_sub',
+      summary: '旧摘要', outline: [{ time: 0, text: '旧大纲' }], evaluation: '旧点评', rating: 3,
+      modelId: 'm1', persona: 'spicy', status: 'done', createdAt: 1,
+      segmentNotes: { 0: { text: '旧注记', status: 'done', createdAt: 1 } },
+    });
+  };
+
+  it('force 绕过 done 缓存：整行覆盖（createdAt 更新、summary 换新、segmentNotes 随之清空）', async () => {
+    const db = freshDb();
+    await seedDone(db);
+    const server = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    servers.push(server);
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob(
+      { db, bili: fakeBili({}), llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } },
+      { videoKey: VIDEO_KEY },
+      ctx,
+      { force: true },
+    );
+    expect(outcome.result).toBe('done');
+    const row = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
+    expect(row?.status).toBe('done');
+    expect(row?.summary).not.toBe('旧摘要');
+    expect(row?.createdAt).toBeGreaterThan(1);
+    expect(row?.segmentNotes).toBeUndefined(); // 分段缓存随重生成失效（2.7a 策略）
+    expect(server.calls).toHaveLength(1);
+    await db.delete();
+  });
+
+  it('无 force 时 done 缓存命中零请求（F5 幂等回归）', async () => {
+    const db = freshDb();
+    await seedDone(db);
+    const server = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    servers.push(server);
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob(
+      { db, bili: fakeBili({}), llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } },
+      { videoKey: VIDEO_KEY },
+      ctx,
+    );
+    expect(outcome.result).toBe('done');
+    expect(server.calls).toHaveLength(0);
+    await db.delete();
+  });
+
+  it('force 失败不覆盖旧 done 行：旧摘要/分段注记完好，错误只在 outcome（F11 友好）', async () => {
+    const db = freshDb();
+    await seedDone(db);
+    const srv = http.createServer(() => {
+      /* 收下请求但永不响应 */
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    try {
+      const { ctx } = ctxLog();
+      const outcome = await runSummarizeJob(
+        { db, bili: fakeBili({}), llm: { baseUrl: url, model: 'm1', apiKey: 'k' }, timeoutMs: 30 },
+        { videoKey: VIDEO_KEY },
+        ctx,
+        { force: true },
+      );
+      expect(outcome.result).toBe('failed');
+      const row = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
+      expect(row?.status).toBe('done');
+      expect(row?.summary).toBe('旧摘要');
+      expect(row?.segmentNotes?.[0]?.text).toBe('旧注记');
+      await db.delete();
+    } finally {
+      srv.close();
+    }
   });
 });

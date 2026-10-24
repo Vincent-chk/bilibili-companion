@@ -17,6 +17,8 @@ interface RunJobMsg {
   job?: { id: string; videoKey: string; type?: string; segIndex?: number };
   llm?: LlmConfig;
   persona?: string;
+  /** 整流超时（SW resolveConfig 解析，思考型真实模型 > 默认 60s）。 */
+  timeoutMs?: number;
 }
 
 /** 进度回传节流：token 级 delta 高频，200ms 合并一次防消息风暴（stage/progress/deltaText 共用）。
@@ -58,7 +60,7 @@ function makeCtx(jobId: string, segIndex?: number) {
 browser.runtime.onMessage.addListener((msg: unknown) => {
   const m = msg as RunJobMsg;
   if (m?.type !== 'OFFSCREEN_RUN_JOB' || !m.job?.videoKey || !m.llm) return undefined; // 非本品消息交给其它 listener
-  return handleRun(m.job, m.llm, m.persona).catch((e: unknown) => ({
+  return handleRun(m.job, m.llm, m.persona, m.timeoutMs).catch((e: unknown) => ({
     result: 'failed' as const,
     error: { code: 'CHAIN_ERROR', msg: String(e).slice(0, 200) },
   }));
@@ -68,6 +70,7 @@ async function handleRun(
   job: { id: string; videoKey: string; type?: string; segIndex?: number },
   llm: LlmConfig,
   persona?: string,
+  timeoutMs?: number,
 ) {
   console.log(
     `[doubao] offscreen run job=${job.id} videoKey=${job.videoKey}${job.type === 'SEGMENT_ANALYZE' ? ` seg=${job.segIndex}` : ''}`,
@@ -81,14 +84,15 @@ async function handleRun(
             error: { code: 'BAD_JOB', msg: 'SEGMENT_ANALYZE 缺 segIndex（审查 P2-9：不得静默解读第 0 段写脏缓存）' },
           }
         : await runSegmentJob(
-            { db, bili: new BiliClient(), llm, onDelta: (t) => ctx.pushDelta(t) },
+            { db, bili: new BiliClient(), llm, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
             { videoKey: job.videoKey, segIndex: job.segIndex },
             ctx,
           )
       : await runSummarizeJob(
-          { db, bili: new BiliClient(), llm, persona, onDelta: (t) => ctx.pushDelta(t) },
+          { db, bili: new BiliClient(), llm, persona, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
           job,
           ctx,
+          { force: job.type === 'REGENERATE' }, // 2.7a：重新生成绕过 done 缓存，成功整行覆盖
         );
   console.log(`[doubao] offscreen job=${job.id} → ${outcome.result}`);
   return outcome;

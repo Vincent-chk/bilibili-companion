@@ -102,6 +102,7 @@ export interface JobRow {
   stage?: JobStage;
   progress: number; // 0–100
   retries: number; // ≤1 自动重试
+  error?: { code: string; msg: string }; // 失败原因（failed 终态写入；摘要以 summaries.error 为权威，分段早退等执行体未写注记的路径由终态广播读此兜底）
   createdAt: number;
   updatedAt: number;
 }

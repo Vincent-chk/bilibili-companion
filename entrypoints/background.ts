@@ -31,6 +31,8 @@ const db = new CompanionDB();
 
 interface UiPort {
   postMessage: (msg: unknown) => void;
+  /** 连接方标签页 id（onConnect 记录）：seek focus-tab 的活端口过滤，孤儿标签落 new-tab 兜底。 */
+  tabId?: number;
 }
 const uiPorts = new Set<UiPort>();
 
@@ -127,7 +129,7 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
   try {
     await ensureOffscreen();
     // offscreen 文档读不了 storage（API 受限）：LLM 配置与 persona 在 SW 解析后随 job 传入
-    const { config, error: cfgErr } = resolveConfig(await readStoredLlmConfig(browserKv));
+    const { config, error: cfgErr, timeoutMs } = resolveConfig(await readStoredLlmConfig(browserKv));
     if (!config) return { result: 'failed', error: { code: 'NO_LLM_CONFIG', msg: cfgErr ?? '未配置 LLM' } };
     const persona = ((await browser.storage.local.get('settings'))['settings'] as { persona?: string } | undefined)
       ?.persona;
@@ -137,6 +139,7 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
         job: { id: job.id, videoKey: job.videoKey, type: job.type, segIndex: job.segIndex },
         llm: config,
         persona,
+        timeoutMs,
       }),
       new Promise<never>((_, rej) => {
         watchdog = setTimeout(() => rej(new Error('offscreen 执行超时(600s)')), 600_000);
@@ -194,7 +197,7 @@ async function broadcastSegmentTerminal(j: JobRow): Promise<void> {
       videoKey: j.videoKey,
       segIndex: j.segIndex,
       text: note?.text ?? '',
-      error: note?.error,
+      error: note?.error ?? j.error, // 执行体未写注记（NO_OUTLINE/NO_VIDEO 早退）时回退 job 行，终态广播不丢错误码
       truncated: note?.truncated,
     });
   } catch {
@@ -233,6 +236,7 @@ export default defineBackground(() => {
   browser.runtime.onConnect.addListener((port) => {
     if ((port as { name?: string }).name !== 'doubao-port') return;
     const p = port as unknown as UiPort;
+    p.tabId = (port as unknown as { sender?: { tab?: { id?: number } } }).sender?.tab?.id;
     uiPorts.add(p);
     (port as unknown as { onDisconnect: { addListener: (cb: () => void) => void } }).onDisconnect.addListener(() =>
       uiPorts.delete(p),
@@ -277,6 +281,8 @@ export default defineBackground(() => {
         return handleListQuery();
       case 'SUMMARY_OPEN':
         return handleSummaryOpen(m);
+      case 'REGENERATE':
+        return handleRegenerate(m);
       case 'SEEK_TO':
         return handleSeekTo(m);
       case 'SEGMENT_NOTE_OPEN':
@@ -533,6 +539,23 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   return { ok: true, item: { visit, video, summary, job }, transcript };
 }
 
+/**
+ * 2.7a REGENERATE（F7/F8【重新生成】）：用户从详情页发起强制重跑。
+ * 成功整行覆盖旧摘要（segmentNotes 随之清空=分段缓存失效策略，chain force 语义）；
+ * 失败不覆盖旧 done 行（旧摘要保留，错误只落 job 行）。同视频任何任务在途 → busy 拒绝。
+ * 人设切换后的联动询问属 2.5 设置页（2.7b）。
+ */
+async function handleRegenerate(m: InMsg): Promise<Record<string, unknown>> {
+  const { videoKey } = m;
+  if (!videoKey) return { ok: false, error: 'REGENERATE 缺 videoKey' };
+  const pointer = await getSessionPointer(browserKv);
+  if (!pointer) return { ok: false, error: 'no-session' };
+  if (await activeJob(videoKey)) return { ok: false, error: 'busy' };
+  await pipeline.enqueue({ type: 'REGENERATE', videoKey, sessionId: pointer.sessionId });
+  void pipeline.drain();
+  return { ok: true, started: true };
+}
+
 // ---- P1.8 · 大纲 seek（SEEK_TO） ------------------------------------------------
 
 /**
@@ -555,15 +578,18 @@ async function handleSeekTo(m: InMsg): Promise<Record<string, unknown>> {
   }
   const page = (await db.videos.get(videoKey))?.page ?? 1;
   const tabs = (await browser.tabs.query({})) as SeekTabCandidate[];
-  const tab = pickSeekTab(tabs, bvid, page);
+  // 活端口过滤：扩展 reload 后旧标签 content 成孤儿（URL 仍匹配但广播进空端口、聚焦成功却不跳转，
+  // 原审查 P2-1 记账项）——过滤后落 new-tab 分支 t= 直达，不再静默失败。
+  // 边界：目标页刚加载完尚未连 Port / SW 刚重启端口未回连时同样落 new-tab（多开一页但功能正确）。
+  const liveTabIds = new Set<number>();
+  for (const p of uiPorts) if (p.tabId !== undefined) liveTabIds.add(p.tabId);
+  const tab = pickSeekTab(tabs, bvid, page, liveTabIds);
   if (tab?.id !== undefined) {
     if (tab.windowId !== undefined) await browser.windows.update(tab.windowId, { focused: true });
     await browser.tabs.update(tab.id, { active: true });
     // 目标页自己收广播执行 seek（发起页 currentVideoKey 不匹配会忽略）；page 随广播带上——
     // 各标签页的 URL 兜底匹配须按 bvid+分P 判定（审查 P1-1：仅比 bvid 会让同 bvid 异 P 页误 seek）
     broadcastToUi({ type: 'SEEK_TO', videoKey, time: Math.max(0, Math.floor(time)), page });
-    // shortcut: 扩展 reload 后旧标签 content 成孤儿（URL 仍匹配）→ 聚焦成功但广播进空端口、
-    // 发起页按设计不 toast，用户见切页却无跳转；完整修需 port↔tab 映射+ack，PoC 阶段不值（审查 P2-1）
     console.log(`[doubao] seek focus-tab: ${videoKey} → t=${Math.floor(time)}s`);
     return { ok: true, mode: 'focus-tab' };
   }
@@ -721,7 +747,8 @@ const maskBody = (raw: string, apiKey: string): string =>
     .slice(0, 120);
 
 /**
- * TEST_CONNECTION：最小 chat/completions 探活（max_tokens=1、stream:false、15s 超时）。
+ * TEST_CONNECTION：最小 chat/completions 探活（max_tokens=1、stream:false、35s 超时——
+ * 思考型模型对 ping 也会先长时间 reasoning，实测 ~14s，15s 必边际超时；35s 仍供应商中立）。
  * 先按 origin 尽力申请权限（成功/失败均继续探测——CORS 端点无权限也能通）。
  */
 async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> {
@@ -734,7 +761,7 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   if (!v.ok) return { ok: false, msg: v.error ?? 'Base URL 不合法' };
   await ensureOriginPermission(`${v.origin}/*`);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('timeout'), 15_000);
+  const timer = setTimeout(() => controller.abort('timeout'), 35_000);
   try {
     const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
@@ -751,7 +778,7 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   } catch (e) {
     return {
       ok: false,
-      msg: controller.signal.aborted ? '连接超时（>15s）' : `无法连接端点：${String(e).slice(0, 80)}`,
+      msg: controller.signal.aborted ? '连接超时（>35s）' : `无法连接端点：${String(e).slice(0, 80)}`,
     };
   } finally {
     clearTimeout(timer);
