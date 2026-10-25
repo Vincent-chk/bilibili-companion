@@ -1532,6 +1532,7 @@ async function main() {
             llmKey: sr.querySelector('#sec-llm input[data-k="apiKey"]')?.value ?? '',
             asrKey: sr.querySelector('#sec-asr input[data-k="apiKey"]')?.value ?? '',
           })`);
+          await shotNamed(probeSid, 'visual-settings.png'); // 视觉验收：设置页全貌（模型三区/滑杆/人设/开关/危险区）——审查时误挂清除后，现移回设置视图打开时
           const maskOk = (v) => v === '****' + String(llmCfg.apiKey).slice(-4);
           await pclick('[data-test="sec-llm"]');
           let testOk = false;
@@ -1720,7 +1721,7 @@ async function main() {
             listHidden: sr.getElementById('view-list')?.classList.contains('hidden'),
             settingsHidden: sr.getElementById('view-settings')?.classList.contains('hidden'),
             status: sr.getElementById('p-status')?.textContent ?? '' })`);
-          await shotNamed(probeSid, 'visual-settings.png');
+          await shotNamed(probeSid, 'visual-post-wipe.png'); // 视觉验收：清除后容器回收（未激活空态，审查 P1-2 回归留证）
 
           const stDomObj = stDom ?? {};
           settingsProbe = {
@@ -1813,6 +1814,8 @@ async function main() {
           const failDetail = await srOf(`return JSON.stringify({
             err: sr.getElementById('d-summary')?.textContent ?? '',
             goSettings: !!sr.getElementById('d-gosettings') })`);
+          await srOf(`sr.getElementById('d-gosettings')?.scrollIntoView({ block: 'center' })`); // 截图须含失败卡与按钮（面板 .p-body 独立滚动，视口 413px 会截断）
+          await sleep(400);
           await shotNamed(probeSid, 'visual-key-invalid.png'); // 视觉验收：解析失败详情+【去设置】入口
           let keyBubble = '';
           for (let i = 0; i < 8; i++) {
