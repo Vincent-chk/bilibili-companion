@@ -98,6 +98,7 @@ export interface JobRow {
   videoKey: string;
   sessionId: string;
   segIndex?: number; // SEGMENT_ANALYZE 的段下标（幂等键一部分，F13）
+  prio?: number; // 取任务优先级：缺省/0=用户或观看触发；1=分段预取（后台静默）。同通道内 (prio, createdAt) 排序
   status: JobStatus;
   stage?: JobStage;
   progress: number; // 0–100

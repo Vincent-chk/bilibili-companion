@@ -232,8 +232,18 @@ export class MascotController {
     b.innerHTML = '要我陪你一起看吗？<br><button class="bubble-btn" id="btn-start">▶ 开始陪看</button>';
     b.querySelector('#btn-start')?.addEventListener('click', (e) => {
       e.stopPropagation();
-      this.deps.onStartClick();
+      this.#startSession();
     });
+  }
+
+  /** 真人测试反馈：点「开始陪看」后 CTA 气泡必须当场收起——
+   *  原实现依赖 ACTIVE 广播后的 say() 覆盖，而 say() 可被气泡开关/输入聚焦抑制、
+   *  激活也可能走 onboarding 门槛或失败（无广播），CTA 便永久滞留且无可关途径。
+   *  激活失败回 INACTIVE 后 hover 可再弹（解除 'start' 限频，用户主动点击不受 10min 惩罚）。 */
+  #startSession(): void {
+    this.hideBubble();
+    this.#lastKindAt.delete('start');
+    this.deps.onStartClick();
   }
 
   hideBubble(): void {
@@ -333,6 +343,6 @@ export class MascotController {
    *  P2.1：EXPIRED_PENDING_CONFIRM 也走面板——数据处置（清除确认弹窗）在面板里，点身体必须可达。 */
   #onClick(): void {
     if (this.#session !== 'INACTIVE') this.deps.onBodyClickActive();
-    else this.deps.onStartClick();
+    else this.#startSession();
   }
 }

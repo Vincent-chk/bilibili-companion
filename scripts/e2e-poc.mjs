@@ -659,7 +659,12 @@ async function main() {
           log('P1.8 同页 seek 探针:', JSON.stringify(seekProbe));
 
           // 8.66) P1.11 F13 分段解读：【AI 解读】内联流式→done；收起再展开=缓存零请求；按钮点击不 seek
+          //       F13 提速：摘要 done 后分段已静默预取（offscreenSegPreClick≥1 为证）；
+          //       零请求不变量按 seg=1 单段计数（其他段的预取可能同时在跑，总数口径不再适用）
           await pageEval(`(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (v) v.pause(); })()`);
+          const segJobLinesAll = () => lines.filter((l) => / seg=\d+$/.test(l.text.trim())).length;
+          const segJobLinesOf = (n) => lines.filter((l) => l.text.trim().endsWith(`seg=${n}`)).length;
+          const offscreenSegPreClick = segJobLinesAll();
           const segBefore = await pageEval(`(() => {
             const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
             const sr = document.getElementById('doubao-ui-root').shadowRoot;
@@ -680,21 +685,21 @@ async function main() {
             const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video');
             return JSON.stringify({ t: v ? +v.currentTime.toFixed(1) : -1 });
           })()`);
-          const offscreenSegBefore = lines.filter((l) => l.text.includes('offscreen run job') && l.text.includes('seg=')).length;
+          const offscreenSegBefore = segJobLinesOf(1);
           await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.seg-btn[data-seg="1"]')?.click()`);
           await sleep(400);
           const segCollapsed = await pageEval(`(() => { const n = document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]'); return JSON.stringify({ hidden: n?.classList.contains('hidden') ?? true }); })()`);
           await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('.seg-btn[data-seg="1"]')?.click()`);
           await sleep(800);
           const segReopened = await pageEval(`(() => { const n = document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]'); return JSON.stringify({ hidden: n?.classList.contains('hidden') ?? true, text: n?.textContent ?? '' }); })()`);
-          const offscreenSegAfter = lines.filter((l) => l.text.includes('offscreen run job') && l.text.includes('seg=')).length;
+          const offscreenSegAfter = segJobLinesOf(1);
           const segDb = await swEval(`(async () => {
             const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
             const rows = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
             const row = rows.find((x) => String(x.key || '').includes('${BVID}'));
             return JSON.stringify(row?.segmentNotes ?? null);
           })()`);
-          seekProbe = { ...seekProbe, segment: { segBefore, segNote, segAfter, segCollapsed, segReopened, offscreenSegBefore, offscreenSegAfter, segDb } };
+          seekProbe = { ...seekProbe, segment: { segBefore, segNote, segAfter, segCollapsed, segReopened, offscreenSegPreClick, offscreenSegBefore, offscreenSegAfter, segDb } };
           log('P1.11 分段解读探针:', JSON.stringify(seekProbe.segment));
           // 视觉验收：分段解读内联注记卡展开态（S10）——注记卡滚到视口中央后截图
           await pageEval(`document.getElementById('doubao-ui-root').shadowRoot.querySelector('[data-segnote="1"]')?.scrollIntoView({ block: 'center' })`);
@@ -707,7 +712,11 @@ async function main() {
             const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
             const rows = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
             const row = rows.find((x) => String(x.key || '').includes('${BVID}'));
-            return JSON.stringify({ createdAt: row?.createdAt ?? 0, status: row?.status ?? '', notes: row?.segmentNotes ? Object.keys(row.segmentNotes).length : 0 });
+            const notes = row?.segmentNotes ?? {};
+            const ks = Object.keys(notes);
+            // F13 提速：regen 整行替换清空旧注记后，预取可能立即重灌新注记——判定改为「无早于新行的陈旧注记」
+            const minCreated = ks.length ? Math.min(...ks.map((k) => notes[k]?.createdAt ?? 0)) : 0;
+            return JSON.stringify({ createdAt: row?.createdAt ?? 0, status: row?.status ?? '', notes: ks.length, noteMinCreated: minCreated });
           })()`);
           const regenBefore = await regenDb();
           const regenSumBefore = lines.filter((l) => l.text.includes('offscreen run job') && !l.text.includes('seg=')).length;
@@ -793,16 +802,25 @@ async function main() {
           expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("btn-end")?.click()',
           returnByValue: true,
         }, probeSid);
-        await sleep(1200);
-        const endProbe = {
-          pointer: await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`),
-          dom: await pageEval(`(() => {
+        // 轮询等 GRACE 落盘（固定 sleep 在 SW 繁忙时会抢在写入前读到 ACTIVE——F13 双通道后 SW 更忙，实测 flake）
+        let endPointer = null;
+        for (let i = 0; i < 20 && endPointer?.state !== 'GRACE'; i++) {
+          await sleep(300);
+          endPointer = await swEval(`(async () => JSON.stringify((await chrome.storage.local.get('sessionPointer')).sessionPointer ?? null))()`);
+        }
+        // 徽章/按钮随面板异步 refresh 重排——轮询至 resumeBtn 就位（上限 ~3s）
+        let endDom = null;
+        for (let i = 0; i < 10; i++) {
+          await sleep(300);
+          endDom = await pageEval(`(() => {
             const sr = document.getElementById('doubao-ui-root')?.shadowRoot;
             if (!sr) return null;
             return JSON.stringify({ img: sr.getElementById('mascot-img')?.getAttribute('src') ?? '',
               resumeBtn: !!sr.getElementById('btn-resume') });
-          })()`),
-        };
+          })()`);
+          if (endDom?.resumeBtn) break;
+        }
+        const endProbe = { pointer: endPointer, dom: endDom };
         log('P1.6 结束陪看探针:', JSON.stringify(endProbe));
 
         // 8.8) 审查 P1 回归探针：
@@ -810,6 +828,7 @@ async function main() {
         //  b) 真鼠标拖拽（CDP Input，产生原生 pointer+click）不得双触发点击（面板保持关闭）
         let bubbleSurvivesResume = null;
         if (endProbe?.pointer?.state === 'GRACE') {
+          await sleep(1000); // 轮询版 endProbe 更快收敛——补回原节奏（resume≈T_end+2s），观察窗须落在旧 hide 计时（+4.2s）后、新气泡 hide（T_resume+4.2s）前
           await cdp('Runtime.evaluate', {
             expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("btn-resume")?.click()',
             returnByValue: true,
@@ -1320,6 +1339,10 @@ async function main() {
             },
           };
           log('P2.2 判定项:', JSON.stringify(wipeProbe));
+          // 封堵 tick sweep 竞态（git log 同款教训族）：wipe 后 P2.3 重启会话时，若探针页 BVID 仍在播放，
+          // 累计 watchedSeconds 首 tick 即过阈 → sweep 合法重跑摘要并置 visit.triggered=1，
+          // 破坏 d) 阈值滑杆前提（5s 扫幂等失效）。P2.2 收口统一暂停，d) 导航后自行 playMuted
+          await pageEval(`(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (v) v.pause(); return 'paused'; })()`).catch(() => {});
         }
 
         // 8.995) P2.3 F6 ASR 确认流（mock/REAL 混合均执行：REAL=真实音频+mock 转写+真实 LLM）：无字幕视频 → 触发 → need_asr 橙标
@@ -1373,6 +1396,9 @@ async function main() {
             await sleep(500);
             nosubBadge = await panelJson(`const b = first?.querySelector('.badge'); const ret = { badge: b?.textContent ?? '', key: first?.getAttribute('data-video-key') ?? '' };`);
           }
+          // 反自动播劫持封堵（git log 同款教训：93s 短视频在 ~50s 确认输入序列内 ended →
+          // B 站自动播推荐换页，后续卡片/徽章全读错视频）：need_confirm 已达，此后零观看依赖 → 暂停
+          await pageEval(`(() => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (v) v.pause(); return 'paused'; })()`).catch(() => {});
           await shotNamed(probeSid, 'visual-asr-need-confirm.png');
 
           // b) 点条目 → 详情 ASR 确认卡（文案逐字 F6-①）+【调用 ASR 解析】【暂不】
@@ -1513,7 +1539,9 @@ async function main() {
             const db = await new Promise((res, rej) => { const r = indexedDB.open('doubao-companion'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
             const js = await new Promise((res) => { const q = db.transaction('jobs','readonly').objectStore('jobs').getAll(); q.onsuccess = () => res(q.result); });
             const sm = await new Promise((res) => { const q = db.transaction('summaries','readonly').objectStore('summaries').getAll(); q.onsuccess = () => res(q.result); });
-            return JSON.stringify({ jobs: js.filter((j) => String(j.videoKey).startsWith(${JSON.stringify(vk + ':')})).length,
+            return JSON.stringify({ jobs: js.filter((j) => String(j.videoKey).startsWith(${JSON.stringify(vk + ':')}) && j.type !== 'SEGMENT_ANALYZE').length,
+              // F13 预取：SEGMENT_ANALYZE 行不计入——pause/threshold 探针语义=「零摘要类生成」，
+              // 预取行是此前摘要 done 的合法留存产物，与本轮采集/触发无关
               sum: sm.filter((x) => String(x.videoKey).startsWith(${JSON.stringify(vk + ':')})).sort((a, b) => a.createdAt - b.createdAt).map((s) => ({ status: s.status, persona: s.persona, createdAt: s.createdAt })) });
           })()`);
           const visitsFor = (vk) => swEval(`(async () => {
@@ -1584,12 +1612,17 @@ async function main() {
           const viewReqBefore = netUrls.filter((u) => u.includes('/x/web-interface/view')).length;
           await cdp('Page.navigate', { url: `${PAGE_URL}?p2=paused` }, probeSid);
           await sleep(3000);
+          // F13 口径：wipe 后会话重启时 tick sweep 可能已合法重跑 BVID 摘要（F2「先看后激活」兜底，
+          // done/visit 行留存）——暂停门禁语义=「窗口内零新增采集」，按增量判定而非绝对零
+          const baseVisitsC = Number((await visitsFor(BVID)) ?? 0);
+          const baseJobsC = Number(((await jobsOf(BVID)) ?? {}).jobs ?? 0);
           const playMuted = `(async () => { const v = document.querySelector('.bpx-player-video-area video') || document.querySelector('video'); if (!v) return 'no-video'; v.muted = true; try { await v.play(); } catch (e) {} return 'ok'; })()`;
           await pageEval(`(async () => ${playMuted})()`).catch(() => {});
           await cdp('Page.bringToFront', {}, probeSid).catch(() => {});
           await sleep(20000); // 暂停窗口：>20s 有效观看（若采集未停会累计并跨过 20s 阈值）
           const pausedVisits = await visitsFor(BVID);
           const pausedJobs = (await jobsOf(BVID)) ?? {};
+          const pausedNoGrowth = Number(pausedVisits ?? -1) === baseVisitsC && Number(pausedJobs?.jobs ?? -1) === baseJobsC;
           const viewReqAfter = netUrls.filter((u) => u.includes('/x/web-interface/view')).length;
           await pclick('#mascot'); // 导航后面板已关：先开面板（ACTIVE=开合面板）
           await sleep(700);
@@ -1615,8 +1648,11 @@ async function main() {
             await sleep(500);
             entered = Number(await visitsFor(BVID) ?? 0);
           }
+          const baseJobs60 = Number(((await jobsOf(BVID)) ?? {}).jobs ?? 0);
           await sleep(20000); // 阈值 60 窗口：累计 ~20s 不应触发（若按旧值 5/20 会触发）
           const th60Jobs = (await jobsOf(BVID)) ?? {};
+          const th60NoTrigger = Number(th60Jobs?.jobs ?? -1) === baseJobs60;
+          const th5LogBase = lines.length; // 此刻阈值仍 60（sweep 不可能已响）——拨 5 后的 queued/done 日志窗口基线
           // 滑杆拨到 5 → watch tick 幂等阈值扫描应立即触发（watchedSeconds 已 >5）
           await pclick('#mascot'); // 导航后面板已关：先开面板
           await sleep(700);
@@ -1628,14 +1664,15 @@ async function main() {
           let th5Queued = false;
           for (let i = 0; i < 30 && !th5Queued; i++) {
             await sleep(500);
-            th5Queued = lines.some((l) => l.text.includes(`summary job queued`) && l.text.includes(BVID));
+            th5Queued = lines.slice(th5LogBase).some((l) => l.text.includes(`summary job queued`) && l.text.includes(BVID));
           }
           let th5Done = false;
           for (let i = 0; i < (REAL ? 300 : 60) && !th5Done; i++) {
             await sleep(500);
-            const j = (await jobsOf(BVID)) ?? {};
-            th5Done = (j?.sum ?? []).some((s) => s.status === 'done');
+            // sweep 可能命中 done 缓存短路（零 LLM、不新增 summary 行）——以 job 行终态为触发证据
+            th5Done = lines.slice(th5LogBase).some((l) => l.text.includes('job SUMMARIZE') && l.text.includes(BVID) && l.text.includes('→ done'));
           }
+          log('P2.5 d) 阈值子项:', JSON.stringify({ th60: th60Store?.settings?.triggerSeconds, baseJobs60, th60Jobs: th60Jobs?.jobs, th60NoTrigger, th5Queued, th5Done }));
           // 阈值恢复 20（后续探针的默认口径）
           await pclick('#btn-settings');
           await sleep(700);
@@ -1744,14 +1781,13 @@ async function main() {
             pauseBlocksCollection:
               pausedStore?.settings?.paused === true &&
               String(pausedStatus?.t ?? '').includes('已暂停') &&
-              Number(pausedVisits ?? 1) === 0 &&
-              (pausedJobs?.jobs ?? 1) === 0 &&
+              pausedNoGrowth === true &&
               viewReqAfter === viewReqBefore &&
               unpausedStore?.settings?.paused !== true,
             // d) 阈值滑杆（F2）
             thresholdSliderLive:
               th60Store?.settings?.triggerSeconds === 60 &&
-              (th60Jobs?.jobs ?? 1) === 0 &&
+              th60NoTrigger === true &&
               th5Queued === true && th5Done === true,
             // e) 气泡开关
             bubblesToggle:
@@ -1850,6 +1886,7 @@ async function main() {
           await sleep(900);
           const greenBadge = await srOf(`return JSON.stringify({ badge: sr.querySelector(".v-item[data-video-key^='${BVID}:'] .badge")?.textContent ?? '' })`);
 
+          log('P2.6 keyInvalid 子项:', JSON.stringify({ badKeyFailed, failBadge: failBadge?.badge, failErr: (failDetail?.err ?? '').slice(0, 40), goSettings: failDetail?.goSettings, keyBubble: keyBubble.slice(0, 24), settingsShown: settingsFromFail?.shown, retryDone, greenBadge: greenBadge?.badge }));
           // d) 断网挂起续跑（F11）：杀掉 mock LLM 服务器（端点不可达=确定性断网；CDP
           //    emulateNetworkConditions 实测对 offscreen 文档的 fetch 不生效）→ REGENERATE
           //    → LLM_NETWORK → wait 挂起（pending 不轰炸）→ 原端口重启 mock → 面板 LIST_QUERY
@@ -1887,7 +1924,7 @@ async function main() {
             })()`);
             const pendingJob = (rows ?? []).some((x) => x.status === 'pending' && x.type === 'REGENERATE');
             waitLogSeen = lines.slice(errProbeStartIdx).some((l) => l.text.includes('waits for network'));
-            waitedPending = pendingJob && !lines.slice(errProbeStartIdx).some((l) => l.text.includes('REGENERATE') && l.text.includes('→ failed'));
+            waitedPending = pendingJob && !lines.slice(errProbeStartIdx).some((l) => l.text.includes('job REGENERATE') && l.text.includes('→ failed')); // 收紧到 SW 迁移行：offscreen 回声（type=REGENERATE → failed）非终态
           }
           await pclick('#d-back'); // 回列表才能读徽章（详情态列表 DOM 不在文档）
           await sleep(800);
@@ -2023,6 +2060,8 @@ async function main() {
         Math.abs((seekProbe?.segment?.segAfter?.t ?? -99) - (seekProbe?.segment?.segBefore?.t ?? -99)) <= 1 &&
         (seekProbe?.segment?.segBefore?.btns ?? 0) >= 6,
       segmentDbNote: seekProbe?.segment?.segDb?.['1']?.status === 'done',
+      // F13 提速：静默预取——首次点击前已有 seg job 静默跑完（旧按需模型此计数恒 0）
+      segmentSilentPrefetch: (seekProbe?.segment?.offscreenSegPreClick ?? 0) >= 1,
       // P1.8：同页大纲 seek（±3s + toast + 面板不关）/ 转写行 seek / 跨标签页聚焦 seek / 新标签页 t= 直达
       seekOutlineSameTab:
         typeof seekProbe?.outline?.sec === 'number' &&
@@ -2074,13 +2113,14 @@ async function main() {
             h === new URL(llmCfg.baseUrl).hostname;
         } catch { return false; }
       }),
-      // 2.7a【重新生成】：REGENERATE 强制重跑 → 第 2 次摘要 job → done 覆盖（createdAt 更新）+ 分段注记清空
+      // 2.7a【重新生成】：REGENERATE 强制重跑 → 第 2 次摘要 job → done 覆盖（createdAt 更新）+ 旧分段注记清空
+      //（F13 提速：清空后预取可能立即重灌——不变量=不存在早于新行的陈旧注记，而非计数恒 0）
       regenerateRoundtrip:
         regenProbe?.regenDone === true &&
         regenProbe?.sumAfter === regenProbe?.sumBefore + 1 &&
         (regenProbe?.after?.createdAt ?? 0) > (regenProbe?.before?.createdAt ?? 0) &&
         regenProbe?.after?.status === 'done' &&
-        regenProbe?.after?.notes === 0 &&
+        ((regenProbe?.after?.notes ?? 1) === 0 || (regenProbe?.after?.noteMinCreated ?? 0) >= (regenProbe?.after?.createdAt ?? 1)) &&
         (regenProbe?.regenUi?.sumLen ?? 0) > 50 && // 审查 P2-9：面板已用新摘要重渲染
         (regenProbe?.regenUi?.outline ?? 0) >= 6 && // 新大纲就位（Schema 6–12 条）
         regenProbe?.regenUi?.notes === 0, // 无残留展开注记卡
@@ -2148,7 +2188,9 @@ async function main() {
       keyInvalidFullLoop: errProbe?.keyInvalidFullLoop === true,
       offlineWaitResume: errProbe?.offlineWaitResume === true,
       // P2.6 起：错误态探针段（errProbeStartIdx 起）预期制造 failed 终态——非预期失败判定截止到该段前
-      noExplicitFail: !lines.slice(cookieLineIdx, errProbeStartIdx || lines.length).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed')) || l.text.includes('E2E FAIL')),
+      // F13 预取：SEGMENT_ANALYZE 失败属预期可恢复路径（STALE 作废重跑/NO_CUES/清Key期 NO_LLM_CONFIG），
+      // SW 迁移行（job SEGMENT_ANALYZE → failed）与 offscreen 完成行（type=SEGMENT_ANALYZE）都排除
+      noExplicitFail: !lines.slice(cookieLineIdx, errProbeStartIdx || lines.length).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed') && !l.text.includes('job SEGMENT_ANALYZE') && !l.text.includes('type=SEGMENT_ANALYZE')) || l.text.includes('E2E FAIL')),
     };
     console.log('\n=== E2E 判定 ===');
     for (const [k, v] of Object.entries(verdict)) console.log(`  ${v ? '✅' : '❌'} ${k}`);

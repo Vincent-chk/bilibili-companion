@@ -28,6 +28,7 @@ export function mountDoubaoUi(doc: Document = document): DoubaoUi {
           <div class="p-mascot-avatar"><img alt="豆包"></div>
           <div class="p-titles"><div class="p-title">豆包的陪看小本本</div><div class="p-sub" id="p-status"></div></div>
           <button class="p-icon-btn" id="btn-settings" title="设置">⚙</button>
+          <button class="p-icon-btn" id="btn-close" title="关闭面板（Esc）">✕</button>
         </div>
         <div class="p-head-actions hidden" id="p-head-actions"></div>
       </header>

@@ -13,9 +13,11 @@ export interface LlmConfig {
   apiKey: string;
 }
 
-/** 流式事件：delta=文本增量，done=流结束（携带 usage 若有）。 */
+/** 流式事件：delta=文本增量，reasoning=思考模型思维链增量（仅存活诊断/日志，不进正文与 UI），
+ *  done=流结束（携带 usage 若有）。 */
 export type StreamEvent =
   | { type: 'delta'; text: string }
+  | { type: 'reasoning'; text: string }
   | { type: 'done'; usage?: unknown };
 
 export interface LlmMessage {

@@ -8,6 +8,7 @@ import {
   buildSegmentMessages,
   runSegmentJob,
   segmentRange,
+  segmentsToPrefetch,
   sliceCues,
   writeSegmentNote,
   type OutlineItem,
@@ -356,5 +357,85 @@ describe('审查修复回归', () => {
     expect(note?.status).toBe('failed');
     expect(note?.error?.code).toBe('LLM_NETWORK');
     expect(note?.error?.msg).toContain('超时');
+  });
+
+  it('reasoning_content 增量不进正文/onDelta，仅 content 计入注记（F13 提速：思考链不污染 UI）', async () => {
+    const db = freshDb();
+    await seedDoneSummary(db);
+    const base = await start(async (req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      // 思考模型：先吐 reasoning_content（不应出现在正文），再吐 content
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '思考中'.repeat(30) } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '该段' } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '讲了重点' } }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+    const forwarded: string[] = [];
+    const r = await runSegmentJob(
+      { db, bili: silentBili(), llm: { baseUrl: base, model: 'mock-model', apiKey: 'k' }, onDelta: (t) => forwarded.push(t) },
+      { videoKey: VIDEO_KEY, segIndex: 1 },
+    );
+    expect(r.result).toBe('done');
+    expect(forwarded.join('')).toBe('该段讲了重点'); // reasoning 不经 onDelta
+    const note = (await db.summaries.get(SKEY))?.segmentNotes?.[1];
+    expect(note?.text).toBe('该段讲了重点'); // 正文不含思考链
+    expect(note?.status).toBe('done');
+  });
+});
+
+describe('segmentsToPrefetch（F13 预取计划）', () => {
+  it('无注记 → 全部段下标', () => {
+    expect(segmentsToPrefetch(outline)).toEqual([0, 1, 2]);
+  });
+  it('跳过已 done 注记，failed/streaming 保留（自愈/免费重试）', () => {
+    const notes = {
+      0: { text: 'x', status: 'done' as const, createdAt: 1 },
+      1: { text: '', status: 'failed' as const, createdAt: 1 },
+      2: { text: '', status: 'streaming' as const, createdAt: 1 },
+    };
+    expect(segmentsToPrefetch(outline, notes)).toEqual([1, 2]);
+  });
+  it('全 done → 空数组（零入队）', () => {
+    const notes = Object.fromEntries(outline.map((_, i) => [i, { text: 'x', status: 'done' as const, createdAt: 1 }]));
+    expect(segmentsToPrefetch(outline, notes)).toEqual([]);
+  });
+  it('空大纲 → 空数组', () => {
+    expect(segmentsToPrefetch([])).toEqual([]);
+  });
+});
+
+describe('F13 双通道并行：陈旧写回防护', () => {
+  it('writeSegmentNote expectCreatedAt 不匹配（行被重生成替换）→ 跳过写回返回 false', async () => {
+    const db = freshDb();
+    await seedDoneSummary(db);
+    const row = (await db.summaries.get(SKEY))!;
+    const ok = await writeSegmentNote(db, SKEY, 0, { text: 'x', status: 'done', createdAt: 1 }, row.createdAt + 1);
+    expect(ok).toBe(false);
+    expect((await db.summaries.get(SKEY))?.segmentNotes?.[0]).toBeUndefined();
+    const hit = await writeSegmentNote(db, SKEY, 0, { text: 'x', status: 'done', createdAt: 1 }, row.createdAt);
+    expect(hit).toBe(true);
+    expect((await db.summaries.get(SKEY))?.segmentNotes?.[0]?.text).toBe('x');
+    await db.delete();
+  });
+
+  it('LLM 在途时行被替换 → done 注记不挂新行，failed STALE（重跑自愈读新大纲）', async () => {
+    const db = freshDb();
+    await seedDoneSummary(db);
+    const base = await start(async (_req, res) => {
+      // 模拟 REGENERATE 恰在分段 LLM 期间完成：同 key 整行替换（createdAt 变、notes 清空）
+      const cur = await db.summaries.get(SKEY);
+      if (cur) await db.summaries.put({ ...cur, createdAt: cur.createdAt + 5000, segmentNotes: undefined });
+      writeSse(res, '该段解读文本');
+    });
+    const r = await runSegmentJob(
+      { db, bili: silentBili(), llm: { baseUrl: base, model: 'mock-model', apiKey: 'k' } },
+      { videoKey: VIDEO_KEY, segIndex: 1 },
+    );
+    expect(r.result).toBe('failed');
+    if (r.result === 'failed') expect(r.error.code).toBe('STALE');
+    const row = await db.summaries.get(SKEY);
+    expect(row?.segmentNotes?.[1]).toBeUndefined(); // 旧大纲产出不挂新行
+    await db.delete();
   });
 });

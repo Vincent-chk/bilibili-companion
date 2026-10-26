@@ -146,6 +146,7 @@ export const UI_STYLES = `
   .seg-note { margin: 7px 2px 2px; background: #f6f7f9; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font-size: 12px; line-height: 1.75; color: #333; cursor: default; text-align: justify; }
   .seg-note .caret { display: inline-block; width: 2px; height: 12px; background: var(--blue); vertical-align: -1px; animation: caretBlink .8s step-end infinite; }
   .seg-trunc { display: block; margin-top: 5px; font-size: 10.5px; color: var(--text3); }
+  .seg-queue { margin-left: 4px; font-size: 10.5px; color: var(--text3); }
   .seg-err { color: var(--red); }
   .seg-retry { margin-left: 8px; padding: 2px 10px; font-size: 11px; }
   .mascot-card { background: linear-gradient(135deg,#fff9ec,#fff2f6); border: 1px solid #ffe3c2; }

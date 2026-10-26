@@ -1,6 +1,8 @@
 // P1.3 · 持久化任务队列（架构 §3.4 / 数据模型 §1.6 jobs 表）。
 // 状态机：pending → running → done | need_confirm | failed（失败 retries≤1 自动重排队）。
-// 并发=1（B 站侧串行）；SW 重启恢复：recover() 把 stale running 重排 pending。
+// 每实例并发=1（B 站侧串行）；lane 参数使多实例分通道并行（主链摘要 + 交互链分段解读，F13 提速：
+// 用户点击不再排在数分钟的摘要任务之后）。取任务按 (prio ?? 0, createdAt)——同通道内用户任务压过后台预取。
+// SW 重启恢复：recover() 把 stale running 重排 pending。
 // 任务语义（选轨/字幕/LLM）由注入的 executor 承担——任务 1.4 提供 SUMMARIZE 实现。
 import type { CompanionDB, JobRow, JobStage, JobType } from '../storage';
 
@@ -31,6 +33,8 @@ export interface PipelineOptions {
   now?: () => number;
   /** 状态迁移回调（日志/Port 广播用；异常忽略）。 */
   onTransition?: (job: JobRow) => void;
+  /** 通道过滤：本实例只 drain 这些类型（缺省=全部）。多实例分 lane 并行（每 lane 并发仍=1）。 */
+  lane?: JobType[];
 }
 
 const ACTIVE_STATUSES: JobRow['status'][] = ['pending', 'running', 'need_confirm'];
@@ -42,6 +46,7 @@ export class Pipeline {
   readonly #maxRetries: number;
   readonly #now: () => number;
   readonly #onTransition?: (job: JobRow) => void;
+  readonly #lane?: JobType[];
   #busy = false;
 
   constructor(db: CompanionDB, handlers: PipelineHandlers, opts: PipelineOptions = {}) {
@@ -50,6 +55,7 @@ export class Pipeline {
     this.#maxRetries = opts.maxRetries ?? 1;
     this.#now = opts.now ?? Date.now;
     this.#onTransition = opts.onTransition;
+    this.#lane = opts.lane;
   }
 
   /**
@@ -57,7 +63,13 @@ export class Pipeline {
    * 不重复建（20s 触发与按需打开并发、双标签页并发触发均在此收口；F13 同视频不同段互不去重）。
    * 'rw' 事务封查后写竞态。
    */
-  async enqueue(input: { type: JobType; videoKey: string; sessionId: string; segIndex?: number }): Promise<JobRow> {
+  async enqueue(input: {
+    type: JobType;
+    videoKey: string;
+    sessionId: string;
+    segIndex?: number;
+    prio?: number; // 缺省 0；1=后台预取（同通道内被用户任务插队）
+  }): Promise<JobRow> {
     return this.#db.transaction('rw', this.#db.jobs, async () => {
       const active = await this.#db.jobs
         .where('videoKey')
@@ -77,6 +89,7 @@ export class Pipeline {
         videoKey: input.videoKey,
         sessionId: input.sessionId,
         ...(input.segIndex !== undefined ? { segIndex: input.segIndex } : {}),
+        ...(input.prio !== undefined && input.prio !== 0 ? { prio: input.prio } : {}),
         status: 'pending',
         progress: 0,
         retries: 0,
@@ -101,11 +114,14 @@ export class Pipeline {
   }
 
   /**
-   * 取最早的 pending 执行到底；无任务返回 false，网络挂起返回 'wait'（drain 据此停轮——
-   * 否则 wait 回 pending 会被立即重取，热循环空转）。
+   * 取本通道 (prio, createdAt) 最高的 pending 执行到底；无任务返回 false，网络挂起返回 'wait'
+   * （drain 据此停轮——否则 wait 回 pending 会被立即重取，热循环空转）。
    */
   async tick(): Promise<boolean | 'wait'> {
-    const job = (await this.#db.jobs.where('status').equals('pending').sortBy('createdAt'))[0];
+    let pending = await this.#db.jobs.where('status').equals('pending').toArray();
+    if (this.#lane) pending = pending.filter((j) => this.#lane!.includes(j.type));
+    pending.sort((a, b) => (a.prio ?? 0) - (b.prio ?? 0) || a.createdAt - b.createdAt);
+    const job = pending[0];
     if (!job) return false;
     await this.#set({ ...job, status: 'running', updatedAt: this.#now() });
     const ctx: JobContext = {

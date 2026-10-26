@@ -40,6 +40,20 @@ export function sliceCues(cues: StoredCue[], range: { from: number; to: number }
   return cues.filter((c) => c.to > range.from && c.from < range.to);
 }
 
+/**
+ * F13 预取计划：摘要 done 后需要静默解读的段下标 = 全部段 − 已 done 注记段。
+ * failed/streaming 注记不跳过（failed=多给一次免费重试；streaming=SW 死亡残留自愈；
+ * 重复入队由 enqueue 幂等收口，预取触发每摘要仅一次，不成环）。上限由大纲 schema（6–12）约束。
+ */
+export function segmentsToPrefetch(
+  outline: OutlineItem[],
+  notes?: { [segIndex: number]: { status: string } },
+): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < outline.length; i++) if (notes?.[i]?.status !== 'done') out.push(i);
+  return out;
+}
+
 export interface SegmentMessagesInput {
   title: string;
   outline: OutlineItem[];
@@ -74,18 +88,27 @@ export function buildSegmentMessages(input: SegmentMessagesInput): { messages: L
   return { messages: [{ role: 'system', content: system }, { role: 'user', content: user }], truncated };
 }
 
-/** segmentNotes 单段写回（rw 事务读改写；行已被 F10 清除则不复活）。 */
+/**
+ * segmentNotes 单段写回（rw 事务读改写；行已被 F10 清除则不复活）。
+ * expectCreatedAt：双通道并行（F13）下防陈旧写回——重生成整行替换后，
+ * 以旧大纲产出的注记不得挂到新行（createdAt 变了即跳过，返回 false 由调用方定夺）。
+ */
 export async function writeSegmentNote(
   db: CompanionDB,
   skey: string,
   segIndex: number,
   note: SegmentNote,
-): Promise<void> {
+  expectCreatedAt?: number,
+): Promise<boolean> {
+  let written = false;
   await db.transaction('rw', db.summaries, async () => {
     const row = await db.summaries.get(skey);
     if (!row) return;
+    if (expectCreatedAt !== undefined && row.createdAt !== expectCreatedAt) return;
     await db.summaries.put({ ...row, segmentNotes: { ...(row.segmentNotes ?? {}), [segIndex]: note } });
+    written = true;
   });
+  return written;
 }
 
 export interface SegmentJobDeps {
@@ -118,6 +141,8 @@ export async function runSegmentJob(
     return { result: 'failed', error: { code: 'NO_OUTLINE', msg: '全片大纲未生成，暂不能分段解读' } };
   }
   const skey = row.key;
+  const rowCreatedAt = row.createdAt; // 双通道并行（F13）防陈旧写回基准：REGENERATE 整行替换后 createdAt 变
+  const staleErr = { code: 'STALE', msg: '摘要已重新生成，本段解读作废，请重新点击' };
   const cached = row.segmentNotes?.[job.segIndex];
   if (cached?.status === 'done') return { result: 'done' }; // 缓存命中：零 LLM/字幕请求
   const video: VideoRow | undefined = await db.videos.get(job.videoKey);
@@ -134,13 +159,13 @@ export async function runSegmentJob(
         tr.kind === 'no-track'
           ? { code: 'NO_SUBTITLE', msg: '该视频无字幕轨，分段解读不可用' }
           : { code: 'NO_CONTENT', msg: '字幕轨内容为空' };
-      await writeSegmentNote(db, skey, job.segIndex, { text: '', status: 'failed', createdAt: Date.now(), error });
+      await writeSegmentNote(db, skey, job.segIndex, { text: '', status: 'failed', createdAt: Date.now(), error }, rowCreatedAt);
       return { result: 'failed', error };
     }
     const cues = sliceCues(tr.transcript.cues, range);
     if (cues.length === 0) {
       const error = { code: 'NO_CUES', msg: '该时间段内无字幕内容' };
-      await writeSegmentNote(db, skey, job.segIndex, { text: '', status: 'failed', createdAt: Date.now(), error });
+      await writeSegmentNote(db, skey, job.segIndex, { text: '', status: 'failed', createdAt: Date.now(), error }, rowCreatedAt);
       return { result: 'failed', error };
     }
 
@@ -152,24 +177,34 @@ export async function runSegmentJob(
       cues,
     });
     const extra = truncated ? { truncated: true } : {};
-    // streaming 占位：其他标签页/中途重开详情可见「解读中」（SW 中途死亡由 recover 重排自愈）
-    await writeSegmentNote(db, skey, job.segIndex, { text: '', status: 'streaming', createdAt: Date.now(), ...extra });
+    // streaming 占位：其他标签页/中途重开详情可见「解读中」（SW 中途死亡由 recover 重排自愈）；
+    // 写不进=行已被重生成替换，LLM 调用前早退省成本
+    if (!(await writeSegmentNote(db, skey, job.segIndex, { text: '', status: 'streaming', createdAt: Date.now(), ...extra }, rowCreatedAt)))
+      return { result: 'failed', error: staleErr };
     await ctx?.update({ stage: 'llm_reduce', progress: 50 });
+    // F13 提速：分段解读关闭思考链（Ark 端点注入 thinking=disabled，首字 TTFT 从 40–90s 压到秒级）；
+    // reasoning 增量仅计数供诊断日志（非 Ark 端点关不掉时，可据此判断模型确在思考而非卡死）
+    let reasoningChars = 0;
     const r = await streamChatCompletion(llm, messages, {
       fetchImpl: deps.fetchImpl,
       timeoutMs: deps.timeoutMs ?? 60_000,
       maxTokens: SEGMENT_MAX_TOKENS,
-      ...(deps.onDelta
-        ? { onDelta: (ev: StreamEvent) => { if (ev.type === 'delta') deps.onDelta?.(ev.text); } }
-        : {}),
+      disableThinking: true,
+      onDelta: (ev: StreamEvent) => {
+        if (ev.type === 'reasoning') reasoningChars += ev.text.length;
+        else if (ev.type === 'delta') deps.onDelta?.(ev.text);
+      },
     });
     // 真实 LLM 补验指标（usage 含 reasoning_tokens：max_tokens 只限 content，思考 token 另行计费）
     console.log(
-      `[doubao] llm segment seg=${job.segIndex} ttft=${r.ttftMs ?? -1}ms truncated=${truncated} usage=${JSON.stringify(r.usage ?? null)}`,
+      `[doubao] llm segment seg=${job.segIndex} ttft=${r.ttftMs ?? -1}ms truncated=${truncated} reasoningChars=${reasoningChars} usage=${JSON.stringify(r.usage ?? null)}`,
     );
     const text = r.text.trim();
     if (!text) throw new Error('分段解读输出为空');
-    await writeSegmentNote(db, skey, job.segIndex, { text, status: 'done', createdAt: Date.now(), ...extra });
+    // 在途期间行被重生成替换 → 旧大纲产出的注记不挂新行（failed STALE 由 pipeline 重排一次，
+    // 重跑自然读新行新大纲，自愈）
+    if (!(await writeSegmentNote(db, skey, job.segIndex, { text, status: 'done', createdAt: Date.now(), ...extra }, rowCreatedAt)))
+      return { result: 'failed', error: staleErr };
     return { result: 'done' };
   } catch (e) {
     const error = mapLlmError(e);
@@ -178,7 +213,7 @@ export async function runSegmentJob(
       status: 'failed',
       createdAt: Date.now(),
       error,
-    }).catch(() => {});
+    }, rowCreatedAt).catch(() => {});
     return { result: 'failed', error };
   }
 }

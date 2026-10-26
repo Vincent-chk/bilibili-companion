@@ -32,6 +32,18 @@ export interface StreamOptions {
   timeoutMs?: number;
   /** 输出 token 上限（成本护栏：F13 分段解读 / F14 对话用；缺省=不限制）。 */
   maxTokens?: number;
+  /** 思考模型关闭思维链（F13 分段解读提速：首字 TTFT 从 40–90s 压到秒级）。
+   *  shortcut: 仅对 Ark（*.volces.com）注入 thinking 字段；其他供应商形态出现真实需求再扩。 */
+  disableThinking?: boolean;
+}
+
+/** Ark（火山方舟）端点判定：chat/completions 支持 body.thinking={type:'disabled'}。 */
+export function isArkBaseUrl(baseUrl: string): boolean {
+  try {
+    return /(^|\.)volces\.com$/i.test(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
 }
 
 // 服务端错误 body 里可能回显 Key：先剔除本次 Key，再兜底打码 Bearer/sk-/ark- 形态 token，只留前 200 字符。
@@ -55,6 +67,7 @@ export async function streamChatCompletion(
   // 裸存 fetch 引用会在 ServiceWorker 里 Illegal invocation（脱离 globalThis 上下文）——必须 bind
   const { onDelta, fetchImpl = fetch.bind(globalThis), timeoutMs = 60000 } = opts;
   const url = `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const thinkingOff = opts.disableThinking === true && isArkBaseUrl(cfg.baseUrl);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
   const t0 = Date.now();
@@ -76,6 +89,7 @@ export async function streamChatCompletion(
         stream_options: { include_usage: true },
         temperature: 0.7,
         ...(opts.maxTokens !== undefined ? { max_tokens: opts.maxTokens } : {}),
+        ...(thinkingOff ? { thinking: { type: 'disabled' } } : {}),
       }),
       signal: controller.signal,
     });
@@ -97,13 +111,19 @@ export async function streamChatCompletion(
         finished = true;
         return;
       }
-      let j: { choices?: { delta?: { content?: string } }[]; usage?: unknown };
+      let j: { choices?: { delta?: { content?: string; reasoning_content?: string } }[]; usage?: unknown };
       try {
-        j = JSON.parse(data) as { choices?: { delta?: { content?: string } }[]; usage?: unknown };
+        j = JSON.parse(data) as {
+          choices?: { delta?: { content?: string; reasoning_content?: string } }[];
+          usage?: unknown;
+        };
       } catch {
         return; // 非 JSON 行（注释/心跳）忽略
       }
       if (j.usage) usage = j.usage;
+      // 思维链增量：仅透传事件供存活诊断（不进 text/ttft/正文——分段解读关思考后通常无此行）
+      const reasoning = j.choices?.[0]?.delta?.reasoning_content;
+      if (typeof reasoning === 'string' && reasoning.length > 0) onDelta?.({ type: 'reasoning', text: reasoning });
       const delta = j.choices?.[0]?.delta?.content;
       if (typeof delta === 'string' && delta.length > 0) {
         if (ttftMs === null) ttftMs = Date.now() - t0;

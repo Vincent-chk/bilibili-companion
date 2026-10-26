@@ -121,6 +121,6 @@ async function handleRun(
             ctx,
             { force: job.type === 'REGENERATE' }, // 2.7a：重新生成绕过 done 缓存，成功整行覆盖
           );
-  console.log(`[doubao] offscreen job=${job.id} → ${outcome.result}`);
+  console.log(`[doubao] offscreen job=${job.id} type=${job.type ?? 'SUMMARIZE'} → ${outcome.result}`);
   return outcome;
 }

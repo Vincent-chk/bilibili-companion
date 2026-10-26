@@ -242,3 +242,81 @@ describe('P2.3 审查 P2-4：ASR_SUMMARIZE 失败不自动重排', () => {
     await db.delete();
   });
 });
+
+describe('F13 双通道 lane + prio 优先级', () => {
+  it('lane 过滤：主链只取摘要类，交互链只取 SEGMENT_ANALYZE（互不越界）', async () => {
+    const db = freshDb();
+    const mainSeen: string[] = [];
+    const segSeen: string[] = [];
+    const main = new Pipeline(
+      db,
+      {
+        execute: async (job) => {
+          mainSeen.push(job.type);
+          return { result: 'done' };
+        },
+      },
+      { lane: ['SUMMARIZE', 'ASR_SUMMARIZE', 'REGENERATE'] },
+    );
+    const seg = new Pipeline(
+      db,
+      {
+        execute: async (job) => {
+          segSeen.push(job.type);
+          return { result: 'done' };
+        },
+      },
+      { lane: ['SEGMENT_ANALYZE'] },
+    );
+    await db.jobs.put(mkJob({ id: 'm', type: 'SUMMARIZE', videoKey: 'a', createdAt: 1 }));
+    await db.jobs.put(mkJob({ id: 's', type: 'SEGMENT_ANALYZE', videoKey: 'a', segIndex: 0, createdAt: 2 }));
+    await main.drain();
+    await seg.drain();
+    expect(mainSeen).toEqual(['SUMMARIZE']); // 主链没碰分段
+    expect(segSeen).toEqual(['SEGMENT_ANALYZE']); // 交互链只跑分段
+    expect((await db.jobs.get('m'))?.status).toBe('done');
+    expect((await db.jobs.get('s'))?.status).toBe('done');
+    await db.delete();
+  });
+
+  it('同通道内 prio 压 createdAt：用户任务(0)先于更早的预取任务(1)', async () => {
+    const db = freshDb();
+    const order: string[] = [];
+    const p = new Pipeline(
+      db,
+      {
+        execute: async (job) => {
+          order.push(job.id);
+          return { result: 'done' };
+        },
+      },
+      { lane: ['SEGMENT_ANALYZE'] },
+    );
+    // 预取任务 prio=1 先入队（createdAt 更小）；用户点击 prio=0 后入队 → 应插队先跑
+    await db.jobs.put(mkJob({ id: 'prefetch', type: 'SEGMENT_ANALYZE', videoKey: 'a', segIndex: 1, prio: 1, createdAt: 1 }));
+    await db.jobs.put(mkJob({ id: 'user', type: 'SEGMENT_ANALYZE', videoKey: 'a', segIndex: 2, prio: 0, createdAt: 5 }));
+    await p.drain();
+    expect(order).toEqual(['user', 'prefetch']);
+    await db.delete();
+  });
+
+  it('enqueue 落 prio：仅非零写列（0/缺省不落，省存储）', async () => {
+    const { db, p } = mkPipeline(async () => ({ result: 'done' }));
+    const a = await p.enqueue({ type: 'SEGMENT_ANALYZE', videoKey: 'a', sessionId: 's', segIndex: 0, prio: 1 });
+    const b = await p.enqueue({ type: 'SEGMENT_ANALYZE', videoKey: 'b', sessionId: 's', segIndex: 0, prio: 0 });
+    expect(a.prio).toBe(1);
+    expect(b.prio).toBeUndefined();
+    await db.delete();
+  });
+
+  it('recover 跨通道：stale running 一律重排 pending（不分 lane）', async () => {
+    const db = freshDb();
+    await db.jobs.put(mkJob({ id: 'r1', type: 'SUMMARIZE', status: 'running' }));
+    await db.jobs.put(mkJob({ id: 'r2', type: 'SEGMENT_ANALYZE', segIndex: 0, status: 'running' }));
+    const p = new Pipeline(db, { execute: async () => ({ result: 'done' }) }, { lane: ['SUMMARIZE'] });
+    const n = await p.recover();
+    expect(n).toBe(2); // 两条 stale running 都回 pending（recover 不按 lane 过滤，重启自愈全量）
+    expect((await db.jobs.get('r2'))?.status).toBe('pending');
+    await db.delete();
+  });
+});

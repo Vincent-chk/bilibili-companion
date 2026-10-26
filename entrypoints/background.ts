@@ -27,6 +27,7 @@ import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/on
 import { clampThreshold, maskApiKey, resolveApiKey, sanitizePersona } from '../src/content/panel/settings-logic';
 import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/content/seek';
 import { parseVideoKey } from '../src/lib/summarize/chain';
+import { segmentsToPrefetch } from '../src/lib/summarize/segment';
 import { buildRefererRules, DNR_RULE_IDS } from '../src/lib/dnr';
 
 const db = new CompanionDB();
@@ -214,35 +215,77 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
 }
 
 const lastLoggedStatus = new Map<string, string>();
+const onJobTransition = (j: JobRow): void => {
+  // 进度写回也会触发本回调：状态变化才打日志（pending 不打，保持原行为）
+  if (j.status !== 'pending' && lastLoggedStatus.get(j.id) !== j.status) {
+    console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
+  }
+  // P1.5：状态变化即广播（含 pending 入队——其他标签页/未开面板的列表要看到「生成中」）；
+  // 纯进度写回状态不变不广播（进度走 SUMMARY_PROGRESS 通道）
+  if (lastLoggedStatus.get(j.id) !== j.status) {
+    lastLoggedStatus.set(j.id, j.status);
+    // P1.11：分段解读任务走独立终态通道（不得触发 SUMMARY_DONE 的 happy 气泡/列表刷新语义）
+    if (j.type === 'SEGMENT_ANALYZE') {
+      if (j.status === 'done' || j.status === 'failed') void broadcastSegmentTerminal(j);
+      return;
+    }
+    const t =
+      j.status === 'done' ? 'SUMMARY_DONE'
+      : j.status === 'failed' ? 'SUMMARY_FAILED'
+      : j.status === 'need_confirm' ? 'SUMMARY_NEED_ASR'
+      : 'SUMMARY_UPDATED';
+    // P2.6：失败终态随带错误码/文案（F9 Key 无效→气泡「去设置」；其余码仅随行不消费）
+    broadcastToUi(
+      t === 'SUMMARY_FAILED' && j.error
+        ? { type: t, videoKey: j.videoKey, errorCode: j.error.code, errorMsg: j.error.msg }
+        : { type: t, videoKey: j.videoKey },
+    );
+    // F13 预取提速：摘要落库（大纲+转写已就绪）→ 静默入队未解读段（交互链 prio=1 后台消化，
+    // 用户点【AI 解读】时大概率缓存命中秒开）
+    if (j.status === 'done') void prefetchSegments(j);
+  }
+};
+// F13 提速：双通道并行——主链（摘要/重生成/ASR，B 站侧串行）+ 交互链（分段解读）。
+// 用户点击分段解读不再排在数分钟的摘要任务之后；每链并发=1（总 LLM 并发≤2）。
 const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
-  onTransition: (j) => {
-    // 进度写回也会触发本回调：状态变化才打日志（pending 不打，保持原行为）
-    if (j.status !== 'pending' && lastLoggedStatus.get(j.id) !== j.status) {
-      console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
-    }
-    // P1.5：状态变化即广播（含 pending 入队——其他标签页/未开面板的列表要看到「生成中」）；
-    // 纯进度写回状态不变不广播（进度走 SUMMARY_PROGRESS 通道）
-    if (lastLoggedStatus.get(j.id) !== j.status) {
-      lastLoggedStatus.set(j.id, j.status);
-      // P1.11：分段解读任务走独立终态通道（不得触发 SUMMARY_DONE 的 happy 气泡/列表刷新语义）
-      if (j.type === 'SEGMENT_ANALYZE') {
-        if (j.status === 'done' || j.status === 'failed') void broadcastSegmentTerminal(j);
-        return;
-      }
-      const t =
-        j.status === 'done' ? 'SUMMARY_DONE'
-        : j.status === 'failed' ? 'SUMMARY_FAILED'
-        : j.status === 'need_confirm' ? 'SUMMARY_NEED_ASR'
-        : 'SUMMARY_UPDATED';
-      // P2.6：失败终态随带错误码/文案（F9 Key 无效→气泡「去设置」；其余码仅随行不消费）
-      broadcastToUi(
-        t === 'SUMMARY_FAILED' && j.error
-          ? { type: t, videoKey: j.videoKey, errorCode: j.error.code, errorMsg: j.error.msg }
-          : { type: t, videoKey: j.videoKey },
-      );
-    }
-  },
+  lane: ['SUMMARIZE', 'ASR_SUMMARIZE', 'REGENERATE'],
+  onTransition: onJobTransition,
 });
+const segPipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
+  lane: ['SEGMENT_ANALYZE'],
+  onTransition: onJobTransition,
+});
+
+/**
+ * F13 分段预取（静默提前解读）：当前视频摘要 done 后，把未解读段以 prio=1 入交互链。
+ * 护栏：暂停中零请求；仅当前 ACTIVE 会话（GRACE/换会话不烧）；done 注记跳过；
+ * enqueue 幂等收口并发重复。成本上界：每视频 ≤12 次小额调用（≤500 token、Ark 关思考）。
+ */
+async function prefetchSegments(j: JobRow): Promise<void> {
+  try {
+    if (await isPaused()) return;
+    const pointer = await getSessionPointer(browserKv);
+    if (pointer?.state !== 'ACTIVE' || pointer.sessionId !== j.sessionId) return;
+    const row = await latestSummary(j.videoKey);
+    if (!row || row.status !== 'done' || !row.outline?.length) return;
+    const todo = segmentsToPrefetch(row.outline, row.segmentNotes);
+    for (const i of todo) {
+      await segPipeline.enqueue({
+        type: 'SEGMENT_ANALYZE',
+        videoKey: j.videoKey,
+        sessionId: j.sessionId,
+        segIndex: i,
+        prio: 1,
+      });
+    }
+    if (todo.length) {
+      console.log(`[doubao] segment prefetch queued: ${j.videoKey} ×${todo.length}`);
+      drainUnlessPaused();
+    }
+  } catch {
+    /* 预取尽力而为：失败不影响按需解读链路（用户点击仍走 OPEN 入队） */
+  }
+}
 
 /** SEGMENT_NOTE_DONE/FAILED：终态注记文本/错误从 summaries.segmentNotes 读回随广播下发（面板免再请求）。 */
 async function broadcastSegmentTerminal(j: JobRow): Promise<void> {
@@ -624,9 +667,11 @@ async function latestSummary(videoKey: string): Promise<SummaryRow | undefined> 
   return rows.length ? rows[rows.length - 1] : undefined;
 }
 
+/** 摘要类活动任务（驱动列表「生成中」徽章与详情流式态判定）。
+ *  F13：排除 SEGMENT_ANALYZE——分段预取在后台跑，不得污染列表徽章/详情流式态（分段态另有 activeSegmentJob）。 */
 async function activeJob(videoKey: string): Promise<JobRow | undefined> {
   const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
-  return rows.find((j) => ACTIVE_JOB_STATUSES.includes(j.status));
+  return rows.find((j) => j.type !== 'SEGMENT_ANALYZE' && ACTIVE_JOB_STATUSES.includes(j.status));
 }
 
 interface StoredSettings {
@@ -648,10 +693,13 @@ async function isPaused(): Promise<boolean> {
   return (await readSettings()).paused === true;
 }
 
-/** P2.5：暂停时不清空 pending 队列（挂起待恢复）；解除暂停的保存路径自行 drain。 */
+/** P2.5：暂停时不清空 pending 队列（挂起待恢复）；解除暂停的保存路径自行 drain。
+ *  F13 提速：双链同 kick——交互链独立于主链，摘要挂起/长跑不拖分段解读。 */
 function drainUnlessPaused(): void {
   void isPaused().then((paused) => {
-    if (!paused) void pipeline.drain();
+    if (paused) return;
+    void pipeline.drain();
+    void segPipeline.drain();
   });
 }
 
@@ -834,11 +882,26 @@ async function activeSegmentJob(videoKey: string, segIndex: number): Promise<Job
   );
 }
 
+/** 交互链排队位次：pending 的 SEGMENT_ANALYZE 中按 (prio, createdAt) 排在 self 之前的条数
+ *  （面板「排队中 · 前面还有 N 个」数据源；running 不可抢占，不计入）。 */
+async function segmentQueueAhead(self: { id: string; prio?: number; createdAt: number }): Promise<number> {
+  const rows = await db.jobs.where('status').equals('pending').toArray();
+  return rows.filter(
+    (j) =>
+      j.id !== self.id &&
+      j.type === 'SEGMENT_ANALYZE' &&
+      ((j.prio ?? 0) < (self.prio ?? 0) ||
+        ((j.prio ?? 0) === (self.prio ?? 0) && j.createdAt < self.createdAt)),
+  ).length;
+}
+
 /**
  * SEGMENT_NOTE_OPEN（架构 §4.4）：命中 segmentNotes done 缓存 → 直接返回（零 LLM 请求）；
- * 未命中 → 建 SEGMENT_ANALYZE job（pipeline 串行）→ 流式经 SEGMENT_NOTE_STREAM/DONE/FAILED 回流。
+ * 未命中 → 建 SEGMENT_ANALYZE job（交互链，与摘要主链并行）→ 流式经 SEGMENT_NOTE_STREAM/DONE/FAILED 回流。
  * 重试口径同 SUMMARY_OPEN（F11）：failed 注记仅 retry=1（用户显式点击）重排；
  * streaming 注记但无活动 job（SW 中途死亡残留）→ 点击即重建自愈。
+ * F13 提速：pending 的预取任务（prio=1）被用户点击就地提升为 prio=0（不被后台队列压尾）；
+ * 应答随带 queued（前面还有几个），面板占位文案追加排队位次。
  */
 async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey, segIndex, retry } = m;
@@ -863,19 +926,35 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
       !(await isPaused()); // P2.5：暂停期间分段解读只读缓存，不发 LLM 请求
     if (allow) {
       const pointer = await getSessionPointer(browserKv);
-      await pipeline.enqueue({
+      const row = await segPipeline.enqueue({
         type: 'SEGMENT_ANALYZE',
         videoKey,
         sessionId: pointer?.sessionId ?? 'no-session',
         segIndex,
       });
       drainUnlessPaused();
+      const queued = row.status === 'pending' ? await segmentQueueAhead(row) : 0;
       // 审查 P1-1：本次入了队就回合成 streaming 占位（started 标记让面板清空旧增量残留）——
       // 若回旧 failed 注记，面板会把重试的流式占位覆盖回失败卡并丢弃全部增量（「重试秒败」假象）
-      return { ok: true, note: { text: '', status: 'streaming', createdAt: Date.now() }, started: true };
+      return {
+        ok: true,
+        note: { text: '', status: 'streaming', createdAt: Date.now() },
+        started: true,
+        ...(queued > 0 ? { queued } : {}),
+      };
     }
   }
-  return { ok: true, note: cached ?? { text: '', status: 'streaming', createdAt: Date.now() } };
+  // 已有活动任务（预取/在跑）：pending 预取提升为用户优先级，应答带位次
+  // update（非 put）：只改 prio/updatedAt，避免用早先读到的陈旧整行覆盖在途 tick 写入的 stage/progress
+  if (active?.status === 'pending' && (active.prio ?? 0) > 0) {
+    await db.jobs.update(active.id, { prio: 0, updatedAt: Date.now() });
+  }
+  const queued = active?.status === 'pending' ? await segmentQueueAhead(active) : 0;
+  return {
+    ok: true,
+    note: cached ?? { text: '', status: 'streaming', createdAt: Date.now() },
+    ...(queued > 0 ? { queued } : {}),
+  };
 }
 
 // ---- P1.10 · 登录态检测与引导（架构 §3.9） ------------------------------------

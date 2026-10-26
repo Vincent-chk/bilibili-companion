@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { LlmHttpError, LlmNetworkError, streamChatCompletion } from '../src/lib/llm/client';
+import { LlmHttpError, LlmNetworkError, isArkBaseUrl, streamChatCompletion } from '../src/lib/llm/client';
 import { resolveConfig, summarize, validateSummary } from '../src/lib/llm/summary';
 
 const META = { title: '测试视频', duration: 600, cueCount: 100 };
@@ -246,5 +246,75 @@ describe('mock-llm-server.mjs（真实脚本）', () => {
     expect(out.degraded).toBe(false);
     expect(out.attempts).toBe(2);
     expect(validateSummary(out.summaryResult)).toEqual([]);
+  });
+});
+
+// ---- F13 提速：关思考注入 + reasoning_content 解析（fetchImpl 假流，零网络） ----
+describe('disableThinking / reasoning 解析', () => {
+  const ARK = 'https://ark.cn-beijing.volces.com/api/v3';
+
+  /** 假 fetch：捕获请求体，回固定 SSE（[DONE] 收尾）。 */
+  const fakeFetch = (sse: string, captured: { body?: string }): typeof fetch =>
+    ((async (_url: unknown, init: RequestInit) => {
+      captured.body = String(init.body);
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(sse));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as unknown) as typeof fetch;
+
+  it('isArkBaseUrl：方舟域（含子域）命中；相似域/非法 URL 拒绝', () => {
+    expect(isArkBaseUrl(ARK)).toBe(true);
+    expect(isArkBaseUrl('https://volces.com/api/v3')).toBe(true);
+    expect(isArkBaseUrl('https://ark.cn-beijing.volces.com.cn/api/v3')).toBe(false); // 后缀相似≠命中
+    expect(isArkBaseUrl('https://api.openai.com/v1')).toBe(false);
+    expect(isArkBaseUrl('not a url')).toBe(false);
+  });
+
+  it('disableThinking+Ark → body.thinking={type:disabled}；非 Ark 或开关关 → 无 thinking 字段', async () => {
+    const sse = 'data: {"choices":[{"delta":{"content":"好"}}]}\n\ndata: [DONE]\n\n';
+    const on: { body?: string } = {};
+    await streamChatCompletion({ baseUrl: ARK, model: 'm', apiKey: 'k' }, [{ role: 'user', content: 'x' }], {
+      fetchImpl: fakeFetch(sse, on),
+      disableThinking: true,
+    });
+    expect(JSON.parse(on.body!).thinking).toEqual({ type: 'disabled' });
+    const off: { body?: string } = {};
+    await streamChatCompletion({ baseUrl: ARK, model: 'm', apiKey: 'k' }, [{ role: 'user', content: 'x' }], {
+      fetchImpl: fakeFetch(sse, off),
+    });
+    expect(JSON.parse(off.body!).thinking).toBeUndefined();
+    const nonArk: { body?: string } = {};
+    await streamChatCompletion(
+      { baseUrl: 'https://api.openai.com/v1', model: 'm', apiKey: 'k' },
+      [{ role: 'user', content: 'x' }],
+      { fetchImpl: fakeFetch(sse, nonArk), disableThinking: true },
+    );
+    expect(JSON.parse(nonArk.body!).thinking).toBeUndefined();
+  });
+
+  it('reasoning_content → {type:reasoning} 事件透传；text/ttft 只认 content', async () => {
+    const sse =
+      'data: {"choices":[{"delta":{"reasoning_content":"先想想"}}]}\n\n' +
+      'data: {"choices":[{"delta":{"reasoning_content":"再想想"}}]}\n\n' +
+      'data: {"choices":[{"delta":{"content":"正文"}}]}\n\n' +
+      'data: [DONE]\n\n';
+    const evs: { type: string; text?: string }[] = [];
+    const cap: { body?: string } = {};
+    const r = await streamChatCompletion(
+      { baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' },
+      [{ role: 'user', content: 'x' }],
+      {
+        fetchImpl: fakeFetch(sse, cap),
+        onDelta: (e) => evs.push({ type: e.type, ...(e.type === 'reasoning' || e.type === 'delta' ? { text: e.text } : {}) }),
+      },
+    );
+    expect(r.text).toBe('正文');
+    expect(r.ttftMs).not.toBeNull(); // ttft 从首个 content 起算（reasoning 不算）
+    expect(evs.filter((e) => e.type === 'reasoning').map((e) => e.text).join('')).toBe('先想想再想想');
+    expect(evs.filter((e) => e.type === 'delta').map((e) => e.text).join('')).toBe('正文');
   });
 });

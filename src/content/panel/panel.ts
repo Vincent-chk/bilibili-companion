@@ -49,6 +49,7 @@ export interface SegNoteVM {
   status: 'streaming' | 'done' | 'failed';
   error?: { code: string; msg: string };
   truncated?: boolean;
+  queued?: number; // F13 提速：交互链排队位次（前面还有 N 个）；首个 delta 到达即失效
 }
 
 export interface PanelDeps {
@@ -121,6 +122,11 @@ export class PanelController {
     deps.ui.root.getElementById('btn-settings')?.addEventListener('click', () => {
       if (this.#open) void this.#showSettings();
     });
+    // 真人测试反馈：面板打开后无关闭按钮（此前只能 Esc 或点豆包身体收起，不直观）→ 头部补 ✕
+    deps.ui.root.getElementById('btn-close')?.addEventListener('click', () => this.close());
+    // 真人测试反馈：头部圆形头像未显示——root.ts 的 <img> 无 src（原型有），在持有 browser 的 panel 侧补上
+    const headerAvatar = deps.ui.root.querySelector<HTMLImageElement>('.p-mascot-avatar img');
+    if (headerAvatar && !headerAvatar.src) headerAvatar.src = browser.runtime.getURL('/mascot/mascot-avatar.png');
   }
 
   #modalShown(): boolean {
@@ -855,6 +861,7 @@ export class PanelController {
         note?: SegNoteVM;
         error?: string;
         started?: boolean;
+        queued?: number;
       }>({ type: 'SEGMENT_NOTE_OPEN', videoKey: this.#detailKey, segIndex: i, ...(retry === 1 ? { retry: 1 } : {}) });
       if (this.#detailKey === null) return; // 已返回列表：丢弃
       if (!r?.ok) {
@@ -871,6 +878,11 @@ export class PanelController {
       const n = r.note;
       if (n?.status === 'done') this.#segNotes.set(i, { status: 'done', text: n.text ?? '', truncated: n.truncated });
       else if (n?.status === 'failed') this.#segNotes.set(i, { status: 'failed', text: '', error: n.error });
+      // F13 提速：流式态记录排队位次（占位追加「排队中」后缀，首字到达即消失）
+      else if (r.queued !== undefined) {
+        const st = this.#segNotes.get(i);
+        if (st?.status === 'streaming') st.queued = r.queued;
+      }
       // streaming：保持占位，等 SEGMENT_NOTE_STREAM/DONE 广播回填
       this.#paintSegNote(i);
     } catch {
@@ -889,9 +901,10 @@ export class PanelController {
     const st = this.#segNotes.get(i);
     if (!st) return;
     if (st.status === 'streaming') {
+      const queue = st.queued && st.queued > 0 ? `<span class="seg-queue">（排队中 · 前面还有 ${st.queued} 个）</span>` : '';
       el.innerHTML = st.text
         ? `${esc(st.text)}<span class="caret"></span>`
-        : '<span class="spinner"></span>豆包正在解读该段…';
+        : `<span class="spinner"></span>豆包正在解读该段…${queue}`;
     } else if (st.status === 'done') {
       el.innerHTML = `${esc(st.text)}${st.truncated ? '<span class="seg-trunc">段过长：仅解读了段内前部分字幕</span>' : ''}`;
     } else {
