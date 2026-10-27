@@ -16,7 +16,7 @@
 // 端口全部动态分配（debug=0 → 读 DevToolsActivePort；mock=0 → 解析 stdout），避免与残留进程抢端口。
 // 红线：只用样本清单内 BV；临时 profile 用完即删；Cookie/Key 不打印不落盘。
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -165,7 +165,21 @@ async function main() {
         const { sessionId, targetInfo: t } = m.params;
         sessionByTarget.set(t.targetId, sessionId);
         attachedTargets.push({ type: t.type, url: t.url, targetId: t.targetId, at: Date.now() });
-        if (t.type === 'service_worker' && t.url.includes('background')) swSessionId = sessionId; // SW 可能重启，始终取最新
+        if (t.type === 'service_worker' && t.url.includes('background')) {
+          // 本机 CfT 157 会同时 attach 多个扩展 SW（另有两个稳定的外部扩展 background.js，
+          // 2026-10-27 实测三 SW attach 顺序随机）——last-attach-wins 会把 swSessionId 指到
+          // 外部扩展：其 chrome.storage/DB 全空 + 后续 RPC 静默失败（P3 收口轮 33 红根因）。
+          // 改按 manifest.name 精确认领本扩展；SW 重启重 attach 时仍始终取最新。
+          cdp('Runtime.evaluate', {
+            expression: 'chrome.runtime.getManifest().name',
+            returnByValue: true,
+          }, sessionId).then((rr) => {
+            if (rr?.result?.result?.value === '豆包陪看助手（PoC）') {
+              swSessionId = sessionId;
+              log(`sw session 认领（manifest.name 匹配）: ${t.url.slice(0, 60)}`);
+            }
+          }).catch(() => {});
+        }
         cdp('Runtime.enable', {}, sessionId).catch(() => {});
         // 扩展出网审计面：SW（chrome-extension:// URL）+ offscreen 文档——后者 attach 时
         // targetInfo.url 常为空且 type='other'（P2.4 实测：按 URL 过滤会漏掉 offscreen 的
@@ -205,6 +219,13 @@ async function main() {
       if (m.method === 'Runtime.consoleAPICalled') {
         const text = (m.params.args || []).map(renderRemote).join(' ');
         lines.push({ t: Date.now(), type: m.params.type, text });
+        // SW 认领兜底：background ready 是本扩展每次 SW 启动必打的首行日志（含重启），
+        // 外部扩展（CfT 157 自带 Gemini/Contextual Tasks）不会出现该标记——比 attach 时
+        // evaluate 认领更可靠（实测 onmessage 内发起的 evaluate 应答未达，r2 FATAL 根因）
+        if (text.includes('[doubao-poc] background ready') && m.sessionId && m.sessionId !== swSessionId) {
+          swSessionId = m.sessionId;
+          log('sw session 认领（background ready 标记）');
+        }
         if (text.includes('[doubao') || m.params.type === 'error') {
           log(`console:${m.params.type}:`, text.slice(0, 220));
         }
@@ -552,6 +573,9 @@ async function main() {
     let settingsProbe = null; // P2.5：设置页探针（视图/打码/2.7b 人设联动/阈值/暂停/气泡/清 Key/隐藏+清除迁移）
     let errProbe = null; // P2.6：错误态探针（Key 无效全链/断网挂起续跑）
     let errProbeStartIdx = 0; // noExplicitFail 截止线（错误态探针预期产生 failed 终态）
+    let perfProbe = null; // P3.2：性能探针（注入耗时/面板刷新耗时/扩展内存/主线程占用）
+    let panelOpenMsProbe = -1; // P3.2：面板打开耗时（8.5 探针写入，判定项引用）
+    let themeProbe = null; // P3.3：暗色模式宿主类同步探针
     const probeSid = landingSid; // P1.8 起固定主页面 session（后续会新建标签页，pop() 会误取）
     // 共享 eval 助手（P1.8 探针前移：同页 seek 与 8.7 豆包交互共用）
     const evalIn = async (sid, expression) => {
@@ -570,11 +594,24 @@ async function main() {
 
       if (uiRootInjected) {
         // 点击豆包 → 面板开（shadow root 内真实 click 事件）
+        // P3.2：面板打开耗时探针——click → 面板真正可见（transform 收敛前 .open 类即就位）
+        const tPanel0 = Date.now();
         await cdp('Runtime.evaluate', {
           expression: 'document.getElementById("doubao-ui-root").shadowRoot.getElementById("mascot").click()',
           returnByValue: true,
         }, probeSid);
-        await sleep(1200); // LIST_QUERY 往返 + 渲染
+        let panelOpenMs = -1;
+        for (let i = 0; i < 40 && panelOpenMs < 0; i++) {
+          const o = await cdp('Runtime.evaluate', {
+            expression: `(() => JSON.stringify({ open: document.getElementById('doubao-ui-root').shadowRoot.getElementById('panel')?.classList.contains('open') === true }))()`,
+            returnByValue: true,
+          }, probeSid);
+          if (o?.result?.result?.value && JSON.parse(o.result.result.value).open) panelOpenMs = Date.now() - tPanel0;
+          else await sleep(50);
+        }
+        panelOpenMsProbe = panelOpenMs; // 判定项引用（外层作用域）
+        log(`P3.2 面板打开耗时=${panelOpenMs}ms（指标 ≤300ms，含 CDP 往返开销）`);
+        await sleep(900); // LIST_QUERY 往返 + 渲染（原 1200ms；面板可见性已由上方轮询确认）
         r = await cdp('Runtime.evaluate', {
           expression: `(() => {
             const sr = document.getElementById('doubao-ui-root').shadowRoot;
@@ -1044,6 +1081,52 @@ async function main() {
                 })()`);
                 p19 = { ...p19, fullscreen: { fsReq, fsState, fsBack } };
                 log('P1.9 全屏避让探针:', JSON.stringify(p19.fullscreen));
+
+                // P3.1 全屏矩阵：①先把豆包外置到右下界缘（大视口坐标）→ ②视口变小（900×600）
+                // → resize 事件驱动 reclampToViewport → 豆包不出界。顺序关键：tab3 直达页默认位
+                // 本就界内，不先外置则探针恒真（假通过）。
+                await eval3(`(() => {
+                  const sr = document.getElementById('doubao-ui-root').shadowRoot;
+                  const w = sr.getElementById('mascot-wrap');
+                  w.style.left = '1262px'; w.style.top = '850px'; return 'placed';
+                })()`);
+                await cdp('Emulation.setDeviceMetricsOverride', { width: 900, height: 600, deviceScaleFactor: 1, mobile: false }, tab3Sid).catch(() => {});
+                await sleep(500); // resize 事件 → reclampToViewport
+                const narrow = await eval3(`(() => {
+                  const sr = document.getElementById('doubao-ui-root').shadowRoot;
+                  const r = sr.getElementById('mascot-wrap').getBoundingClientRect();
+                  return JSON.stringify({ vw: innerWidth, vh: innerHeight, left: Math.round(r.left), top: Math.round(r.top),
+                    right: Math.round(r.right), bottom: Math.round(r.bottom) });
+                })()`);
+                await shotNamed(tab3Sid, 'visual-narrow-viewport.png'); // 视觉验收：小窗态豆包在界内
+                await cdp('Emulation.clearDeviceMetricsOverride', {}, tab3Sid).catch(() => {});
+                await sleep(500);
+                p19 = { ...p19, resizeReclamp: narrow };
+                log('P3.1 视口缩放重钳位探针:', JSON.stringify(narrow));
+
+                // P3.1 宽屏矩阵上限（验收总纲：1280–2560px 宽）：2560×1440 下豆包外置位
+                // 2400/1350（x 超出 2560 视口钳位上界 2382）→ resize 后重钳位到右下角界内
+                // + 面板 400px 不溢出视口。
+                await eval3(`(() => {
+                  const sr = document.getElementById('doubao-ui-root').shadowRoot;
+                  const w = sr.getElementById('mascot-wrap');
+                  w.style.left = '2400px'; w.style.top = '1350px'; return 'placed-wide';
+                })()`);
+                await cdp('Emulation.setDeviceMetricsOverride', { width: 2560, height: 1440, deviceScaleFactor: 1, mobile: false }, tab3Sid).catch(() => {});
+                await sleep(500); // resize 事件 → reclampToViewport（2400 → 钳位 2382）
+                const wide = await eval3(`(() => {
+                  const sr = document.getElementById('doubao-ui-root').shadowRoot;
+                  const r = sr.getElementById('mascot-wrap').getBoundingClientRect();
+                  const p = sr.getElementById('panel');
+                  return JSON.stringify({ vw: innerWidth, vh: innerHeight, left: Math.round(r.left), top: Math.round(r.top),
+                    right: Math.round(r.right), bottom: Math.round(r.bottom),
+                    panelW: Math.round(p.getBoundingClientRect().width), panelOpen: p.classList.contains('open') });
+                })()`);
+                await shotNamed(tab3Sid, 'visual-wide-viewport.png'); // 视觉验收：2560 宽屏豆包右下角+面板界内
+                await cdp('Emulation.clearDeviceMetricsOverride', {}, tab3Sid).catch(() => {});
+                await sleep(500);
+                p19 = { ...p19, wideViewport: wide };
+                log('P3.1 宽屏矩阵探针:', JSON.stringify(wide));
               }
             } else {
               log('P1.9 探针：tab3 session 未得，overlay/全屏跳过');
@@ -1639,7 +1722,19 @@ async function main() {
           await sleep(1500);
           const th60Store = await swStore();
           await cdp('Page.navigate', { url: PAGE_URL }, probeSid);
-          await sleep(3000);
+          // P3.2 注入耗时探针：content main() 起点→UI 挂载完成（performance.now 时基，
+          // document_idle 语义下=纯执行体成本，不含页面加载等待）。轮询日志窗捕获。
+          {
+            const tInj0 = Date.now();
+            let injMs = null;
+            for (let i = 0; i < 40 && injMs === null; i++) {
+              const l = lines.filter((x) => x.text.includes('[doubao-perf] inject-ms') && x.t >= tInj0).pop();
+              if (l) injMs = Number(l.text.match(/inject-ms ([\d.]+)/)?.[1] ?? NaN);
+              else await sleep(250);
+            }
+            perfProbe = { ...(perfProbe ?? {}), injectObservedMs: injMs, observedWallMs: Date.now() - tInj0 };
+            log(`P3.2 注入耗时观察: inject-ms=${injMs} wall=${Date.now() - tInj0}ms`);
+          }
           await pageEval(`(async () => ${playMuted})()`).catch(() => {});
           await cdp('Page.bringToFront', {}, probeSid).catch(() => {});
           // 等真实进入（VIDEO_ENTER 成功 → visit 建立，阈值 60 已随应答下发 watcher）
@@ -1673,6 +1768,22 @@ async function main() {
             th5Done = lines.slice(th5LogBase).some((l) => l.text.includes('job SUMMARIZE') && l.text.includes(BVID) && l.text.includes('→ done'));
           }
           log('P2.5 d) 阈值子项:', JSON.stringify({ th60: th60Store?.settings?.triggerSeconds, baseJobs60, th60Jobs: th60Jobs?.jobs, th60NoTrigger, th5Queued, th5Done }));
+
+          // ---- P3.3 暗色模式探针（d2）：html.dark → Shadow 宿主同步 .dark；移除→回浅色 ----
+          await pageEval(`document.documentElement.classList.add('dark')`);
+          await sleep(400); // MutationObserver 微任务即生效，留渲染余量
+          const darkOn = await pageEval(`(() => JSON.stringify({
+            hostDark: document.getElementById('doubao-ui-root').classList.contains('dark'),
+            panelBg: getComputedStyle(document.getElementById('doubao-ui-root').shadowRoot.getElementById('panel')).backgroundColor }))()`);
+          await shotNamed(probeSid, 'visual-panel-dark.png'); // 视觉验收：暗色模式面板（S4-暗）
+          await pageEval(`document.documentElement.classList.remove('dark')`);
+          await sleep(400);
+          const darkOff = await pageEval(`(() => JSON.stringify({
+            hostDark: document.getElementById('doubao-ui-root').classList.contains('dark'),
+            panelBg: getComputedStyle(document.getElementById('doubao-ui-root').shadowRoot.getElementById('panel')).backgroundColor }))()`);
+          themeProbe = { darkOn, darkOff };
+          log('P3.3 暗色模式探针:', JSON.stringify(themeProbe));
+
           // 阈值恢复 20（后续探针的默认口径）
           await pclick('#btn-settings');
           await sleep(700);
@@ -1977,6 +2088,33 @@ async function main() {
       }
     }
 
+    // 8.998) P3.2 性能量化：扩展进程组内存（RSS，指标 ≤120MB）+ [doubao-perf] 日志采集
+    {
+      const pidsOf = (pat) => {
+        try { return execSync(`/usr/bin/pgrep -f "${pat}"`, { encoding: 'utf8' }).split('\n').filter(Boolean).map(Number); } catch { return []; }
+      };
+      const rssMb = (pids) => {
+        if (!pids.length) return 0;
+        try {
+          const out = execSync(`/bin/ps -o rss= -p ${pids.join(',')}`, { encoding: 'utf8' });
+          return Math.round(out.trim().split('\n').reduce((a, s) => a + Number(s.trim() || 0), 0) / 1024);
+        } catch { return 0; }
+      };
+      // Chrome 进程树：主进程=--user-data-dir 命令行；扩展进程=--extension-process（SW/offscreen/UI）
+      const allPids = pidsOf(`user-data-dir=${profile}`);
+      // 只取本 Chrome 实例的扩展进程（pgrep -f 全局匹配会误收其他 Chrome 的扩展进程）
+      const extCmd = (pid) => { try { return execSync(`/bin/ps -o command= -p ${pid}`, { encoding: 'utf8' }); } catch { return ''; } };
+      const extPids = pidsOf('extension-process').filter((pid) => extCmd(pid).includes(`user-data-dir=${profile}`));
+      perfProbe = {
+        ...(perfProbe ?? {}), // 保留 d) 导航窗捕获的 injectObservedMs/observedWallMs
+        perfLogs: lines.filter((l) => l.text.includes('[doubao-perf]')).map((l) => l.text),
+        extRssMb: rssMb(extPids.length ? extPids : allPids),
+        browserGroupRssMb: rssMb([...new Set([...allPids, ...extPids])]),
+        procCounts: { all: allPids.length, extension: extPids.length },
+      };
+      log('P3.2 性能探针:', JSON.stringify({ ...perfProbe, perfLogs: perfProbe.perfLogs.length }));
+    }
+
     // 9) 截图与 console 留证
     const shot = path.join(ROOT, 'e2e-artifacts');
     fs.mkdirSync(shot, { recursive: true });
@@ -1995,7 +2133,7 @@ async function main() {
     const netHosts = [...new Set(netUrls.map((u) => { try { return new URL(u).hostname; } catch { return String(u).slice(0, 80); } }))];
     const routeChangedCount = lines.filter((l) => l.text.includes('[doubao-poc] route-changed')).length;
     log(`出网审计: ${netUrls.length} 请求, hosts=${JSON.stringify(netHosts)}; route-changed 原始计数=${routeChangedCount}; llm 指标 ${llmMetrics.length} 条`);
-    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, settingsProbe, errProbe, lines }, null, 1));
+    fs.writeFileSync(path.join(shot, 'console.json'), JSON.stringify({ outcome, realMode: REAL, bvid: BVID, url: PAGE_URL, llmModel: llmCfg.modelId, llmMetrics, netHosts, netRequestCount: netUrls.length, routeChangedCount, dbSummary, uiProbe, mascotProbe, onboardingProbe, seekProbe, regenProbe, p19: p19Probe, loginProbe, sessionProbe, retentionProbe, wipeProbe, asrProbe, dnrProbe, settingsProbe, errProbe, perfProbe, themeProbe, lines }, null, 1));
     log(`console lines: ${lines.length}, screenshots: ${shotSaved}, saved to e2e-artifacts/`);
 
     // 10) 判定（真实链标记：onboarding → 激活 → watcher 触发 → offscreen → DB 落库 → 面板 → P1.6 豆包交互）
@@ -2191,6 +2329,34 @@ async function main() {
       // F13 预取：SEGMENT_ANALYZE 失败属预期可恢复路径（STALE 作废重跑/NO_CUES/清Key期 NO_LLM_CONFIG），
       // SW 迁移行（job SEGMENT_ANALYZE → failed）与 offscreen 完成行（type=SEGMENT_ANALYZE）都排除
       noExplicitFail: !lines.slice(cookieLineIdx, errProbeStartIdx || lines.length).some((l) => (l.text.includes('[doubao]') && l.text.includes('→ failed') && !l.text.includes('job SEGMENT_ANALYZE') && !l.text.includes('type=SEGMENT_ANALYZE')) || l.text.includes('E2E FAIL')),
+      // P3.1 全屏矩阵：视口变小后豆包重钳位在界内（left/top≥0 且 right/bottom 不超视口；
+      // headless 默认窗 1440×900 → override 900×600，resize 事件驱动 reclampToViewport）
+      resizeReclampInBounds: (() => {
+        const n = p19Probe?.resizeReclamp;
+        // 强判据：外置位 left=1262/top=850 在 900×600 视口必出界 → 钳位后必须贴右下缘（防恒真）
+        return !!n && n.vw === 900 && n.vh === 600 && n.left >= 0 && n.top >= 170 && n.right <= n.vw && n.bottom <= n.vh
+          && n.left > 700 && n.top > 400;
+      })(),
+      // P3.1 宽屏矩阵 2560：外置位 2400 钳位到 2382 界内 + 面板布局宽 ≤400 不随视口膨胀
+      //（rect.right 不可用——面板闭合态 translateX(105%) 平移出屏属预期，宽度不受平移影响）
+      wideViewport2560InBounds: (() => {
+        const w = p19Probe?.wideViewport;
+        return !!w && w.vw === 2560 && w.vh === 1440 && w.left >= 0 && w.top >= 170 &&
+          w.right <= w.vw && w.bottom <= w.vh && w.panelW <= 400 && w.left > 2200;
+      })(),
+      // P3.2 性能达标：注入 ≤1.5s / 面板打开 ≤300ms（含 CDP 往返）/ 扩展进程组 RSS ≤120MB
+      perfInjectUnder1500ms: (() => {
+        const v = perfProbe?.injectObservedMs; // d) 导航轮询窗内捕获的 [doubao-perf] inject-ms
+        return typeof v === 'number' && Number.isFinite(v) && v <= 1500;
+      })(),
+      perfPanelOpenUnder300ms: panelOpenMsProbe >= 0 && panelOpenMsProbe <= 300,
+      perfExtMemoryUnder120MB: (perfProbe?.extRssMb ?? 1e9) > 0 && (perfProbe?.extRssMb ?? 1e9) <= 120,
+      // P3.3 暗色模式：html.dark → 宿主 .dark + 面板底色转暗；移除 → 回浅色（双向同步）
+      darkModeHostSync:
+        themeProbe?.darkOn?.hostDark === true &&
+        String(themeProbe?.darkOn?.panelBg ?? '').includes('rgb(22, 22, 26)') &&
+        themeProbe?.darkOff?.hostDark === false &&
+        String(themeProbe?.darkOff?.panelBg ?? '').includes('rgb(244, 245, 247)'),
     };
     console.log('\n=== E2E 判定 ===');
     for (const [k, v] of Object.entries(verdict)) console.log(`  ${v ? '✅' : '❌'} ${k}`);

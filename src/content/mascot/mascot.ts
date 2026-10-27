@@ -273,6 +273,12 @@ export class MascotController {
     this.#el.wrap.style.top = `${p.y}px`;
   }
 
+  /** P3.1：视口变化（进/退全屏、窗口缩放）后按当前视口重钳位，防豆包出界不可达。 */
+  reclampToViewport(): void {
+    const { vw, vh } = this.#viewport();
+    this.#applyPos(clampMascotPos(this.#el.wrap.offsetLeft, this.#el.wrap.offsetTop, vw, vh));
+  }
+
   get position(): { x: number; y: number } {
     return { x: this.#el.wrap.offsetLeft, y: this.#el.wrap.offsetTop };
   }

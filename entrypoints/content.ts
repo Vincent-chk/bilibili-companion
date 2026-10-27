@@ -16,6 +16,7 @@ import { clockOf, fmtSec } from '../src/content/panel/view-models';
 import { LOGIN_BUBBLE_TEXT, loginBubble } from '../src/content/login';
 import { shouldConsumeSeek } from '../src/content/seek';
 import { setupFullscreenMigration } from '../src/content/ui/fullscreen';
+import { setupThemeSync } from '../src/content/ui/theme';
 import { mountDoubaoUi, toast } from '../src/content/ui/root';
 import { WatchSession, findVideoElement } from '../src/content/watcher/dom';
 
@@ -25,7 +26,10 @@ export default defineContentScript({
   matches: ['*://www.bilibili.com/*'],
   runAt: 'document_idle',
   main() {
+    // P3.2 性能探针：注入耗时（content script 起点→UI 挂载完成，performance.now 单调时基）
+    const tInject0 = performance.now();
     const ui = mountDoubaoUi();
+    console.log('[doubao-perf] inject-ms', (performance.now() - tInject0).toFixed(1));
     let panel: PanelController | null = null;
 
     const requestSessionStart = async (): Promise<void> => {
@@ -210,7 +214,10 @@ export default defineContentScript({
     });
 
     // P1.9 准则#3：浏览器全屏时把 Shadow 宿主迁入全屏元素子树（退出迁回）
-    setupFullscreenMigration(document, ui.host);
+    // P3.1：视口变化（进/退全屏、窗口缩放）→ 豆包按新视口重钳位（防出界不可达）
+    setupFullscreenMigration(document, ui.host, () => mascot?.reclampToViewport());
+    // P3.3：B 站暗色模式 → 宿主同步 .dark 类（Shadow DOM 不吃页面级联，令牌覆盖见 styles.ts）
+    setupThemeSync(document, ui.host);
     // P1.9 准则#5：VIDEO_ENTER 解析出当前视频后通知面板跟随（startWatcher 在模块层回调）
     onVideoKeyResolved = (videoKey) => panel?.followVideo(videoKey);
 

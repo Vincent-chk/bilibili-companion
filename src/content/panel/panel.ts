@@ -209,6 +209,7 @@ export class PanelController {
 
   /** LIST_QUERY → 渲染当前视图。 */
   async refresh(): Promise<void> {
+    const t0 = performance.now(); // P3.2 性能探针：列表态「数据往返+渲染」耗时（面板 ≤300ms 指标）
     try {
       const r = await this.deps.bridge.request<ListQueryResponse>({ type: 'LIST_QUERY' });
       if (!r?.ok) return;
@@ -219,7 +220,10 @@ export class PanelController {
       this.#paused = r.paused === true; // P2.5：状态行「已暂停」提示
       this.setLoginState(r.loggedIn ?? null); // P1.10 引导卡（SW 缓存值；强制复核在 open()）
       this.#renderStatus();
-      if (this.#view === 'list') this.#renderList();
+      if (this.#view === 'list') {
+        this.#renderList();
+        console.log('[doubao-perf] panel-refresh-ms', (performance.now() - t0).toFixed(1), this.#items.length);
+      }
       // P2.2 F10-②：超期待确认 → 打开面板即弹清除确认（本次开口只弹一次；「稍后提醒」重开再弹）
       if (
         this.#open &&

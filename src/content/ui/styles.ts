@@ -17,6 +17,49 @@ export const UI_STYLES = `
     --purple: #7c3aed; --purple-bg: #f3e8ff;
   }
   :host, :host * { box-sizing: border-box; }
+  /* P3.3 · B 站暗色模式适配：宿主类由 ui/theme.setupThemeSync（html.dark / theme-* 信号）同步。
+     仅重定义设计令牌——选择器 :host(.dark) .x 特异性高于 .x，硬编码浅色逐条被覆盖；
+     品牌色不变量（粉/蓝按钮、渐变头像、rgba 投影、深底白字徽章）不在暗色组内。 */
+  :host(.dark) {
+    --bg: #16161a; --text: #e8e9ea; --text2: #a0a4ab; --text3: #757a82; --line: #2c2f36;
+    --card: #1e2025;
+    --green-bg: #123222; --blue2-bg: #0e2c3d; --orange-bg: #3a2413;
+    --gray-bg: #26282e; --red-bg: #3d1518; --purple-bg: #2a1b3d;
+  }
+  :host(.dark) ::selection { background: #5b2335; }
+  :host(.dark) .mascot-bubble { background: var(--card); color: var(--text); }
+  :host(.dark) .mascot-bubble::after { border-top-color: var(--card); }
+  :host(.dark) .p-head { background: var(--card); }
+  :host(.dark) .btn-ghost { background: var(--card); color: var(--text2); }
+  :host(.dark) .countdown-pill { background: #33230f; color: #f0a458; }
+  :host(.dark) .v-item:hover { box-shadow: 0 6px 18px rgba(0,0,0,.45); }
+  :host(.dark) .v-cover { background: #2c2f36; }
+  :host(.dark) .d-back { background: var(--card); color: var(--text2); }
+  :host(.dark) .d-cover { background: #2c2f36; }
+  :host(.dark) .d-sec { background: var(--card); }
+  :host(.dark) .d-summary { color: #c7cad1; }
+  :host(.dark) .d-outline li:hover { background: #2b1e24; }
+  :host(.dark) .seg-btn:hover { background: #14384e; color: #7cc7ef; }
+  :host(.dark) .seg-note { background: #23252c; color: #c7cad1; }
+  :host(.dark) .mascot-card { background: linear-gradient(135deg,#2a2418,#2a1f26); border-color: #4a3a22; }
+  :host(.dark) .mascot-say-text { color: #cdb898; }
+  :host(.dark) .tr-line:hover { background: #23252c; }
+  :host(.dark) .set-sec { background: var(--card); }
+  :host(.dark) .tag-required { background: var(--red-bg); color: #f87171; }
+  :host(.dark) .field input[type=text], :host(.dark) .field input[type=password] { background: #23252c; color: var(--text); }
+  :host(.dark) .set-disabled input { background: #1e2025 !important; }
+  :host(.dark) .rule-box { background: #1e2025; }
+  :host(.dark) .p-icon-btn:hover { background: #26282e; }
+  :host(.dark) .set-danger { border-color: #5b2328; }
+  :host(.dark) .switch i { background: #3a3e46; }
+  :host(.dark) .persona-pill { background: var(--card); }
+  :host(.dark) .persona-pill.on { background: #2b1e24; }
+  :host(.dark) .modal { background: var(--card); }
+  :host(.dark) .m-step.step-disabled { background: #1e2025; }
+  :host(.dark) .step-num.gray { background: #4a4e57; }
+  :host(.dark) .test-status.err { color: #f87171; }
+  :host(.dark) .field input.err { border-color: #b91c1c; }
+  :host(.dark) .field .field-err { color: #f87171; }
   :host {
     font-family: system-ui, -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
     color: var(--text);
@@ -53,7 +96,7 @@ export const UI_STYLES = `
   @keyframes caretBlink { 50% { opacity: 0; } }
 
   /* ============ 右侧面板（overlay，不推挤页面布局） ============ */
-  #panel { position: fixed; top: 0; right: 0; bottom: 0; width: 400px; background: var(--bg); z-index: 2147483100; display: flex; flex-direction: column; transform: translateX(105%); transition: transform .28s cubic-bezier(.22,.8,.36,1); box-shadow: -8px 0 32px rgba(0,0,0,.12); }
+  #panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(400px, calc(100vw - 24px)); background: var(--bg); z-index: 2147483100; display: flex; flex-direction: column; transform: translateX(105%); transition: transform .28s cubic-bezier(.22,.8,.36,1); box-shadow: -8px 0 32px rgba(0,0,0,.12); } /* P3.1：窄视口（小窗/分屏）面板不出界 */
   #panel.open { transform: translateX(0); }
   .p-head { background: #fff; padding: 14px 16px 12px; border-bottom: 1px solid var(--line); flex: none; }
   .p-head-row { display: flex; align-items: center; gap: 10px; }
