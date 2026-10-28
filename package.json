@@ -1,6 +1,6 @@
 {
   "name": "bilibili-companion",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "「豆包」B 站陪看助手：视频摘要、点评和分段解读",
