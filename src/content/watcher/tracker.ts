@@ -5,6 +5,7 @@
 
 export interface WatchTickPayload {
   videoKey: string;
+  watchId?: string;
   watchedSeconds: number;
   progressPct: number;
 }
@@ -15,6 +16,7 @@ export interface WatchTriggerPayload {
 
 export interface WatchTrackerOptions {
   videoKey: string;
+  watchId?: string;
   durationSec: number;
   thresholdSec: number;
   onTick: (p: WatchTickPayload) => void;
@@ -38,6 +40,7 @@ export class WatchTracker {
   #currentSec = 0;
   #triggered = false;
   #lastTickWallMs = -Infinity;
+  #lastReportedSeconds = 0;
   readonly #now: () => number;
 
   constructor(private readonly o: WatchTrackerOptions) {
@@ -58,12 +61,15 @@ export class WatchTracker {
   }
 
   setPlaying(playing: boolean): void {
+    if (this.#playing && !playing && this.watchedSeconds > this.#lastReportedSeconds) this.#maybeTick(true);
     this.#playing = playing;
     if (!playing) this.#lastMediaSec = null; // 重基线：暂停期间拖进度条不被计入
   }
 
   setVisible(visible: boolean): void {
+    if (this.#visible && !visible && this.#playing && this.watchedSeconds > this.#lastReportedSeconds) this.#maybeTick(true);
     this.#visible = visible;
+    if (!visible) this.#lastMediaSec = null; // 后台即使没有 timeupdate，回前台也需重新建立基线
   }
 
   /** timeupdate（≈4Hz）喂入媒体当前时间。 */
@@ -79,16 +85,20 @@ export class WatchTracker {
     } else {
       this.#lastMediaSec = null; // 非有效观看期间只刷进度，不累计（恢复时重基线）
     }
-    this.#maybeTick();
+    // 首次跨过本地阈值时无视节流，保证后台收到完整累计值；即使触发消息先到也能由 tick 兜底。
+    const crossingThreshold = !this.#triggered && this.#watchedMs >= this.o.thresholdSec * 1000;
+    this.#maybeTick(crossingThreshold);
     this.#maybeTrigger();
   }
 
-  #maybeTick(): void {
+  #maybeTick(force = false): void {
     const t = this.#now();
-    if (t - this.#lastTickWallMs < WATCH_TICK_MIN_INTERVAL_MS) return;
+    if (!force && t - this.#lastTickWallMs < WATCH_TICK_MIN_INTERVAL_MS) return;
     this.#lastTickWallMs = t;
+    this.#lastReportedSeconds = this.watchedSeconds;
     this.o.onTick({
       videoKey: this.o.videoKey,
+      ...(this.o.watchId ? { watchId: this.o.watchId } : {}),
       watchedSeconds: this.watchedSeconds,
       progressPct: this.progressPct,
     });

@@ -68,13 +68,18 @@ export const UI_STYLES = `
   input { font-family: inherit; }
   .hidden { display: none !important; }
   ::selection { background: #ffd9e4; }
+  .update-banner { margin: 10px 12px; padding: 10px 12px; border-radius: 10px; background: var(--blue2-bg); color: var(--text); font-size: 12px; }
+  .update-banner a { color: var(--blue2); font-weight: 600; }
 
   /* ============ 豆包吉祥物（1.6：状态机切图 + CSS 动画；1.9：贴边/闲时半透明/全屏层级） ============ */
   /* z-index 取 2147483000 段位（架构 §2.1）：B 站网页全屏为 CSS 全屏，靠层级保持浮层在上 */
-  #mascot-wrap { position: fixed; z-index: 2147483000; width: 170px; user-select: none; -webkit-user-select: none; transition: opacity .4s ease; }
+  #mascot-wrap { position: fixed; z-index: 2147483000; width: 170px; height: 150px; pointer-events: none; user-select: none; -webkit-user-select: none; transition: opacity .4s ease; }
   #mascot-wrap.idle-dim { opacity: .6; } /* 准则#1：5s 无交互降 60% 透明 */
   #mascot-wrap.snapping { transition: opacity .4s ease, left .2s ease, top .2s ease; } /* 准则#1：松手贴边过渡 */
-  #mascot { position: relative; width: 150px; height: 150px; cursor: grab; transition: filter .2s; }
+  #mascot { position: absolute; left: 0; bottom: 0; width: 48px; height: 48px; padding: 0; border: 0; background: transparent; cursor: grab; pointer-events: auto; transition: filter .2s; }
+  #mascot-wrap.edge-right #mascot { left: auto; right: 0; }
+  #mascot-wrap:hover #mascot, #mascot-wrap:focus-within #mascot, #mascot-wrap.dragging #mascot { width: 150px; height: 150px; }
+  #mascot:focus-visible { outline: 3px solid #fb7299; outline-offset: 3px; border-radius: 16px; }
   #mascot:active { cursor: grabbing; }
   #mascot:hover { filter: drop-shadow(0 6px 16px rgba(251,114,153,.35)); }
   #mascot-img { display: block; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
@@ -87,9 +92,10 @@ export const UI_STYLES = `
   @keyframes bounce { 0%,100% { transform: translateY(0); } 35% { transform: translateY(-16px) rotate(-4deg); } 70% { transform: translateY(0); } 85% { transform: translateY(-7px); } }
 
   /* 气泡：完全悬浮在人物上方，不与立绘重叠（原型三修结论） */
-  .mascot-bubble { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); min-width: 120px; max-width: 230px; background: #fff; border-radius: 14px; padding: 9px 14px; font-size: 13px; line-height: 1.5; color: var(--text); box-shadow: var(--shadow-lg); text-align: center; animation: bubbleIn .25s ease; z-index: 2; }
+  .mascot-bubble { position: absolute; bottom: calc(100% + 10px); left: 0; min-width: min(120px, calc(100vw - 16px)); max-width: min(230px, calc(100vw - 16px)); background: #fff; border-radius: 14px; padding: 9px 14px; font-size: 13px; line-height: 1.5; color: var(--text); box-shadow: var(--shadow-lg); text-align: center; animation: bubbleIn .25s ease; z-index: 2; pointer-events: auto; }
+  #mascot-wrap.edge-right .mascot-bubble { left: auto; right: 0; }
   .mascot-bubble::after { content: ""; position: absolute; bottom: -7px; left: 50%; transform: translateX(-50%); border: 8px solid transparent; border-top-color: #fff; border-bottom: none; }
-  @keyframes bubbleIn { from { opacity: 0; transform: translateX(-50%) translateY(6px) scale(.9); } to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } }
+  @keyframes bubbleIn { from { opacity: 0; transform: translateY(6px) scale(.9); } to { opacity: 1; transform: translateY(0) scale(1); } }
   .mascot-bubble .bubble-btn { display: inline-block; margin-top: 6px; background: var(--pink); color: #fff; font-size: 13px; font-weight: 600; padding: 7px 18px; border-radius: 99px; transition: transform .15s, opacity .15s; white-space: nowrap; }
   .mascot-bubble .bubble-btn:hover { transform: scale(1.05); opacity: .92; }
   .mascot-bubble .caret { display: inline-block; width: 2px; height: 14px; background: var(--pink); vertical-align: -2px; animation: caretBlink .8s step-end infinite; }

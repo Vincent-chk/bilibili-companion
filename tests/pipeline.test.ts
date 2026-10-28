@@ -1,6 +1,6 @@
 // P1.3 · lib/pipeline 单测：入队幂等、SW 重启恢复（stale running 重排）、自动重试 ≤1、
 // need_confirm 状态与 resume/retry、并发=1、stage/progress 落库、执行中被清除不复活。
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { indexedDB, IDBKeyRange } from 'fake-indexeddb';
 import { CompanionDB, type JobRow } from '../src/lib/storage';
 import { Pipeline, type JobContext, type JobOutcome } from '../src/lib/pipeline';
@@ -57,6 +57,138 @@ describe('enqueue 幂等', () => {
 });
 
 describe('执行与终态', () => {
+  it('空队列查询进行中入队，新任务仍会在本轮结束前执行', async () => {
+    const { db, p } = mkPipeline(async () => ({ result: 'done' }));
+    let release!: () => void;
+    let markSnapshot!: () => void;
+    const snapshotTaken = new Promise<void>(resolve => { markSnapshot = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(p, 'tick').mockImplementationOnce(async () => {
+      const snapshot = await db.jobs.where('status').equals('pending').toArray();
+      expect(snapshot).toHaveLength(0);
+      markSnapshot();
+      await gate;
+      return false;
+    });
+    const draining = p.drain();
+    await snapshotTaken;
+    const job = await p.enqueue({ type: 'SUMMARIZE', videoKey: 'v', sessionId: 's' });
+    await p.drain(); // 与后台入队后的普通启动请求相同
+    release();
+    await draining;
+    expect((await db.jobs.get(job.id))?.status).toBe('done');
+    await db.delete();
+  });
+
+  it('空队列查询进行中手动重试失败任务，重试不会被遗漏', async () => {
+    const { db, p } = mkPipeline(async () => ({ result: 'done' }));
+    await db.jobs.put(mkJob({ id: 'failed', status: 'failed', retries: 1 }));
+    let release!: () => void;
+    let markSnapshot!: () => void;
+    const snapshotTaken = new Promise<void>(resolve => { markSnapshot = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(p, 'tick').mockImplementationOnce(async () => {
+      const snapshot = await db.jobs.where('status').equals('pending').toArray();
+      expect(snapshot).toHaveLength(0);
+      markSnapshot();
+      await gate;
+      return false;
+    });
+    const draining = p.drain();
+    await snapshotTaken;
+    await p.retry('failed');
+    await p.drain();
+    release();
+    await draining;
+    expect((await db.jobs.get('failed'))?.status).toBe('done');
+    await db.delete();
+  });
+
+  it('网络等待期间有新任务入队，也不立即重试等待中的任务', async () => {
+    const db = freshDb();
+    let online = false;
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const seen: string[] = [];
+    const p = new Pipeline(db, { execute: async job => {
+      seen.push(job.videoKey);
+      if (!online) { markStarted(); await gate; return { result: 'wait', error: { code: 'OFFLINE', msg: '离线' } }; }
+      return { result: 'done' };
+    } });
+    const first = await p.enqueue({ type: 'SUMMARIZE', videoKey: 'first', sessionId: 's' });
+    const draining = p.drain();
+    await started;
+    const second = await p.enqueue({ type: 'SUMMARIZE', videoKey: 'second', sessionId: 's' });
+    await p.drain();
+    release();
+    await draining;
+    expect(seen).toEqual(['first']);
+    expect((await db.jobs.get(first.id))?.status).toBe('pending');
+    expect((await db.jobs.get(second.id))?.status).toBe('pending');
+    online = true;
+    await p.drain(true);
+    expect(seen).toEqual(['first', 'first', 'second']);
+    await db.delete();
+  });
+
+  it('恢复请求发生在旧执行尚未结束时，结束后仍会补跑', async () => {
+    const db = freshDb();
+    let calls = 0;
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const p = new Pipeline(db, { execute: async () => {
+      calls++;
+      if (calls === 1) { markStarted(); await gate; return { result: 'wait', error: { code: 'PAUSED', msg: '暂停' } }; }
+      return { result: 'done' };
+    } });
+    await db.jobs.put(mkJob({ id: 'a' }));
+    const draining = p.drain();
+    await started;
+    await p.drain(true);
+    release();
+    await draining;
+    expect(calls).toBe(2);
+    expect((await db.jobs.get('a'))?.status).toBe('done');
+    await db.delete();
+  });
+
+  it('普通列表刷新在执行中重入，不会让挂起任务立即多跑一轮', async () => {
+    const db = freshDb();
+    let calls = 0;
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const p = new Pipeline(db, { execute: async () => { calls++; markStarted(); await gate; return { result: 'wait', error: { code: 'OFFLINE', msg: '离线' } }; } });
+    await db.jobs.put(mkJob({ id: 'a' }));
+    const draining = p.drain();
+    await started;
+    await p.drain();
+    release();
+    await draining;
+    expect(calls).toBe(1);
+    expect((await db.jobs.get('a'))?.status).toBe('pending');
+    await db.delete();
+  });
+  it('暂停后不继续执行已排队任务，恢复后可继续', async () => {
+    const db = freshDb();
+    let allowed = true;
+    const calls: string[] = [];
+    const p = new Pipeline(db, { execute: async job => { calls.push(job.videoKey); allowed = false; return { result: 'done' }; } }, { canRun: async () => allowed });
+    await db.jobs.put(mkJob({ id: 'a', videoKey: 'a', createdAt: 1 }));
+    await db.jobs.put(mkJob({ id: 'b', videoKey: 'b', createdAt: 2 }));
+    await p.drain();
+    expect(calls).toEqual(['a']);
+    expect((await db.jobs.get('b'))?.status).toBe('pending');
+    allowed = true;
+    await p.drain();
+    expect(calls).toEqual(['a', 'b']);
+    await db.delete();
+  });
   it('done：progress 落到 100；stage/progress 更新持久化', async () => {
     const { db, p } = mkPipeline(async (job, ctx) => {
       await ctx.update({ stage: 'subtitle', progress: 30 });
@@ -181,6 +313,59 @@ describe('need_confirm（need_asr，F6）', () => {
 });
 
 describe('SW 重启恢复', () => {
+  it('两条队列忙于空查询时，恢复的摘要和分段任务均能继续执行', async () => {
+    const db = freshDb();
+    await db.jobs.put(mkJob({ id: 'main', type: 'SUMMARIZE', status: 'running' }));
+    await db.jobs.put(mkJob({ id: 'segment', type: 'SEGMENT_ANALYZE', status: 'running', segIndex: 0 }));
+    const main = new Pipeline(db, { execute: async () => ({ result: 'done' }) }, { lane: ['SUMMARIZE'] });
+    const segment = new Pipeline(db, { execute: async () => ({ result: 'done' }) }, { lane: ['SEGMENT_ANALYZE'] });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let markMain!: () => void;
+    let markSegment!: () => void;
+    const snapshots = [new Promise<void>(resolve => { markMain = resolve; }), new Promise<void>(resolve => { markSegment = resolve; })];
+    for (const [queue, mark] of [[main, markMain], [segment, markSegment]] as const) {
+      vi.spyOn(queue, 'tick').mockImplementationOnce(async () => {
+        expect(await db.jobs.where('status').equals('pending').count()).toBe(0);
+        mark();
+        await gate;
+        return false;
+      });
+    }
+    const draining = [main.drain(), segment.drain()];
+    await Promise.all(snapshots);
+    expect(await main.recover()).toBe(2); // recover 恢复全部 lane
+    await Promise.all([main.drain(true), segment.drain(true)]);
+    release();
+    await Promise.all(draining);
+    expect((await db.jobs.get('main'))?.status).toBe('done');
+    expect((await db.jobs.get('segment'))?.status).toBe('done');
+    await db.delete();
+  });
+
+  it('显式恢复后仍离线时只补跑一次，不会热循环', async () => {
+    const db = freshDb();
+    let calls = 0;
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const p = new Pipeline(db, { execute: async () => {
+      calls++;
+      if (calls === 1) { markStarted(); await gate; }
+      return { result: 'wait', error: { code: 'OFFLINE', msg: '离线' } };
+    } });
+    await db.jobs.put(mkJob({ id: 'waiting' }));
+    const draining = p.drain();
+    await started;
+    await p.drain(true);
+    release();
+    await draining;
+    expect(calls).toBe(2);
+    expect((await db.jobs.get('waiting'))?.status).toBe('pending');
+    await db.delete();
+  });
+
   it('stale running 重排 pending，新 Pipeline 实例（模拟 SW 重启）可继续消费', async () => {
     const { db, p } = mkPipeline(async () => ({ result: 'done' }));
     await db.jobs.put(mkJob({ id: 'r1', status: 'running' }));
@@ -244,6 +429,18 @@ describe('P2.3 审查 P2-4：ASR_SUMMARIZE 失败不自动重排', () => {
 });
 
 describe('F13 双通道 lane + prio 优先级', () => {
+  it('保留等待中的自动摘要时，后面的手动重生成仍可执行', async () => {
+    const db = freshDb();
+    const p = new Pipeline(db, { execute: async () => ({ result: 'done' }) }, {
+      lane: ['SUMMARIZE', 'REGENERATE'], canRun: async job => job.type !== 'SUMMARIZE',
+    });
+    await db.jobs.put(mkJob({ id: 'automatic', type: 'SUMMARIZE', videoKey: 'a', createdAt: 1 }));
+    await db.jobs.put(mkJob({ id: 'manual', type: 'REGENERATE', videoKey: 'b', createdAt: 2 }));
+    await p.drain();
+    expect((await db.jobs.get('automatic'))?.status).toBe('pending');
+    expect((await db.jobs.get('manual'))?.status).toBe('done');
+    await db.delete();
+  });
   it('lane 过滤：主链只取摘要类，交互链只取 SEGMENT_ANALYZE（互不越界）', async () => {
     const db = freshDb();
     const mainSeen: string[] = [];

@@ -1,6 +1,6 @@
 // content script：Phase 0 骨架（0.3）+ P1.2 watcher + P1.5 面板 + P1.6 豆包 + P1.7 onboarding + P1.8 seek。
 // 职责：识别当前页 bvid → Shadow DOM 挂豆包 + 面板 → SPA 路由变化重新识别
-//       → watcher 有效观看计时（20s 触发 / WATCH_TICK 节流上报，经 runtime 消息走 background）。
+//       → watcher 有效观看计时（达到阈值触发 / WATCH_TICK 节流上报，经 runtime 消息走 background）。
 // UI：单一 Shadow 宿主（doubao-ui-root）；豆包（五表情状态机/气泡/拖拽/点击开合）+ 面板（列表/详情）+ onboarding 弹窗。
 // 会话：开始/结束陪看走 SESSION_START/END（最小切片，完整保留期状态机是任务 2.1）；
 //       未配置 LLM → NEED_ONBOARDING → onboarding 配置门槛（LLM 必填+测试连接+ASR 可选+TTS 置灰）。
@@ -21,6 +21,7 @@ import { mountDoubaoUi, toast } from '../src/content/ui/root';
 import { WatchSession, findVideoElement } from '../src/content/watcher/dom';
 
 let mascot: MascotController | null = null;
+let collectionEnabled = false;
 
 export default defineContentScript({
   matches: ['*://www.bilibili.com/*'],
@@ -31,6 +32,15 @@ export default defineContentScript({
     const ui = mountDoubaoUi();
     console.log('[doubao-perf] inject-ms', (performance.now() - tInject0).toFixed(1));
     let panel: PanelController | null = null;
+    let mascotHidden = false;
+    let uiSessionState: string | null = null;
+    let watchPaused = true;
+    const syncCollection = (restart = false): void => {
+      const enabled = uiSessionState === 'ACTIVE' && !watchPaused;
+      if (enabled === collectionEnabled && !restart) return;
+      collectionEnabled = enabled;
+      report(enabled ? detectBvid(location.href) : null);
+    };
 
     const requestSessionStart = async (): Promise<void> => {
       try {
@@ -78,16 +88,22 @@ export default defineContentScript({
         return;
       }
       panel?.handleEvent(e);
+      if (e.type === 'WATCH_SETTINGS') {
+        watchPaused = e.paused === true;
+        syncCollection(e.restartWatcher === true);
+      }
       if (e.type === 'SESSION_STATE' && e.state) {
+        const changed = uiSessionState !== e.state;
         uiSessionState = e.state;
-        mascot?.setSessionState(e.state as UiSessionState);
+        syncCollection();
+        if (changed) mascot?.setSessionState(e.state as UiSessionState);
         // P2.5：隐藏豆包只在陪看会话内生效——回 INACTIVE 自动解除（激活入口必须可见）
         if (e.state === 'INACTIVE' && mascotHidden) {
           mascotHidden = false;
           mascot?.setHidden(false);
         }
         // P1.10 时机：激活/恢复后复核登录态（force 绕缓存）
-        if (e.state === 'ACTIVE') void requestLoginCheck(1);
+        if (changed && e.state === 'ACTIVE') void requestLoginCheck(1);
       }
       // P1.10：登录态翻转 → 气泡（未登录激活=login 限频 kind；翻正=welcome）；引导卡由面板自管
       if (e.type === 'LOGIN_STATE') applyLoginState(e.loggedIn ?? null);
@@ -177,8 +193,6 @@ export default defineContentScript({
 
     // P2.5：隐藏豆包（本次会话）——content 内存态（刷新即回归）；开关在设置页。
     // INACTIVE 下忽略隐藏（审查 P2-4：隐藏+关面板=激活入口锁死，唯一自愈是刷新）
-    let mascotHidden = false;
-    let uiSessionState: string | null = null;
 
     panel = new PanelController({
       ui,
@@ -222,6 +236,12 @@ export default defineContentScript({
     onVideoKeyResolved = (videoKey) => panel?.followVideo(videoKey);
 
     bridge.connect(); // 连接后 SW 回放 SESSION_STATE → 豆包按当前会话态初始化表情/气泡
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') void bridge.syncState();
+    });
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted) void bridge.syncState();
+    });
     void requestLoginCheck(); // P1.10 时机③：content 首连探登录态（引导卡/气泡数据源）
 
     report(detectBvid(location.href));
@@ -230,7 +250,7 @@ export default defineContentScript({
     // （B 站真 SPA 的 pushState 发生在主世界，content 孤立世界的 history 补丁拦不到——P1.9 E2E 实测）；
     // popstate 与 history 补丁仅作兜底（后退/前进、孤立世界内的调用）。
     // 去重键= bvid+分P（审查 P2-1）：同视频 ?t=/?spm 类 replaceState 不重建 watcher
-    // （否则内存 watchedMs 归零、20s 触发被无限推迟）；非视频页按整 URL。
+    // （否则内存 watchedMs 归零、阈值触发被无限推迟）；非视频页按整 URL。
     const routeKey = (href: string): string => {
       const bvid = detectBvid(href);
       if (!bvid) return href;
@@ -253,12 +273,12 @@ export default defineContentScript({
     browser.runtime.onMessage.addListener((m: unknown) => {
       const msg = m as { type?: string; url?: string };
       if (msg?.type !== 'ROUTE_CHANGED' || !msg.url) return undefined;
-      console.log('[doubao-poc] route-changed', msg.url); // 去重前原始计数：B 站播放期 replaceState 频度真机观察（验收记录 §5.4）
+      console.log('[doubao-poc] route-changed'); // 保留计数，不记录可能包含敏感参数的地址
       onRoute(msg.url);
       return undefined;
     });
 
-    console.log('[doubao-poc] content script injected:', location.href);
+    console.log('[doubao-poc] content script injected');
   },
 });
 
@@ -288,7 +308,7 @@ async function startWatcher(bvid: string | null): Promise<void> {
   watchSession?.dispose();
   watchSession = null;
   currentVideoKey = null;
-  if (!bvid) return;
+  if (!bvid || !collectionEnabled) return;
   try {
     const r = (await browser.runtime.sendMessage({
       type: 'VIDEO_ENTER',
@@ -302,7 +322,7 @@ async function startWatcher(bvid: string | null): Promise<void> {
     } | undefined;
     if (gen !== watchGen) return; // 等待期间已切走：过期应答作废
     if (!r?.ok || !r.videoKey) return;
-    const { videoKey, duration = 0, triggerSeconds = 20 } = r;
+    const { videoKey, duration = 0, triggerSeconds = 10 } = r;
     currentVideoKey = videoKey;
     onVideoKeyResolved?.(videoKey); // 准则#5：面板开着则跟随当前视频卡片
     watchSession = new WatchSession({
@@ -313,8 +333,13 @@ async function startWatcher(bvid: string | null): Promise<void> {
         void browser.runtime
           .sendMessage({ type: 'WATCH_TICK', ...p })
           .then((r) => {
+            if (gen !== watchGen) return; // 旧监听器的迟到应答不能销毁恢复后的新实例
             // 审查 P2-2：SW 拒收（暂停）→ dispose 本地计时，暂停窗口时长不追溯补记
             if ((r as { ok?: boolean; reason?: string } | undefined)?.reason === 'paused') watchSession?.dispose();
+            if ((r as { summaryTriggered?: boolean } | undefined)?.summaryTriggered && mascot?.session === 'ACTIVE') {
+              mascot.setState('note');
+              void mascot.say('开始偷偷记笔记啦～', 4200, 'note');
+            }
           })
           .catch(() => {});
       },
@@ -323,6 +348,7 @@ async function startWatcher(bvid: string | null): Promise<void> {
         void browser.runtime
           .sendMessage({ type: 'TRIGGER_SUMMARY', ...p })
           .then((r2) => {
+            if (gen !== watchGen) return;
             const res = r2 as { ok?: boolean; deduped?: boolean } | undefined;
             if (res?.ok && !res.deduped && mascot?.session === 'ACTIVE') {
               mascot.setState('note');

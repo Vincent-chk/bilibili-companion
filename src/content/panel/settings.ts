@@ -6,7 +6,7 @@ import { browser } from 'wxt/browser';
 import type { Bridge } from '../bridge';
 import { esc, toast, type DoubaoUi } from '../ui/root';
 import { PERSONA_OPTIONS } from './settings-logic';
-import type { ModelConfigInput } from '../onboarding/onboarding-logic';
+import { validateAsr, validateLlm, type ModelConfigInput } from '../onboarding/onboarding-logic';
 
 /** SETTINGS_GET 应答（SW 打码后的只读快照）。 */
 export interface SettingsData {
@@ -23,6 +23,7 @@ export interface SettingsData {
 export interface SaveResult {
   ok: boolean;
   error?: string;
+  denied?: string[];
   llmCleared?: boolean;
   personaChanged?: boolean;
 }
@@ -64,6 +65,7 @@ function modelSection(
     fieldHtml('baseUrl', 'Base URL', cfg.baseUrl, 'https://api.example.com/v1', 'text', disabled) +
     fieldHtml('modelId', 'Model ID', cfg.modelId, 'model-name', 'text', disabled) +
     fieldHtml('apiKey', 'API Key', cfg.apiKey, 'sk-...（仅保存在本机）', 'password', disabled) +
+    (!disabled && cfg.apiKey ? '<div class="set-desc">已保存的密钥已隐藏，圆点数量对应密钥长度；不更改即可继续使用。</div>' : '') +
     (disabled ? '' : `<div class="set-row-btns"><button class="btn btn-ghost" data-test="${id}">测试连接</button><button class="btn btn-primary" data-save="${id}">保存</button></div><div class="test-status hidden" data-status="${id}"></div>`) +
     `</div>`
   );
@@ -78,7 +80,7 @@ export function renderSettingsView(deps: SettingsViewDeps): void {
   const box = root.getElementById('view-settings');
   if (!box) return;
   const d = deps.data;
-  // apiKey 显示打码形态（F9）：input 值=****尾4，保存时 SW 按打码哨兵沿用旧 Key
+  // apiKey 显示打码形态：长度与原密钥一致，保存时 SW 按打码哨兵沿用旧 Key。
   const llmCfg = d.llm ? { baseUrl: d.llm.baseUrl, modelId: d.llm.modelId, apiKey: d.llm.apiKeyMasked } : { baseUrl: '', modelId: '', apiKey: '' };
   const asrCfg = d.asr ? { baseUrl: d.asr.baseUrl, modelId: d.asr.modelId, apiKey: d.asr.apiKeyMasked } : { baseUrl: '', modelId: '', apiKey: '' };
   box.innerHTML =
@@ -92,7 +94,7 @@ export function renderSettingsView(deps: SettingsViewDeps): void {
     `<div class="persona-row">${PERSONA_OPTIONS.map((p) => `<div class="persona-pill${p.id === d.persona ? ' on' : ''}" data-persona="${p.id}">${p.label}</div>`).join('')}</div>` +
     switchRow('sw-bubbles', '气泡通知', '关闭后豆包不再弹气泡（表情仍在）', d.bubbles) +
     switchRow('sw-hide', '隐藏豆包（本次会话）', '隐藏≠结束陪看：记录照常；刷新页面或本次陪看数据清除后回归', deps.mascotHidden) +
-    switchRow('sw-pause', '暂停陪看', '开启后不再有任何采集与请求（列表不新增、不生成）', d.paused) +
+    switchRow('sw-pause', '暂停陪看', '停止记录和启动新任务；已开始的生成会继续完成', d.paused) +
     `</div>` +
     `<div class="set-sec"><h3>🗂 数据保留规则</h3><div class="rule-box">` +
     `· 点「开始陪看」= 激活，仅记录<b>激活期间</b>看过的视频<br>· 点「结束陪看」= 关闭，并开始 <b>1 小时</b>倒计时<br>· 1 小时内重新打开 → <b>恢复上次浏览状态</b><br>· 超过 1 小时 → 弹窗确认后<b>全部清除</b>（含摘要 / 转写）<br>· 所有数据仅保存在本机浏览器中</div></div>` +
@@ -118,6 +120,17 @@ export function renderSettingsView(deps: SettingsViewDeps): void {
   box.querySelector('#s-back')?.addEventListener('click', () => deps.onBack());
   box.querySelector('#btn-clear')?.addEventListener('click', () => deps.onWipe());
 
+  const revisions: Record<string, number> = { 'sec-llm': 0, 'sec-asr': 0 };
+  for (const id of Object.keys(revisions)) {
+    box.querySelector(`#${id}`)?.querySelectorAll<HTMLInputElement>('input[data-k]').forEach((input) => {
+      input.addEventListener('input', () => {
+        revisions[id] = (revisions[id] ?? 0) + 1;
+        const status = box.querySelector<HTMLElement>(`[data-status="${id}"]`);
+        if (status) { status.className = 'test-status hidden'; status.textContent = ''; }
+      });
+    });
+  }
+
   // ---- 模型区：测试连接 / 保存（LLM 空 Key 保存 = 清除配置，先确认） ----
   for (const sel of ['[data-test]', '[data-save]']) {
     box.querySelectorAll<HTMLButtonElement>(sel).forEach((btn) => {
@@ -125,13 +138,27 @@ export function renderSettingsView(deps: SettingsViewDeps): void {
         const id = btn.getAttribute(sel === '[data-test]' ? 'data-test' : 'data-save')!;
         const kind = id === 'sec-asr' ? 'asr' : 'llm';
         const cfg = readSection(id);
+        const forValidation = { ...cfg, apiKey: cfg.apiKey || ((cfg.baseUrl || cfg.modelId) ? deps.data[kind]?.apiKeyMasked : '') || '' };
+        let validationError: string | undefined;
+        if (kind === 'llm') {
+          const v = validateLlm(forValidation);
+          if (!v.ok) validationError = v.error ?? '请完整填写模型地址、模型名和 Key';
+        } else {
+          const v = validateAsr(forValidation);
+          if (v.kind === 'error' || (btn.hasAttribute('data-test') && v.kind === 'skip')) validationError = v.error ?? '请完整填写模型配置再测试';
+        }
+        const clearingLlm = !btn.hasAttribute('data-test') && kind === 'llm' && !cfg.apiKey && deps.data.llm;
+        if (validationError && !clearingLlm) { setStatus(id, 'err', validationError); return; }
         if (btn.hasAttribute('data-test')) {
+          const revision = revisions[id];
+          const status = box.querySelector<HTMLElement>(`[data-status="${id}"]`);
+          if (status) { status.className = 'test-status hidden'; status.textContent = ''; }
           btn.disabled = true;
           btn.textContent = '连接中…';
           void deps.bridge
             .request<{ ok: boolean; msg: string }>({ type: 'TEST_CONNECTION', kind, llm: cfg })
-            .then((r) => setStatus(id, r?.ok ? 'ok' : 'err', `${r?.ok ? '✓' : '✕'} ${r?.msg ?? '无应答，请重试'}`))
-            .catch(() => setStatus(id, 'err', '✕ 连接失败（后台无响应），请重试'))
+            .then((r) => { if (revisions[id] === revision) setStatus(id, r?.ok ? 'ok' : 'err', `${r?.ok ? '✓' : '✕'} ${r?.msg ?? '无应答，请重试'}`); })
+            .catch(() => { if (revisions[id] === revision) setStatus(id, 'err', '✕ 连接失败（后台无响应），请重试'); })
             .finally(() => {
               btn.disabled = false;
               btn.textContent = '测试连接';
@@ -150,7 +177,12 @@ export function renderSettingsView(deps: SettingsViewDeps): void {
         }
         void deps.bridge
           .request<SaveResult>({ type: 'SETTINGS_SAVE', [kind]: cfg })
-          .then((r) => (r?.ok ? deps.onSaved(r) : toast(deps.ui, r?.error ?? '保存失败，请重试')))
+          .then((r) => {
+            if (r?.ok) {
+              toast(deps.ui, r.denied?.length ? '设置已保存，但模型端点未获授权；连接失败时请重新保存并允许访问' : '设置已保存', r.denied?.length ? 6000 : 2600);
+              deps.onSaved(r);
+            } else toast(deps.ui, r?.error ?? '保存失败，请重试');
+          })
           .catch(() => toast(deps.ui, '保存失败（后台无响应），请重试'));
       });
     });
@@ -207,7 +239,7 @@ export function renderSettingsView(deps: SettingsViewDeps): void {
       .request<SaveResult>({ type: 'SETTINGS_SAVE', paused })
       .then((r) => {
         if (r?.ok) {
-          toast(deps.ui, paused ? '已暂停陪看：不再采集与请求' : '已恢复陪看', 2600);
+          toast(deps.ui, paused ? '已暂停：当前任务继续完成，后续任务等待恢复' : '已恢复陪看', 2600);
           deps.onSaved(r);
         } else {
           el.checked = !paused; // 审查 P2-5：暂停开关保存失败回滚（F12 语义不得虚标）

@@ -3,10 +3,10 @@
 // 阈值钳位（数据模型 §2：5–300）、v1.0 人设枚举（spicy/gentle/academic；v1.1.1 五风格属 F15/Phase 5）。
 import type { ModelConfigInput } from '../onboarding/onboarding-logic';
 
-/** Key 打码：仅尾 4 位可见（F9/02-数据模型 §3「sk-****abcd」口径）。 */
+/** Key 打码：最多保留尾 4 位，遮挡字符数量与密钥长度一致。 */
 export function maskApiKey(key: string): string {
   const k = (key ?? '').trim();
-  return k.length <= 4 ? '****' : `****${k.slice(-4)}`;
+  return k.length <= 4 ? '*'.repeat(k.length) : `${'*'.repeat(k.length - 4)}${k.slice(-4)}`;
 }
 
 /**
@@ -16,12 +16,12 @@ export function maskApiKey(key: string): string {
 export function resolveApiKey(prevKey: string | undefined, input: string): string {
   const v = (input ?? '').trim();
   if (!v) return prevKey ?? '';
-  if (prevKey && v === maskApiKey(prevKey)) return prevKey;
+  if (prevKey && (v === maskApiKey(prevKey) || v === (prevKey.trim().length <= 4 ? '****' : `****${prevKey.trim().slice(-4)}`))) return prevKey;
   return v;
 }
 
 /** 阈值钳位（数据模型 §2 triggerSeconds 5–300；滑杆 5–120 step5 是 UI 档位，存储仍按全域钳位）。 */
-export function clampThreshold(v: unknown, fallback = 20): number {
+export function clampThreshold(v: unknown, fallback = 10): number {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback;
   return Math.min(300, Math.max(5, n));
 }

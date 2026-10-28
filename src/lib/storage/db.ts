@@ -35,6 +35,7 @@ export interface VisitRow {
   firstSeenAt: number;
   lastSeenAt: number;
   watchedSeconds: number; // 有效观看累计（前台+播放中）
+  watchedByTracker?: Record<string, number>; // 各监听实例已计入的秒数，刷新/多标签去重累计
   progressPct: number; // 0–100
   triggered: 0 | 1; // 20s 阈值是否已触发
 }
@@ -98,7 +99,7 @@ export interface JobRow {
   videoKey: string;
   sessionId: string;
   segIndex?: number; // SEGMENT_ANALYZE 的段下标（幂等键一部分，F13）
-  prio?: number; // 取任务优先级：缺省/0=用户或观看触发；1=分段预取（后台静默）。同通道内 (prio, createdAt) 排序
+  prio?: number; // -1=用户主动摘要；缺省/0=常规；1=分段预取。数字越小越优先。
   status: JobStatus;
   stage?: JobStage;
   progress: number; // 0–100

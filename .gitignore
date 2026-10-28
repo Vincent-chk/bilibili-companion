@@ -2,6 +2,10 @@
 .env
 .env.*
 *.local
+*.pem
+*.key
+*.p12
+*.pfx
 
 # 构建产物与依赖
 node_modules/
@@ -14,3 +18,5 @@ coverage/
 .DS_Store
 .bin/
 e2e-artifacts/
+test-results/
+playwright-report/

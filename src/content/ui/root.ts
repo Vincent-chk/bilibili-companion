@@ -21,7 +21,7 @@ export function mountDoubaoUi(doc: Document = document): DoubaoUi {
   }
   const root = host.attachShadow({ mode: 'open' });
   root.innerHTML = `<style>${UI_STYLES}</style>
-    <div id="mascot-wrap" class="hidden"><div id="mascot-bubble" class="mascot-bubble hidden"></div><div id="mascot"><div class="mascot-float"><img id="mascot-img" alt="豆包" draggable="false"></div></div></div>
+    <div id="mascot-wrap" class="hidden"><div id="mascot-bubble" class="mascot-bubble hidden"></div><button type="button" id="mascot" aria-label="豆包"><div class="mascot-float"><img id="mascot-img" alt="豆包" draggable="false"></div></button></div>
     <aside id="panel" aria-label="豆包陪看面板">
       <header class="p-head">
         <div class="p-head-row">
@@ -33,6 +33,7 @@ export function mountDoubaoUi(doc: Document = document): DoubaoUi {
         <div class="p-head-actions hidden" id="p-head-actions"></div>
       </header>
       <div class="p-body" id="p-body">
+        <div id="update-banner" class="update-banner hidden"></div>
         <div id="login-card" class="login-card hidden"></div>
         <section id="view-list"></section>
         <section id="view-settings" class="hidden"></section>

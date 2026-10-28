@@ -54,6 +54,7 @@ export function bindVideo(video: HTMLVideoElement, t: WatchTracker): () => void 
     video.removeEventListener('ended', onStop);
     video.removeEventListener('timeupdate', onTime);
     document.removeEventListener('visibilitychange', onVis);
+    t.setPlaying(false); // 切页/解绑时上报最后确认的前台观看，按 watchId 幂等合并
   };
 }
 
@@ -71,6 +72,7 @@ export class WatchSession {
     if (this.#disposed || !video) return;
     const tracker = new WatchTracker({
       videoKey: this.o.videoKey,
+      watchId: crypto.randomUUID(),
       durationSec: this.o.durationSec,
       thresholdSec: this.o.thresholdSec,
       onTick: this.o.onTick,
@@ -80,8 +82,10 @@ export class WatchSession {
   }
 
   dispose(): void {
+    if (this.#disposed) return;
     this.#disposed = true;
-    this.#unbind?.();
+    const unbind = this.#unbind;
     this.#unbind = null;
+    unbind?.();
   }
 }

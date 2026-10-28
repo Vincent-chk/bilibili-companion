@@ -1,7 +1,8 @@
 // P1.2 · watcher 单测：有效观看计时（前台+播放中）、seek 跳变不计、暂停/后台重基线、
 // 20s 阈值幂等触发、WATCH_TICK 1Hz 节流、进度百分比。配套 pickPage 多 P 选页。
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WatchTracker, type WatchTickPayload, type WatchTriggerPayload } from '../src/content/watcher/tracker';
+import { bindVideo } from '../src/content/watcher/dom';
 import { pickPage } from '../src/lib/bilibili/client';
 
 function mkTracker(opts: { thresholdSec?: number; durationSec?: number; now?: () => number } = {}) {
@@ -58,6 +59,20 @@ describe('有效观看计时', () => {
     w.show();
     feed(w, 65, 5); // 回前台后首个 tick 只建基线，其后正常累计
     expect(w.t.watchedSeconds).toBe(10);
+  });
+
+  it('后台期间没有 timeupdate 时，恢复前台不计入后台播放', () => {
+    const w = mkTracker({ thresholdSec: 6 });
+    w.play();
+    feed(w, 0, 5);
+    w.hide();
+    w.show();
+    w.tick(6); // 此次间隔中的播放发生在后台，恢复后的首帧仅建立基线
+    expect(w.t.watchedSeconds).toBe(5);
+    expect(w.triggers).toHaveLength(0);
+    w.tick(7); // 恢复前台后继续播放 1 秒才应触发
+    expect(w.t.watchedSeconds).toBe(6);
+    expect(w.triggers).toHaveLength(1);
   });
 
   it('seek 前跳/回退不计入；暂停期间 seek 恢复播放不计间隙', () => {
@@ -129,6 +144,57 @@ describe('20s 阈值触发（F2）', () => {
 });
 
 describe('WATCH_TICK 节流（协议 §3：每秒节流）', () => {
+  it('暂停或进入后台时补报节流窗口内的已观看时间', () => {
+    const w = mkTracker();
+    w.play();
+    feed(w, 0, 4);
+    expect(w.ticks.map(t => t.watchedSeconds)).toEqual([0]);
+    w.pause();
+    expect(w.ticks.map(t => t.watchedSeconds)).toEqual([0, 4]);
+    w.play();
+    w.tick(10);
+    w.tick(11);
+    w.hide();
+    expect(w.ticks.at(-1)?.watchedSeconds).toBe(5);
+    expect(w.triggers).toHaveLength(0);
+  });
+
+  it('切页解绑时补报最后的已观看时间', () => {
+    const doc = Object.assign(new EventTarget(), { visibilityState: 'visible' });
+    const video = Object.assign(new EventTarget(), { currentTime: 0, paused: false, ended: false });
+    vi.stubGlobal('document', doc);
+    try {
+      const w = mkTracker();
+      const unbind = bindVideo(video as unknown as HTMLVideoElement, w.t);
+      for (let sec = 0; sec <= 4; sec++) {
+        video.currentTime = sec;
+        video.dispatchEvent(new Event('timeupdate'));
+      }
+      expect(w.ticks.map(t => t.watchedSeconds)).toEqual([0]);
+      unbind();
+      expect(w.ticks.map(t => t.watchedSeconds)).toEqual([0, 4]);
+      unbind(); // 重复解绑不会重复上报，防暂停回复引发循环
+      expect(w.ticks.map(t => t.watchedSeconds)).toEqual([0, 4]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('达到阈值时即使处于节流窗口也先上报完整观看时间', () => {
+    const events: string[] = [];
+    const tracker = new WatchTracker({
+      videoKey: 'BV1x:111', watchId: 'watch-1', durationSec: 100, thresholdSec: 5,
+      now: () => 1000,
+      onTick: (tick) => events.push(`tick:${tick.watchedSeconds}:${tick.watchId}`),
+      onTrigger: () => events.push('trigger'),
+    });
+    tracker.setPlaying(true);
+    for (let sec = 0; sec <= 5; sec++) tracker.onMediaTime(sec);
+    expect(events).toEqual(['tick:0:watch-1', 'tick:5:watch-1', 'trigger']);
+    tracker.setPlaying(false); // 达阈值后立即暂停或切页不能依赖下一次 timeupdate
+    expect(events).toEqual(['tick:0:watch-1', 'tick:5:watch-1', 'trigger']);
+  });
+
   it('1s 内多次媒体事件只上报一次；跨秒再次上报；载荷字段齐备', () => {
     const w = mkTracker();
     w.play();

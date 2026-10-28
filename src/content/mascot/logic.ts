@@ -21,18 +21,21 @@ export const MASCOT_WRAP_W = 170;
 export const MASCOT_H = 150;
 
 /**
- * 位置钳位（原型边界）：上边界 170px 保证头顶气泡不出视口；四周留白。
+ * 正常视口上边界 170px 保证头顶气泡空间；极矮窗口优先保证收起入口可见。
  */
 export function clampMascotPos(x: number, y: number, vw: number, vh: number): { x: number; y: number } {
+  const maxY = vh < 170 + MASCOT_H
+    ? Math.max(48 - MASCOT_H, vh - MASCOT_H)
+    : Math.max(170, vh - MASCOT_H - 10);
   return {
     x: Math.min(Math.max(4, x), Math.max(4, vw - MASCOT_WRAP_W - 8)),
-    y: Math.min(Math.max(170, y), Math.max(170, vh - MASCOT_H - 10)),
+    y: Math.min(Math.max(Math.min(170, maxY), y), maxY),
   };
 }
 
-/** 默认位（原型：右下区域，避开播放器控件；顶部预留气泡空间）。 */
+/** 默认左下贴边；保留完整立绘的空间供展开与拖拽。 */
 export function defaultMascotPos(vw: number, vh: number): { x: number; y: number } {
-  return clampMascotPos(vw - 380, vh - 280, vw, vh);
+  return clampMascotPos(4, vh - MASCOT_H - 10, vw, vh);
 }
 
 /** 视口相对坐标（02-数据模型 §2：mascotPos 为相对坐标，窗口缩放后按比例还原）。 */

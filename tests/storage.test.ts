@@ -143,6 +143,17 @@ describe('visit upsert', () => {
     expect(row.progressPct).toBe(55); // 进度跟随媒体时间正常刷新
     await db.delete();
   });
+
+  it('不同 watcher 的观看增量累加，同一 watcher 重复上报不重复累计', async () => {
+    const db = freshDb();
+    await upsertVisit(db, { sessionId: 's', videoKey: 'v', now: 1 });
+    await updateVisitProgress(db, { sessionId: 's', videoKey: 'v' }, { watchId: 'a', watchedSeconds: 12, progressPct: 20 });
+    await updateVisitProgress(db, { sessionId: 's', videoKey: 'v' }, { watchId: 'a', watchedSeconds: 12, progressPct: 20 });
+    await updateVisitProgress(db, { sessionId: 's', videoKey: 'v' }, { watchId: 'b', watchedSeconds: 12, progressPct: 30 });
+    await updateVisitProgress(db, { sessionId: 's', videoKey: 'v' }, { watchId: 'a', watchedSeconds: 13, progressPct: 35 });
+    expect((await db.visits.toArray())[0]?.watchedSeconds).toBe(25);
+    await db.delete();
+  });
 });
 
 describe('wipeAllData（F10 清除事务）', () => {

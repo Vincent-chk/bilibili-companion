@@ -1,6 +1,6 @@
 import type { LlmConfig, LlmMessage, StreamEvent } from './types';
 
-/** 非 2xx：body 已打码（Key 剔除）并截断到前 200 字符。 */
+/** 非 2xx：仅保留状态码，避免服务端错误体回显用户数据。 */
 export class LlmHttpError extends Error {
   readonly status: number;
   readonly body: string;
@@ -46,15 +46,6 @@ export function isArkBaseUrl(baseUrl: string): boolean {
   }
 }
 
-// 服务端错误 body 里可能回显 Key：先剔除本次 Key，再兜底打码 Bearer/sk-/ark- 形态 token，只留前 200 字符。
-const sanitizeBody = (raw: string, apiKey: string): string => {
-  let out = raw;
-  if (apiKey) out = out.split(apiKey).join('***');
-  out = out.replace(/(Bearer\s+)[^\s"']+/gi, '$1***');
-  out = out.replace(/\b(?:sk|ark)-[A-Za-z0-9][A-Za-z0-9-]{8,}/g, '***');
-  return out.slice(0, 200);
-};
-
 /**
  * SSE 流式 chat/completions。手写行缓冲解析（TextDecoder(stream) + 按 \n 切行），
  * 不依赖任何 SSE 库；[DONE] 或流自然结束即完成，返回完整文本 + usage + 首 token 延迟。
@@ -94,8 +85,9 @@ export async function streamChatCompletion(
       signal: controller.signal,
     });
     if (!res.ok) {
-      const raw = await res.text().catch(() => '');
-      throw new LlmHttpError(res.status, sanitizeBody(raw, cfg.apiKey));
+      // 错误体可能回显任意字幕、Cookie 或密钥，无法靠模式匹配完整脱敏。
+      await res.text().catch(() => ''); // 读完以复用连接；正文不进入错误、日志或存储。
+      throw new LlmHttpError(res.status, '服务端错误详情已隐藏');
     }
     if (!res.body) throw new LlmNetworkError('LLM 响应无 body');
 

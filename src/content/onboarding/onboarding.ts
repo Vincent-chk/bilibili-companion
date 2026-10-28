@@ -17,7 +17,7 @@ export interface OnboardingDeps {
   /** 最小请求探活（background TEST_CONNECTION；kind=asr 走 /models 探活，P2.3）。 */
   testConnection: (cfg: ModelConfigInput, kind: 'llm' | 'asr') => Promise<{ ok: boolean; msg: string }>;
   /** 保存（background SETTINGS_SAVE：写 settings/onboarded + 申请端点 origin 权限）。 */
-  save: (payload: SettingsSavePayload) => Promise<{ ok: boolean; error?: string }>;
+  save: (payload: SettingsSavePayload) => Promise<{ ok: boolean; error?: string; denied?: string[] }>;
   /** 「稍后再说」：回未激活态（开始陪看气泡 + 提示）。 */
   onDismiss: () => void;
   /** 保存成功：触发 SESSION_START（配置已就绪，激活必成）。 */
@@ -162,6 +162,7 @@ export function openOnboarding(deps: OnboardingDeps): void {
           if (r.ok) {
             close();
             deps.onSaved();
+            if (r.denied?.length) toast(deps.ui, '设置已保存，但模型端点未获授权；连接失败时请重新保存并允许访问', 6000);
           } else {
             toast(deps.ui, r.error ?? '保存失败，请重试');
           }
@@ -182,6 +183,7 @@ export function openOnboarding(deps: OnboardingDeps): void {
         if (r.ok) {
           close();
           deps.onSaved();
+          if (r.denied?.length) toast(deps.ui, '设置已保存，但模型端点未获授权；连接失败时请重新保存并允许访问', 6000);
         } else {
           toast(deps.ui, r.error ?? '保存失败，请重试');
         }

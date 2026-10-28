@@ -37,6 +37,9 @@ export interface BiliClientOptions {
   onCookie?: (cookies: Record<string, string>) => void;
   /** P2.6：熔断门禁时钟（默认 performance.now；单测注入可控时钟）。 */
   now?: () => number;
+  /** 扩展宿主提供跨实例/跨执行体的限速与熔断门禁。 */
+  beforeRequest?: () => Promise<void>;
+  onRiskControl?: () => Promise<void>;
 }
 
 interface NavResp {
@@ -127,6 +130,8 @@ export class BiliClient {
   /** P2.6 跨请求熔断：-412 后 breakerWaitMs 内所有请求即刻拒绝（F11「60s 内不再请求」）。 */
   #blockedUntil = -Infinity;
   #now: () => number;
+  #beforeRequest?: () => Promise<void>;
+  #onRiskControl?: () => Promise<void>;
 
   constructor(opts: BiliClientOptions = {}) {
     // 裸存 fetch 引用会在 ServiceWorker 里 Illegal invocation（脱离 globalThis 上下文）——必须 bind
@@ -138,6 +143,8 @@ export class BiliClient {
     this.#extraHeaders = opts.extraHeaders ?? {};
     this.#onCookie = opts.onCookie;
     this.#now = opts.now ?? performance.now.bind(performance);
+    this.#beforeRequest = opts.beforeRequest;
+    this.#onRiskControl = opts.onRiskControl;
   }
 
   // -- 基础设施 -------------------------------------------------------------
@@ -180,12 +187,14 @@ export class BiliClient {
       const url = qs ? `${API_BASE}${path}?${qs}` : `${API_BASE}${path}`;
       await this.#pace();
       try {
+        await this.#beforeRequest?.();
         const res = await this.#fetchImpl(url, {
           headers: this.#apiHeaders(),
           credentials: 'include',
           signal: AbortSignal.timeout(this.#timeoutMs),
         });
         if (res.status === 412) {
+          await this.#onRiskControl?.();
           // HTTP 层风控与 JSON code -412 同等处理（对齐 python：熔断后重试 1 次）
           if (attempt === 1) {
             this.#blockedUntil = this.#now() + this.#breakerWaitMs; // P2.6：跨请求熔断窗（同实例其他请求即刻拒绝）
@@ -203,6 +212,7 @@ export class BiliClient {
         }
         const apiCode = json.code ?? 0;
         if (apiCode !== 0) {
+          if (apiCode === -412) await this.#onRiskControl?.();
           if (apiCode === -412 && attempt === 1) {
             this.#blockedUntil = this.#now() + this.#breakerWaitMs; // P2.6：跨请求熔断窗
             await sleep(this.#breakerWaitMs);
@@ -318,13 +328,20 @@ export class BiliClient {
   /** 匿名直下字幕 JSON：不带 Cookie/Referer——auth_key 自鉴权（07 报告 §4 第 3 次复证）。
    *  P2.6 字幕结构变化降级：非 JSON/形状漂移不炸链路——归一化吸收变体，空内容走既有 'empty' 语义。 */
   async fetchTranscript(subtitleUrl: string): Promise<TranscriptCue[]> {
+    if (this.#now() < this.#blockedUntil) throw new BiliApiError(-412, 'subtitle', '风控熔断中');
     const url = normalizeSubtitleUrl(subtitleUrl);
     await this.#pace();
+    await this.#beforeRequest?.();
     const res = await this.#fetchImpl(url, {
       headers: { 'User-Agent': UA },
       credentials: 'omit',
       signal: AbortSignal.timeout(this.#timeoutMs),
     });
+    if (res.status === 412) {
+      this.#blockedUntil = this.#now() + this.#breakerWaitMs;
+      await this.#onRiskControl?.();
+      throw new BiliApiError(-412, 'subtitle', '字幕服务风控拦截，冷却后自动恢复');
+    }
     if (!res.ok) throw new Error(`字幕下载失败：HTTP ${res.status}`);
     let j: unknown;
     try {

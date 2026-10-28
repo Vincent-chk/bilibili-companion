@@ -1,0 +1,83 @@
+name: Phase 3 Windows acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase3-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chrome:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: '11.24.0'
+          run_install: false
+      - name: Install and verify source
+        run: |
+          pnpm install --frozen-lockfile --registry=https://registry.npmjs.org
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm typegen
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm compile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prepare Chrome for Testing and OpenSSL
+        run: |
+          $cftInfo = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
+          $cftStable = $cftInfo.channels.Stable
+          if ([int]$cftStable.version.Split('.')[0] -lt 155) { throw 'Chrome version is below acceptance minimum' }
+          $cftAsset = $cftStable.downloads.chrome | Where-Object { $_.platform -eq 'win64' } | Select-Object -First 1
+          if (-not $cftAsset.url.StartsWith('https://storage.googleapis.com/chrome-for-testing-public/')) { throw 'Unexpected browser source' }
+          $cftDir = Join-Path $env:RUNNER_TEMP 'phase3-cft'
+          $cftZip = Join-Path $env:RUNNER_TEMP 'phase3-cft.zip'
+          Invoke-WebRequest $cftAsset.url -OutFile $cftZip
+          Expand-Archive $cftZip -DestinationPath $cftDir
+          $cftExe = Join-Path $cftDir 'chrome-win64/chrome.exe'
+          if (-not (Test-Path $cftExe)) { throw 'Chrome executable missing' }
+          "E2E_BROWSER=$cftExe" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "E2E_EXTENSION_DIR=$((Resolve-Path '.output/chrome-mv3').Path)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "Chrome for Testing $($cftStable.version) / win64" | Out-File 'windows-environment.txt' -Encoding utf8
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            $gitRoot = Split-Path (Split-Path (Get-Command git).Source)
+            $opensslDir = Join-Path $gitRoot 'usr/bin'
+            if (-not (Test-Path (Join-Path $opensslDir 'openssl.exe'))) { throw 'OpenSSL unavailable' }
+            $opensslDir | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      - name: Run non-ASR browser fixtures
+        run: |
+          # Native permission UI, two-hour soak, and macOS-only process-kill tests remain separate gates.
+          pnpm test:e2e 2>&1 | Tee-Object -FilePath 'windows-e2e.log'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: phase3-windows-${{ github.run_id }}
+          retention-days: 3
+          include-hidden-files: true
+          if-no-files-found: warn
+          path: |
+            windows-environment.txt
+            windows-e2e.log
+            test-results/
+            .output/*.zip
+            .output/chrome-mv3/manifest.json

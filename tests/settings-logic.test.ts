@@ -4,11 +4,11 @@ import { PERSONA_OPTIONS, clampThreshold, isPersonaId, maskApiKey, resolveApiKey
 
 describe('maskApiKey（F9 仅尾 4 位）', () => {
   it('常规 Key：仅尾 4 位可见', () => {
-    expect(maskApiKey('sk-abcdef123456')).toBe('****3456');
+    expect(maskApiKey('sk-abcdef123456')).toBe('***********3456');
   });
   it('≤4 位 Key 全遮（不泄露整 Key）', () => {
     expect(maskApiKey('sk-x')).toBe('****');
-    expect(maskApiKey('')).toBe('****');
+    expect(maskApiKey('')).toBe('');
   });
 });
 
@@ -18,6 +18,7 @@ describe('resolveApiKey（打码哨兵：未改动=沿用旧 Key）', () => {
   });
   it('输入恰为旧 Key 的打码形态 → 沿用（不把 ****xxxx 当新 Key 存库）', () => {
     expect(resolveApiKey('sk-real-key-9999', maskApiKey('sk-real-key-9999'))).toBe('sk-real-key-9999');
+    expect(resolveApiKey('sk-real-key-9999', '****9999')).toBe('sk-real-key-9999'); // 更新时仍打开的旧设置页
   });
   it('新输入 → 新 Key', () => {
     expect(resolveApiKey('sk-old', 'sk-brand-new')).toBe('sk-brand-new');
@@ -29,14 +30,14 @@ describe('resolveApiKey（打码哨兵：未改动=沿用旧 Key）', () => {
 });
 
 describe('clampThreshold（5–300，数据模型 §2）', () => {
-  it('边界：5/300 内保留，越界钳位，非数回默认 20', () => {
+  it('边界：5/300 内保留，越界钳位，非数回默认 10', () => {
     expect(clampThreshold(5)).toBe(5);
     expect(clampThreshold(120)).toBe(120);
     expect(clampThreshold(300)).toBe(300);
     expect(clampThreshold(1)).toBe(5);
     expect(clampThreshold(999)).toBe(300);
-    expect(clampThreshold('60' as never)).toBe(20);
-    expect(clampThreshold(NaN)).toBe(20);
+    expect(clampThreshold('60' as never)).toBe(10);
+    expect(clampThreshold(NaN)).toBe(10);
   });
   it('小数取整（滑杆 step=5 不产生，存储防御）', () => {
     expect(clampThreshold(20.7)).toBe(21);

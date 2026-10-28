@@ -3,7 +3,7 @@
 // - P1.4 pipeline 编排：job 派发给 offscreen 执行体，进度回流落库；SW 启动 recover+drain
 // 触发链：watcher 20s → TRIGGER_SUMMARY → pipeline.enqueue → offscreen → lib/summarize/chain → 落库
 // （Phase 0 的 VIDEO_SEEN 进页即跑链已随 1.4 移除：SW 内不留 LLM 路径，E2E 改走真实触发链）
-import { BiliClient, pickPage } from '../src/lib/bilibili/client';
+import { BiliApiError, BiliClient, pickPage } from '../src/lib/bilibili/client';
 import { readStoredLlmConfig, resolveConfig } from '../src/lib/llm/summary';
 import { Pipeline, type JobContext, type JobOutcome } from '../src/lib/pipeline';
 import {
@@ -29,8 +29,54 @@ import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/conten
 import { parseVideoKey } from '../src/lib/summarize/chain';
 import { segmentsToPrefetch } from '../src/lib/summarize/segment';
 import { buildRefererRules, DNR_RULE_IDS } from '../src/lib/dnr';
+import { checkForUpdate, isNewerVersion, type UpdateRecord } from '../src/lib/update';
 
 const db = new CompanionDB();
+let settingsSaveTail: Promise<void> = Promise.resolve();
+let browserSessionReady: Promise<void> = Promise.resolve();
+
+// 所有 B 站 API 请求（含 offscreen）在 SW 排队，跨实例共享限速与 60 秒风控冷却。
+let biliRiskUntil = 0;
+let biliNextRequestAt = 0;
+let biliGateTail: Promise<void> = Promise.resolve();
+function beforeBiliRequest(runningJob = false): Promise<void> {
+  const run = async (): Promise<void> => {
+    biliRiskUntil = Math.max(biliRiskUntil, (await browserKv.get<number>('biliRiskUntil')) ?? 0);
+    if (Date.now() < biliRiskUntil) throw new BiliApiError(-412, 'request-gate', 'B 站风控冷却中，稍后自动恢复');
+    if (!runningJob && await isPaused()) throw new BiliApiError(-499, 'request-gate', '陪看已暂停');
+    const delay = biliNextRequestAt - Date.now();
+    if (delay > 0) await sleep(delay);
+    if (Date.now() < biliRiskUntil) throw new BiliApiError(-412, 'request-gate', 'B 站风控冷却中，稍后自动恢复');
+    if (!runningJob && await isPaused()) throw new BiliApiError(-499, 'request-gate', '陪看已暂停');
+    biliNextRequestAt = Date.now() + 500;
+  };
+  const pending = biliGateTail.then(run, run);
+  biliGateTail = pending.catch(() => {});
+  return pending;
+}
+async function markBiliRisk(): Promise<void> {
+  biliRiskUntil = Math.max(biliRiskUntil, Date.now() + 60_000);
+  await browserKv.set('biliRiskUntil', biliRiskUntil).catch(() => {});
+  await browser.alarms.create('doubao-bili-risk', { when: biliRiskUntil + 50 });
+}
+const biliRequestHooks = { beforeRequest: beforeBiliRequest, onRiskControl: markBiliRisk };
+
+const updateStore = {
+  get: () => browserKv.get<UpdateRecord>('updateCheck'),
+  set: (value: UpdateRecord) => browserKv.set('updateCheck', value),
+};
+let updateCheckInFlight: Promise<void> | null = null;
+let updateAbort: AbortController | null = null;
+function checkUpdate(): void {
+  if (updateCheckInFlight) return;
+  const controller = new AbortController();
+  updateAbort = controller;
+  updateCheckInFlight = (async () => {
+    const latest = await checkForUpdate(updateStore, browser.runtime.getManifest().version, { paused: await isPaused(), signal: controller.signal });
+    const revision = (await updateStore.get())?.revision ?? 0;
+    if (!controller.signal.aborted && !(await isPaused())) broadcastToUi({ type: 'UPDATE_AVAILABLE', updateVersion: latest, updateRevision: revision });
+  })().catch(() => {}).finally(() => { updateCheckInFlight = null; updateAbort = null; });
+}
 
 // ---- P1.5 · Port（doubao-port）与面板推送 ----------------------------------------
 // runtime.sendMessage 到不了 content script（扩展内部专用），B→C 推送一律走 Port 广播。
@@ -41,8 +87,12 @@ interface UiPort {
   tabId?: number;
 }
 const uiPorts = new Set<UiPort>();
+let sessionBroadcastRevision = 0;
+let settingsBroadcastRevision = 0;
 
 function broadcastToUi(msg: Record<string, unknown>): void {
+  if (msg.type === 'SESSION_STATE') sessionBroadcastRevision++;
+  if (msg.type === 'WATCH_SETTINGS') settingsBroadcastRevision++;
   for (const p of uiPorts) {
     try {
       p.postMessage(msg);
@@ -74,6 +124,7 @@ let lastBroadcastSession: { sessionId: string; state: string } | null = null;
 
 /** 判定保留期；broadcast=true 时仅在会话态变化时广播（审查 P2-3：无第三种语义）。 */
 async function runRetention(broadcast = false): Promise<RetentionResult> {
+  await browserSessionReady;
   const r = await applyRetention(db, browserKv);
   if (!r.pointer) return r;
   if (broadcast) {
@@ -142,6 +193,7 @@ async function sendToOffscreen(payload: Record<string, unknown>): Promise<unknow
 }
 
 async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOutcome> {
+  if (await isPaused()) return { result: 'wait', error: { code: 'PAUSED', msg: '陪看已暂停' } };
   const onProgress = (msg: unknown) => {
     const m = msg as {
       type?: string;
@@ -176,6 +228,7 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
     const { config, error: cfgErr, timeoutMs } = resolveConfig(await readStoredLlmConfig(browserKv));
     if (!config) return { result: 'failed', error: { code: 'NO_LLM_CONFIG', msg: cfgErr ?? '未配置 LLM' } };
     const settings = await readSettings();
+    if (settings.paused) return { result: 'wait', error: { code: 'PAUSED', msg: '陪看已暂停' } };
     const reply = (await Promise.race([
       sendToOffscreen({
         type: 'OFFSCREEN_RUN_JOB',
@@ -199,12 +252,13 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
     if (!reply) throw new Error('offscreen 无应答（文档可能未加载完成）');
     // P2.6 F11 断网挂起续跑：网络级失败（LLM 传输层/离线期任何 UNKNOWN）回 wait——
     // pipeline 落 pending 不烧重试不 failed 轰炸；恢复时机=SW online 事件/面板 LIST_QUERY/alarms
-    if (reply.result === 'failed' && (reply.error?.code === 'LLM_NETWORK' || (navigator.onLine === false && reply.error?.code === 'UNKNOWN'))) {
+    if (reply.result === 'failed' && (reply.error?.code === 'LLM_NETWORK' || reply.error?.code === 'RISK_CONTROL' || reply.error?.code === 'PAUSED' || (navigator.onLine === false && reply.error?.code === 'UNKNOWN'))) {
       console.log(`[doubao] job waits for network: ${job.videoKey} (${reply.error?.code})`);
       return { result: 'wait', error: reply.error };
     }
     return reply;
   } catch (e) {
+    if (await isPaused()) return { result: 'wait', error: { code: 'PAUSED', msg: '陪看已暂停' } };
     console.log(`[doubao] offscreen executor error: ${String(e).slice(0, 200)}`);
     offscreenReady = false; // offscreen 文档可能已被系统回收：下次执行重建
     throw e;
@@ -216,6 +270,9 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
 
 const lastLoggedStatus = new Map<string, string>();
 const onJobTransition = (j: JobRow): void => {
+  if (j.status === 'done' || j.status === 'failed' || j.status === 'need_confirm') {
+    void browser.storage.session.remove(`manualJob:${j.id}`).catch(() => {});
+  }
   // 进度写回也会触发本回调：状态变化才打日志（pending 不打，保持原行为）
   if (j.status !== 'pending' && lastLoggedStatus.get(j.id) !== j.status) {
     console.log(`[doubao] job ${j.type} ${j.videoKey} → ${j.status}${j.retries ? ` (retry ${j.retries})` : ''}`);
@@ -245,15 +302,30 @@ const onJobTransition = (j: JobRow): void => {
     if (j.status === 'done') void prefetchSegments(j);
   }
 };
+// 用户在保留期内主动发起的任务仅在本次浏览器运行期间可执行；SW 休眠不会丢失标记。
+async function allowManualJob(job: JobRow): Promise<void> {
+  await browser.storage.session.set({ [`manualJob:${job.id}`]: true });
+}
+async function canRunJob(job: JobRow): Promise<boolean> {
+  if (await isPaused()) return false;
+  const pointer = await getSessionPointer(browserKv);
+  if (!pointer || pointer.sessionId !== job.sessionId) return false;
+  if (pointer.state === 'ACTIVE') return true;
+  if (pointer.state !== 'GRACE') return false;
+  const key = `manualJob:${job.id}`;
+  return (await browser.storage.session.get(key))[key] === true;
+}
 // F13 提速：双通道并行——主链（摘要/重生成/ASR，B 站侧串行）+ 交互链（分段解读）。
 // 用户点击分段解读不再排在数分钟的摘要任务之后；每链并发=1（总 LLM 并发≤2）。
 const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   lane: ['SUMMARIZE', 'ASR_SUMMARIZE', 'REGENERATE'],
   onTransition: onJobTransition,
+  canRun: canRunJob,
 });
 const segPipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   lane: ['SEGMENT_ANALYZE'],
   onTransition: onJobTransition,
+  canRun: canRunJob,
 });
 
 /**
@@ -311,6 +383,7 @@ interface InMsg {
   url?: string;
   videoKey?: string;
   watchedSeconds?: number;
+  watchId?: string;
   progressPct?: number;
   time?: number; // SEEK_TO 目标秒（P1.8）
   segIndex?: number; // SEGMENT_NOTE_OPEN 段下标（P1.11）
@@ -324,6 +397,7 @@ interface InMsg {
   persona?: string;
   bubbles?: boolean;
   paused?: boolean;
+  runningJob?: boolean;
   llmClear?: boolean;
 }
 
@@ -347,29 +421,69 @@ async function ensureDnrRules(): Promise<void> {
 
 export default defineBackground(() => {
   console.log('[doubao-poc] background ready');
+  // storage.session 在 SW 休眠时保留，浏览器资料重启时清空；扩展重载和更新也会清空。
+  browserSessionReady = (async () => {
+    const marker = await browser.storage.session.get('browserSessionReady');
+    if (!marker.browserSessionReady) {
+      const pointer = await getSessionPointer(browserKv);
+      if (pointer?.state === 'ACTIVE') {
+        const heartbeat = await browserKv.get<{ sessionId: string; at: number }>('browserHeartbeat');
+        const now = Date.now();
+        const closedAt = heartbeat?.sessionId === pointer.sessionId && Number.isFinite(heartbeat.at) && heartbeat.at >= pointer.lastActiveAt && heartbeat.at <= now
+          ? heartbeat.at : now;
+        await handleSessionEnd(closedAt);
+        const result = await applyRetention(db, browserKv, now);
+        if (result.verdict.kind === 'EXPIRE' && result.pointer) {
+          lastBroadcastSession = { sessionId: result.pointer.sessionId, state: result.pointer.state };
+          broadcastToUi(sessionStateMsg(result.pointer));
+        }
+      }
+      await browser.storage.session.set({ browserSessionReady: true });
+    }
+    // 不重建已有闹钟：每次 SW 唤醒都重设会把下一次心跳不断推迟。
+    try {
+      if (!(await browser.alarms.get('doubao-browser-heartbeat'))) {
+        await browser.alarms.create('doubao-browser-heartbeat', { periodInMinutes: 1 });
+      }
+    } catch {
+      // 心跳不可用时，启动判定使用可得时间；不阻塞扩展使用。
+    }
+  })();
   // SW 启动：恢复 stale running → 清空 pending（断网挂起/重启后续跑，F11；P2.5 暂停中则挂起）
-  void pipeline.recover().then(async (n) => {
+  void browserSessionReady.then(() => pipeline.recover()).then(async (n) => {
     if (n) console.log(`[doubao] recovered ${n} stale job(s)`);
-    drainUnlessPaused();
+    drainUnlessPaused(n > 0); // 恢复了任务时，忙碌中的两条队列都须在当前轮后补查
   });
   // P1.10 时机①：扩展启动即探登录态（架构 §3.9）
-  void checkLoginState(true)
+  void browserSessionReady.then(() => checkLoginState(true))
     .then((s) => applyLoginState(s))
     .catch(() => {});
   // P2.1 时机①：扩展启动即判保留期（GRACE 超期 → EXPIRED_PENDING_CONFIRM；仅状态，不删数据）
   void runRetention(true).catch(() => {});
+  void browserSessionReady.then(() => checkUpdate());
   // P2.1 兜底：30min 周期闹钟在 SW 被唤醒时补一次判定（MV3 定时器不可靠，判定以时间戳比较为准）
   void browser.alarms.create('doubao-retention', { periodInMinutes: 30 });
   browser.alarms.onAlarm.addListener((a) => {
+    if ((a as { name?: string }).name === 'doubao-browser-heartbeat') {
+      void browserSessionReady.then(async () => {
+        const pointer = await getSessionPointer(browserKv);
+        if (pointer?.state === 'ACTIVE') await browserKv.set('browserHeartbeat', { sessionId: pointer.sessionId, at: Date.now() });
+      });
+    }
+    if ((a as { name?: string }).name === 'doubao-bili-risk') {
+      drainUnlessPaused(true);
+      void readSettings().then(settings => broadcastToUi({ type: 'WATCH_SETTINGS', paused: settings.paused === true, restartWatcher: true }));
+    }
     if ((a as { name?: string }).name === 'doubao-retention') {
       void runRetention(true);
       drainUnlessPaused(); // P2.6：断网挂起的 pending 在 30min 兜底唤醒时也试续跑
+      void browserSessionReady.then(() => checkUpdate()); // 存储时间戳保证最多每天检查一次
     }
   });
   // P2.6 F11：网络恢复事件 → 立即续跑挂起队列（MV3 SW 全局作用域可收 online/offline）
   addEventListener('online', () => {
     console.log('[doubao] network online: resuming suspended jobs');
-    drainUnlessPaused();
+    drainUnlessPaused(true);
   });
   // P2.3：DNR 音频 Referer 规则（幂等重建；启动/重启均确保在位）
   void ensureDnrRules();
@@ -384,10 +498,15 @@ export default defineBackground(() => {
     (port as unknown as { onDisconnect: { addListener: (cb: () => void) => void } }).onDisconnect.addListener(() =>
       uiPorts.delete(p),
     );
+    const replayRevision = sessionBroadcastRevision;
+    const settingsRevision = settingsBroadcastRevision;
     void runRetention()
-      .then((r) => {
+      .then(async (r) => {
         try {
-          p.postMessage(sessionStateMsg(r.pointer));
+          const settings = await readSettings();
+          if (settingsRevision === settingsBroadcastRevision) p.postMessage({ type: 'WATCH_SETTINGS', paused: settings.paused === true });
+          // 连接期间已经收到更新广播时，不再回放较旧的会话快照。
+          if (replayRevision === sessionBroadcastRevision) p.postMessage(sessionStateMsg(r.pointer));
         } catch {
           /* 端口即断 */
         }
@@ -412,43 +531,66 @@ export default defineBackground(() => {
   browser.runtime.onMessage.addListener((msg: unknown) => {
     const m = msg as InMsg;
     switch (m?.type) {
+      case 'BILI_REQUEST_GATE':
+        return browserSessionReady.then(() => beforeBiliRequest(m.runningJob === true)).then(() => ({ ok: true })).catch((e: unknown) => ({ ok: false, code: e instanceof BiliApiError ? e.code : -412, msg: e instanceof Error ? e.message : '请求暂缓' }));
+      case 'BILI_RISK_HIT':
+        return browserSessionReady.then(() => markBiliRisk()).then(() => ({ ok: true }));
       case 'PING':
-        return Promise.resolve({ pong: true });
+        return browserSessionReady.then(() => ({ pong: true }));
       case 'VIDEO_ENTER':
-        return handleVideoEnter(m);
+        return browserSessionReady.then(() => handleVideoEnter(m));
       case 'WATCH_TICK':
-        return handleWatchTick(m);
+        return browserSessionReady.then(() => handleWatchTick(m));
       case 'TRIGGER_SUMMARY':
-        return handleTriggerSummary(m);
+        return browserSessionReady.then(() => handleTriggerSummary(m));
       case 'LIST_QUERY':
-        return handleListQuery();
+        return browserSessionReady.then(() => handleListQuery());
       case 'SUMMARY_OPEN':
-        return handleSummaryOpen(m);
+        return browserSessionReady.then(() => handleSummaryOpen(m));
       case 'REGENERATE':
-        return handleRegenerate(m);
+        return browserSessionReady.then(() => handleRegenerate(m));
       case 'ASR_CONFIRM':
-        return handleAsrConfirm(m); // P2.3 F6：用户确认调用 ASR
+        return browserSessionReady.then(() => handleAsrConfirm(m)); // P2.3 F6：用户确认调用 ASR
       case 'ASR_DECLINE':
-        return handleAsrDecline(m); // P2.3 F6：暂不（保持橙色标注，无状态迁移）
+        return browserSessionReady.then(() => handleAsrDecline(m)); // P2.3 F6：暂不（保持橙色标注，无状态迁移）
       case 'SEEK_TO':
-        return handleSeekTo(m);
+        return browserSessionReady.then(() => handleSeekTo(m));
       case 'SEGMENT_NOTE_OPEN':
-        return handleSegmentNoteOpen(m);
+        return browserSessionReady.then(() => handleSegmentNoteOpen(m));
       case 'LOGIN_CHECK':
-        return handleLoginCheck(m);
+        return browserSessionReady.then(() => handleLoginCheck(m));
       case 'SESSION_START':
-        return handleSessionStart();
+        return browserSessionReady.then(() => handleSessionStart());
       case 'SESSION_END':
-        return handleSessionEnd();
+        return browserSessionReady.then(() => handleSessionEnd());
       case 'WIPE_CONFIRM':
       case 'WIPE_NOW':
-        return handleWipe(); // P2.2 F10 清除链路（超期确认【立即清除】/ 手动清除）
-      case 'TEST_CONNECTION':
-        return handleTestConnection(m);
-      case 'SETTINGS_SAVE':
-        return handleSettingsSave(m);
+        return browserSessionReady.then(() => handleWipe()); // P2.2 F10 清除链路（超期确认【立即清除】/ 手动清除）
+      case 'TEST_CONNECTION': {
+        const endpoint = validateEndpointUrl(m.llm?.baseUrl ?? '');
+        // 必须在消息同步阶段调用，不能先 await 存储或进入 Promise 队列，否则手势丢失。
+        const access = ensureOriginPermission(m.llm?.modelId?.trim() && endpoint.ok && endpoint.origin ? [`${endpoint.origin}/*`] : []);
+        return Promise.all([access, browserSessionReady]).then(() => handleTestConnection(m));
+      }
+      case 'SETTINGS_SAVE': {
+        const origins = [m.llm, m.asr].flatMap(cfg => {
+          const endpoint = validateEndpointUrl(cfg?.baseUrl ?? '');
+          return cfg?.modelId?.trim() && endpoint.ok && endpoint.origin ? [`${endpoint.origin}/*`] : [];
+        });
+        const access = ensureOriginPermission([...new Set(origins)]);
+        // 配置写入仍按点击顺序串行；原生授权对话框不占用保存队列，其他标签页可立即暂停。
+        const saved = settingsSaveTail.then(() => browserSessionReady).then(() => handleSettingsSave(m));
+        settingsSaveTail = saved.then(() => {}, () => {});
+        return Promise.all([saved, access]).then(async ([result]) => {
+          if (result.ok !== true) return result;
+          const granted: string[] = [];
+          const denied: string[] = [];
+          for (const origin of origins) (await browser.permissions.contains({ origins: [origin] }) ? granted : denied).push(origin);
+          return { ...result, granted, denied };
+        });
+      }
       case 'SETTINGS_GET':
-        return handleSettingsGet(); // P2.5：设置页数据源（Key 打码，F9）
+        return browserSessionReady.then(() => handleSettingsGet()); // P2.5：设置页数据源（Key 打码，F9）
       default:
         return undefined; // 未识别消息交给其它 listener（SUMMARY_PROGRESS 由 executeViaOffscreen 处理）
     }
@@ -497,17 +639,19 @@ async function handleSessionStart(): Promise<Record<string, unknown>> {
     ...(existing?.state === 'GRACE' ? { restoredAt: now } : {}),
   };
   await setSessionPointer(browserKv, pointer);
+  await browserKv.set('browserHeartbeat', { sessionId, at: now });
   console.log(`[doubao] session ${resumable ? 'resumed' : 'started'}: ${sessionId}`);
   lastBroadcastSession = { sessionId, state: 'ACTIVE' };
   broadcastToUi(sessionStateMsg(pointer));
+  drainUnlessPaused(true);
   return { ok: true, sessionState: 'ACTIVE', resumed: resumable };
 }
 
 /** SESSION_END（结束陪看）：ACTIVE → GRACE（closedAt=现在，1h 保留基准；响应带倒计时数据）。 */
-async function handleSessionEnd(): Promise<Record<string, unknown>> {
+async function handleSessionEnd(closedAt = Date.now()): Promise<Record<string, unknown>> {
   const pointer = await getSessionPointer(browserKv);
   if (!pointer || pointer.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
-  const now = Date.now();
+  const now = closedAt;
   const next: SessionPointer = { ...pointer, state: 'GRACE', closedAt: now, lastActiveAt: now };
   await db.sessions.update(pointer.sessionId, { state: 'GRACE', closedAt: now, lastActiveAt: now });
   await setSessionPointer(browserKv, next);
@@ -551,6 +695,8 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
   const { bvid, url } = m;
   if (!bvid || !url) return { ok: false, error: 'VIDEO_ENTER 缺 bvid/url' };
   if (await isPaused()) return { ok: false, reason: 'paused' };
+  const initialPointer = await getSessionPointer(browserKv);
+  if (initialPointer?.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
   try {
     let wantedPage = 1;
     try {
@@ -564,7 +710,7 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
       (r) => r.page === wantedPage && isCacheFresh(r.fetchedAt, now),
     );
     if (!row) {
-      const client = new BiliClient(); // credentials:'include'：扩展宿主下自动带登录 Cookie
+      const client = new BiliClient(biliRequestHooks);
       const v = await client.getView(bvid); // view 免 WBI 签名，无需先取 keys
       const pg = pickPage(v.pages, wantedPage);
       row = {
@@ -582,7 +728,8 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
       await db.videos.put(row);
     }
     const pointer = await getSessionPointer(browserKv);
-    if (pointer) await upsertVisit(db, { sessionId: pointer.sessionId, videoKey: row.key, now });
+    if (pointer?.state !== 'ACTIVE' || pointer.sessionId !== initialPointer.sessionId || await isPaused()) return { ok: false, reason: 'inactive' };
+    await upsertVisit(db, { sessionId: pointer.sessionId, videoKey: row.key, now });
     const settings = (await browser.storage.local.get('settings'))['settings'] as
       | { triggerSeconds?: number }
       | undefined;
@@ -590,7 +737,7 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
       ok: true,
       videoKey: row.key,
       duration: row.duration,
-      triggerSeconds: clamp(settings?.triggerSeconds ?? 20, 5, 300),
+      triggerSeconds: clamp(settings?.triggerSeconds ?? 10, 5, 300),
     };
   } catch (e) {
     return { ok: false, error: String(e).slice(0, 200) };
@@ -604,38 +751,44 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
  *  （先看后激活的 autoplay 时序，E2E 实测），触发请求在 INACTIVE 期被吞后不再重发；
  *  这里以 DB 的 watchedSeconds 为权威做幂等补偿，F2 语义（累计≥阈值→触发）在任何时序下成立。 */
 async function handleWatchTick(m: InMsg): Promise<Record<string, unknown>> {
-  const { videoKey, watchedSeconds = 0, progressPct = 0 } = m;
+  const { videoKey, watchedSeconds = 0, progressPct = 0, watchId } = m;
   if (!videoKey) return { ok: false };
   if (await isPaused()) return { ok: false, reason: 'paused' }; // P2.5：暂停=零采集（不建行不记进度）
   const pointer = await getSessionPointer(browserKv);
-  if (!pointer) return { ok: false, reason: 'inactive' };
+  if (pointer?.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
   const sessionId = pointer.sessionId;
   const existing = await db.visits.where({ sessionId, videoKey }).first();
   if (!existing) {
     // videos 行可能也缺（VIDEO_ENTER 全程未激活）：job 链有兜底，列表标题退 videoKey
     await upsertVisit(db, { sessionId, videoKey, now: Date.now() });
   }
-  await updateVisitProgress(db, { sessionId, videoKey }, { watchedSeconds, progressPct });
-  const threshold = clamp((await readSettings()).triggerSeconds ?? 20, 5, 300);
+  await updateVisitProgress(db, { sessionId, videoKey }, { watchedSeconds, progressPct, watchId });
+  const threshold = clamp((await readSettings()).triggerSeconds ?? 10, 5, 300);
   const row = await db.visits.where({ sessionId, videoKey }).first();
   if (row && !row.triggered && row.watchedSeconds >= threshold) {
     // 审查 P2-1（2.2 轮）：读 pointer（:507）到入队之间可能插入手动清除——复验仍属同会话
     // 才入队，否则 wipe 后的迟到 tick 会重建 visit+烧一次 LLM（visit 行刚被随表清空，
     // where 查无行本会跳过；此复验收口 pointer 被清除/换新的窗口）
     const live = await getSessionPointer(browserKv);
-    if (live?.sessionId !== sessionId) return { ok: true, staleSession: true };
-    await db.transaction('rw', [db.visits, db.jobs], async () => {
-      await db.visits.put({ ...row, triggered: 1, lastSeenAt: Date.now() });
+    if (live?.sessionId !== sessionId || live.state !== 'ACTIVE' || await isPaused()) return { ok: true, staleSession: true };
+    const queued = await db.transaction('rw', [db.visits, db.jobs], async () => {
+      // 在事务内读取，避免覆盖另一标签页刚提交的观看增量；重复触发也在此收口。
+      const latest = await db.visits.where({ sessionId, videoKey }).first();
+      if (!latest || latest.triggered || latest.watchedSeconds < threshold) return false;
+      await db.visits.update(latest.id!, { triggered: 1, lastSeenAt: Date.now() });
       await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId });
+      return true;
     });
+    if (!queued) return { ok: true, deduped: true };
     console.log(`[doubao] summary job queued (tick sweep): ${videoKey}`);
     drainUnlessPaused();
+    return { ok: true, summaryTriggered: true };
   }
   return { ok: true, ...(existing ? {} : { created: true }) };
 }
 
 /**
- * TRIGGER_SUMMARY（20s 阈值）：会话级幂等（visits.triggered）+ pipeline.enqueue 活动任务去重
+ * TRIGGER_SUMMARY（可配置阈值）：会话级幂等（visits.triggered）+ pipeline.enqueue 活动任务去重
  * （双标签页/触发与按需并发在此收口），入队后 kick drain。
  */
 async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> {
@@ -643,15 +796,23 @@ async function handleTriggerSummary(m: InMsg): Promise<Record<string, unknown>> 
   if (!videoKey) return { ok: false };
   if (await isPaused()) return { ok: false, reason: 'paused' }; // P2.5：暂停不触发不置位（恢复后照常）
   const pointer = await getSessionPointer(browserKv);
-  if (!pointer) return { ok: false, reason: 'inactive' };
+  if (pointer?.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
   const visit = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
   if (!visit) return { ok: false, reason: 'no-visit' };
+  const threshold = clamp((await readSettings()).triggerSeconds ?? 10, 5, 300);
+  if (visit.watchedSeconds < threshold) return { ok: false, reason: 'below-threshold' };
   if (visit.triggered) return { ok: true, deduped: true };
-  // 单事务：置位 triggered 与建 job 同生共死，jobs 写失败可重试触发而不永久丢失
-  await db.transaction('rw', [db.visits, db.jobs], async () => {
-    await db.visits.put({ ...visit, triggered: 1, lastSeenAt: Date.now() });
+  const live = await getSessionPointer(browserKv);
+  if (live?.sessionId !== pointer.sessionId || live.state !== 'ACTIVE' || await isPaused()) return { ok: false, reason: 'inactive' };
+  // 单事务：置位 triggered 与建 job 同生共死，不用事务外旧记录覆盖并发进度。
+  const queued = await db.transaction('rw', [db.visits, db.jobs], async () => {
+    const latest = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
+    if (!latest || latest.triggered || latest.watchedSeconds < threshold) return false;
+    await db.visits.update(latest.id!, { triggered: 1, lastSeenAt: Date.now() });
     await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
+    return true;
   });
+  if (!queued) return { ok: true, deduped: true };
   console.log(`[doubao] summary job queued: ${videoKey}`);
   drainUnlessPaused();
   return { ok: true };
@@ -695,11 +856,11 @@ async function isPaused(): Promise<boolean> {
 
 /** P2.5：暂停时不清空 pending 队列（挂起待恢复）；解除暂停的保存路径自行 drain。
  *  F13 提速：双链同 kick——交互链独立于主链，摘要挂起/长跑不拖分段解读。 */
-function drainUnlessPaused(): void {
-  void isPaused().then((paused) => {
+function drainUnlessPaused(resume = false): void {
+  void browserSessionReady.then(() => isPaused()).then((paused) => {
     if (paused) return;
-    void pipeline.drain();
-    void segPipeline.drain();
+    void pipeline.drain(resume);
+    void segPipeline.drain(resume);
   });
 }
 
@@ -710,17 +871,21 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
   const { pointer } = await runRetention();
   drainUnlessPaused(); // P2.6：面板在看=续跑挂起队列的好时机（断网恢复后首个用户触点）
   const settings = await readSettings();
+  const update = await updateStore.get();
+  const latest = update?.latest;
   const retainUntil = pointer ? retainUntilOf(pointer) : undefined;
   const base = {
     ok: true as const,
     sessionState: pointer?.state ?? 'INACTIVE',
     ...(pointer?.closedAt !== undefined ? { closedAt: pointer.closedAt } : {}),
     ...(retainUntil !== undefined ? { retainUntil } : {}),
-    triggerSeconds: clamp(settings.triggerSeconds ?? 20, 5, 300),
+    triggerSeconds: clamp(settings.triggerSeconds ?? 10, 5, 300),
     // P2.5：「暂停陪看」总开关随列表应答下发（面板状态行与设置开关的数据源）
     paused: settings.paused === true,
     // P1.10：引导卡数据源（30s 缓存零网络；强制刷新走 LOGIN_CHECK force=1，面板打开时机）
     loggedIn: loginCache?.loggedIn ?? null,
+    updateVersion: latest && isNewerVersion(latest, browser.runtime.getManifest().version) ? latest : null,
+    updateRevision: update?.revision ?? 0,
   };
   if (!pointer) return { ...base, items: [] };
   const visits = (await db.visits.where('sessionId').equals(pointer.sessionId).toArray()).sort(
@@ -762,9 +927,16 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   const untouched = !summary && !lastJobRow; // 从未生成过也从未排过队
   const failedBefore = summary?.status === 'failed' || lastJobRow?.status === 'failed';
   if (!job && (untouched || (failedBefore && m.retry === 1)) && !(await isPaused())) {
-    await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId });
+    await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId, ...(m.retry === 1 ? { prio: -1 } : {}) });
     job = await activeJob(videoKey);
     drainUnlessPaused();
+  }
+  // 用户主动点击时允许保留期内执行，包括提升已存在的自动摘要；广播刷新不能触发。
+  if (m.retry === 1 && job && (job.type === 'SUMMARIZE' || job.type === 'REGENERATE') && job.status === 'pending' && !(await isPaused())) {
+    if (job.type === 'SUMMARIZE') await db.jobs.update(job.id, { prio: -1, updatedAt: Date.now() });
+    await allowManualJob(job);
+    job = await db.jobs.get(job.id);
+    drainUnlessPaused(true);
   }
   const transcript = excerptOf(await db.transcripts.get(videoKey));
   // P2.3 审查 P1-1：need_asr 卡片要能显示上次 ASR 尝试的失败原因——音频链失败保留 need_asr 行、
@@ -785,7 +957,8 @@ async function handleRegenerate(m: InMsg): Promise<Record<string, unknown>> {
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, error: 'no-session' };
   if (await activeJob(videoKey)) return { ok: false, error: 'busy' };
-  await pipeline.enqueue({ type: 'REGENERATE', videoKey, sessionId: pointer.sessionId });
+  const job = await pipeline.enqueue({ type: 'REGENERATE', videoKey, sessionId: pointer.sessionId });
+  await allowManualJob(job);
   drainUnlessPaused();
   return { ok: true, started: true };
 }
@@ -807,7 +980,7 @@ async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
   if (!asr?.baseUrl || !asr.modelId || !asr.apiKey) return { ok: false, reason: 'NEED_ASR_CONFIG' };
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, error: 'no-session' };
-  await db.transaction('rw', db.jobs, async () => {
+  const job = await db.transaction('rw', db.jobs, async () => {
     const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
     for (const j of rows) {
       // 审查 P2-3：need_confirm 语义唯一（等 ASR 确认），不按 type 过滤——REGENERATE 落
@@ -816,8 +989,9 @@ async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
         await db.jobs.put({ ...j, status: 'done', updatedAt: Date.now() });
       }
     }
-    await pipeline.enqueue({ type: 'ASR_SUMMARIZE', videoKey, sessionId: pointer.sessionId });
+    return pipeline.enqueue({ type: 'ASR_SUMMARIZE', videoKey, sessionId: pointer.sessionId });
   });
+  await allowManualJob(job);
   console.log(`[doubao] asr job queued (user confirmed): ${videoKey}`);
   drainUnlessPaused();
   return { ok: true, started: true };
@@ -932,6 +1106,7 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
         sessionId: pointer?.sessionId ?? 'no-session',
         segIndex,
       });
+      await allowManualJob(row);
       drainUnlessPaused();
       const queued = row.status === 'pending' ? await segmentQueueAhead(row) : 0;
       // 审查 P1-1：本次入了队就回合成 streaming 占位（started 标记让面板清空旧增量残留）——
@@ -946,8 +1121,10 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
   }
   // 已有活动任务（预取/在跑）：pending 预取提升为用户优先级，应答带位次
   // update（非 put）：只改 prio/updatedAt，避免用早先读到的陈旧整行覆盖在途 tick 写入的 stage/progress
-  if (active?.status === 'pending' && (active.prio ?? 0) > 0) {
-    await db.jobs.update(active.id, { prio: 0, updatedAt: Date.now() });
+  if (active?.status === 'pending' && !(await isPaused())) {
+    if ((active.prio ?? 0) > 0) await db.jobs.update(active.id, { prio: 0, updatedAt: Date.now() });
+    await allowManualJob(active);
+    drainUnlessPaused(true);
   }
   const queued = active?.status === 'pending' ? await segmentQueueAhead(active) : 0;
   return {
@@ -961,7 +1138,7 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
 
 // 登录探测专用实例：-412 熔断等待压到 1.5s（默认 60s 会让面板打开的 force 复核卡一分钟）；
 // 探测失败返回 null（未知态）不写缓存，下次重探。
-const loginClient = new BiliClient({ breakerWaitMs: 1500 });
+const loginClient = new BiliClient({ ...biliRequestHooks, breakerWaitMs: 1500 });
 const LOGIN_CACHE_MS = 30_000;
 let loginCache: { at: number; loggedIn: boolean | null } | null = null;
 /** 最近一次广播过的登录态（undefined=从未广播）；仅翻转时广播，防轰炸。 */
@@ -1034,14 +1211,13 @@ interface ModelConfigMsg {
   apiKey?: string;
 }
 
-/** optional_host_permissions：已含则跳过，否则申请（F9：弹窗仅含所填端点 origin）。
- *  SW 消息上下文可能无用户手势 → 申请抛错按未授权处理，不阻塞保存（端点带 CORS 时链路仍可用）。 */
-async function ensureOriginPermission(pattern: string): Promise<boolean> {
+/** F9：同步发起请求以保留点击手势；已授权时 Chrome 自行省略弹窗。拒绝不阻塞 CORS 端点。 */
+function ensureOriginPermission(origins: string[]): Promise<boolean> {
+  if (!origins.length) return Promise.resolve(true);
   try {
-    if (await browser.permissions.contains({ origins: [pattern] })) return true;
-    return await browser.permissions.request({ origins: [pattern] });
+    return browser.permissions.request({ origins }).catch(() => false);
   } catch {
-    return false;
+    return Promise.resolve(false);
   }
 }
 
@@ -1069,7 +1245,6 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   if (!baseUrl || !model || !apiKey) return { ok: false, msg: '请先填写完整配置再测试' };
   const v = validateEndpointUrl(baseUrl);
   if (!v.ok) return { ok: false, msg: v.error ?? 'Base URL 不合法' };
-  await ensureOriginPermission(`${v.origin}/*`);
   // P2.3：ASR 探活走 GET /models（OpenAI-compatible 惯例；/audio/transcriptions 探活需真音频不划算）
   if (m.kind === 'asr') {
     const controller = new AbortController();
@@ -1156,7 +1331,6 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
   const asr = m.asr;
   const prev = (await readSettings()) as unknown as Record<string, unknown>;
   const next: Record<string, unknown> = { ...prev };
-  const patterns: string[] = [];
   let llmCleared = false;
 
   // F9 清空 LLM Key 保存：显式清除 + 会话收口（ACTIVE→GRACE，走 F10 保留/确认链路）
@@ -1180,8 +1354,6 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
     const v = validateLlm({ baseUrl: llm.baseUrl ?? '', modelId: llm.modelId ?? '', apiKey });
     if (!v.ok) return { ok: false, error: v.error ?? `必填项缺失：${v.missing.join(' / ')}` };
     next['llm'] = { baseUrl: llm.baseUrl!.trim(), modelId: llm.modelId!.trim(), apiKey };
-    const oL = validateEndpointUrl(llm.baseUrl!);
-    if (oL.ok && oL.origin) patterns.push(`${oL.origin}/*`);
   } else if (
     llm === undefined &&
     asr !== undefined &&
@@ -1207,8 +1379,6 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
       });
       if (a.kind === 'error') return { ok: false, error: a.error };
       next.asr = { baseUrl: asr.baseUrl!.trim(), modelId: asr.modelId!.trim(), apiKey: resolveApiKey(prevAsr?.apiKey, asr.apiKey ?? '') };
-      const oA = validateEndpointUrl(asr.baseUrl!);
-      if (oA.ok && oA.origin) patterns.push(`${oA.origin}/*`);
     }
   } // asr 缺省 = 沿用（P2.5 起不再隐式删除）
 
@@ -1218,9 +1388,8 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
   if (m.bubbles !== undefined) next['bubbles'] = m.bubbles === true;
   if (m.paused !== undefined) {
     next['paused'] = m.paused === true;
-    if (m.paused !== true) void pipeline.drain(); // 解除暂停：立即续跑挂起的采集/生成
   }
-  if (typeof next['triggerSeconds'] !== 'number') next['triggerSeconds'] = 20;
+  if (typeof next['triggerSeconds'] !== 'number') next['triggerSeconds'] = 10;
   if (typeof next['persona'] !== 'string') next['persona'] = 'spicy';
   if (typeof next['bubbles'] !== 'boolean') next['bubbles'] = true;
   if (typeof next['asrMaxMB'] !== 'number') next['asrMaxMB'] = 25; // P2.3：音频上限默认 25MB（≈50 分钟）
@@ -1231,15 +1400,20 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
     settings: next,
     ...(setOnboarded === undefined ? {} : { onboarded: setOnboarded }),
   });
-
-  const granted: string[] = [];
-  const denied: string[] = [];
-  for (const p of patterns) {
-    (await ensureOriginPermission(p) ? granted : denied).push(p);
+  if (m.paused === true) {
+    updateAbort?.abort();
   }
+  if (m.paused !== undefined) broadcastToUi({ type: 'WATCH_SETTINGS', paused: next['paused'] === true });
+  if (m.paused === false) {
+    drainUnlessPaused(true);
+    const pending = updateCheckInFlight;
+    if (pending) void pending.then(() => checkUpdate());
+    else checkUpdate();
+  }
+
   console.log(
-    `[doubao] settings saved (${llmCleared ? 'llm cleared' : llm !== undefined ? 'llm ok' : 'llm kept'}, asr ${asr === undefined ? 'kept' : 'provided'}, paused=${String(next['paused'] === true)}; origins granted=${granted.length} denied=${denied.length})`,
+    `[doubao] settings saved (${llmCleared ? 'llm cleared' : llm !== undefined ? 'llm ok' : 'llm kept'}, asr ${asr === undefined ? 'kept' : 'provided'}, paused=${String(next['paused'] === true)})`,
   );
-  return { ok: true, granted, denied, ...(llmCleared ? { llmCleared: true } : {}), personaChanged };
+  return { ok: true, ...(llmCleared ? { llmCleared: true } : {}), personaChanged };
 }
 

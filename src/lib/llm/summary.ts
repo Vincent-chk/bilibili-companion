@@ -1,8 +1,7 @@
 import type { LlmConfig, LlmMessage, StreamEvent, SummaryResult } from './types';
 import { streamChatCompletion } from './client';
 
-// Key 安全红线（三条）：Key 不落盘（不写任何文件/存储）、不入库（不进 Dexie 或任何数据库）、
-// 不打印（不进日志与错误信息——错误只含 status 与打码后的 body 前 200 字符）。
+// Key 保存在 chrome.storage.local；不写源码、构建产物、Dexie 或日志。
 
 /** 人设只改点评口吻（F8/决策 D12：摘要本体保持客观）。v1.0 三预设。 */
 export const PERSONA_EVALUATION_STYLE: Record<string, string> = {
@@ -76,6 +75,12 @@ export function parseSummary(raw: string): { value: SummaryResult | null; error?
   }
 }
 
+/** 避免将截断的结构化模型输出当作正文；也识别旧版本已保存的原始 JSON。 */
+export function looksLikeStructuredSummary(raw: string): boolean {
+  const text = raw.trim();
+  return /^(?:```(?:json)?\s*)?\{\s*"(?:summary|outline|evaluation|rating)"\s*:/i.test(text);
+}
+
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /** Schema 校验（02-数据模型 §LLM 输出 Schema）。返回错误列表，空数组=通过。 */
@@ -129,7 +134,7 @@ export interface SummarizeOptions {
 export interface SummarizeOutcome {
   degraded: boolean;
   summaryResult: SummaryResult | null;
-  /** 降级时的纯文本兜底：最后一轮原始输出前 600 字（outline 置空）。 */
+  /** 降级时的纯文本兜底；结构化输出损坏时为 null，不展示原始 JSON。 */
   plainText: string | null;
   attempts: number;
   usage?: unknown;
@@ -137,7 +142,7 @@ export interface SummarizeOutcome {
 }
 
 /**
- * 结构化完成链（可复用执行体）：stream → parse → 校验失败带错误信息重发 1 次 → 再失败降级纯文本。
+ * 结构化完成链：校验失败带错重发 1 次；优先保留结构完整的结果，损坏的 JSON 不作为正文。
  * 最多 2 次请求。传输类错误（LlmHttpError / LlmNetworkError）直接抛给调用方做错误映射，不做降级。
  */
 export async function completeStructured(
@@ -155,6 +160,7 @@ export async function completeStructured(
     });
 
   let messages = baseMessages;
+  let usable: SummaryResult | null = null;
   for (let attempt = 1; ; attempt++) {
     const r = await run(messages);
     const { value, error } = parseSummary(r.text);
@@ -169,11 +175,14 @@ export async function completeStructured(
         ttftMs: r.ttftMs,
       };
     }
+    // 字数与条数只是格式目标，不应丢弃字段完整的摘要和可用大纲。
+    if (value && errs.every((e) => /^(?:summary 字数|outline 条数|evaluation 字数)/.test(e))) usable = value;
     if (attempt >= 2) {
+      if (usable) return { degraded: false, summaryResult: usable, plainText: null, attempts: attempt, usage: r.usage, ttftMs: r.ttftMs };
       return {
         degraded: true,
         summaryResult: null,
-        plainText: r.text.slice(0, 600),
+        plainText: looksLikeStructuredSummary(r.text) ? null : r.text.slice(0, 600),
         attempts: attempt,
         usage: r.usage,
         ttftMs: r.ttftMs,
@@ -208,7 +217,7 @@ export interface StoredLlmConfig {
 
 export interface ResolvedConfig {
   config: LlmConfig | null;
-  source: 'storage' | 'build-inject' | 'none';
+  source: 'storage' | 'none';
   error?: string;
   /** 整流超时（ms）：POC_LLM_TIMEOUT_MS 构建期注入；缺省 60s（见 resolveLlmTimeoutMs）。 */
   timeoutMs: number;
@@ -226,25 +235,18 @@ export function resolveLlmTimeoutMs(): number {
 }
 
 /**
- * 配置顺序：chrome.storage.local 的 llm 三件套（调用方传入，lib 层不读存储）
- * → 构建期注入 __POC_LLM_BASE_URL__/__POC_LLM_MODEL__/__POC_LLM_KEY__ → 都没有返回 null + 可读错误。
+ * 使用运行期配置（调用方从 chrome.storage.local 读取），未配置则返回可读错误。
  */
 export function resolveConfig(stored?: StoredLlmConfig): ResolvedConfig {
   const timeoutMs = resolveLlmTimeoutMs();
   if (stored?.baseUrl && stored.model && stored.apiKey) {
     return { config: { baseUrl: stored.baseUrl, model: stored.model, apiKey: stored.apiKey }, source: 'storage', timeoutMs };
   }
-  const baseUrl = typeof __POC_LLM_BASE_URL__ === 'string' ? __POC_LLM_BASE_URL__ : '';
-  const model = typeof __POC_LLM_MODEL__ === 'string' ? __POC_LLM_MODEL__ : '';
-  const apiKey = typeof __POC_LLM_KEY__ === 'string' ? __POC_LLM_KEY__ : '';
-  if (baseUrl && model && apiKey) {
-    return { config: { baseUrl, model, apiKey }, source: 'build-inject', timeoutMs };
-  }
   return {
     config: null,
     source: 'none',
     timeoutMs,
-    error: '未配置 LLM：请在设置中填写 baseUrl / model / apiKey，或经 POC_LLM_BASE_URL / POC_LLM_MODEL / POC_LLM_API_KEY 环境变量在构建期注入',
+    error: '未配置 LLM：请在设置中填写 baseUrl / model / apiKey',
   };
 }
 

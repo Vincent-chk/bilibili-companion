@@ -49,8 +49,9 @@ export function mapLlmError(e: unknown): { code: string; msg: string } {
   }
   // P2.6 F11：-412 → RISK_CONTROL（此前落 UNKNOWN 文案含技术细节不可读；熔断 60s 后自动恢复）
   if (e instanceof BiliApiError && e.code === -412) {
-    return { code: 'RISK_CONTROL', msg: 'B 站风控拦截（-412），已熔断冷却约 1 分钟，稍后可点击重试' };
+    return { code: 'RISK_CONTROL', msg: 'B 站风控拦截，冷却约 1 分钟后自动恢复' };
   }
+  if (e instanceof BiliApiError && e.code === -499) return { code: 'PAUSED', msg: '陪看已暂停，恢复后继续' };
   if (e instanceof LlmHttpError) {
     if (e.status === 401 || e.status === 403) return { code: 'KEY_INVALID', msg: 'LLM Key 无效或无权限，请到设置检查' };
     if (e.status === 402) return { code: 'NO_BALANCE', msg: 'LLM 余额不足' };
@@ -250,6 +251,12 @@ export async function runLlmAndPersist(
     if (keepDone) {
       return { result: 'failed', error: { code: 'DEGRADED', msg: '重生成输出未通过校验，旧摘要已保留，可稍后重试' } };
     }
+    // 结构化内容截断或损坏时，不能把 JSON 当正文，也不能伪装成成功。
+    if (!outcome.plainText?.trim()) {
+      const error = { code: 'DEGRADED', msg: '摘要生成不完整，请点击重新生成' };
+      await db.summaries.put({ ...baseSummary, source: transcript.source, status: 'failed', error });
+      return { result: 'failed', error };
+    }
     // 降级纯文本（F5：不白屏）：summary=前600字、outline 置空
     await db.summaries.put({
       ...baseSummary,
@@ -260,6 +267,13 @@ export async function runLlmAndPersist(
     return { result: 'done' };
   }
   const r = outcome.summaryResult;
+  // 重生成仅得到少于建议数量且比旧版更少的要点时，不丢弃旧大纲与分段解读。
+  if (keepDone && r.outline.length < 6) {
+    const previous = (await db.summaries.where('videoKey').equals(video.key).sortBy('createdAt')).pop();
+    if (previous?.status === 'done' && r.outline.length < previous.outline.length) {
+      return { result: 'failed', error: { code: 'DEGRADED', msg: '新大纲不完整，旧摘要已保留，可重新生成' } };
+    }
+  }
   await db.summaries.put({
     ...baseSummary,
     source: transcript.source,

@@ -2,6 +2,8 @@
 // 平铺字段），B→C 推送走 Port 长连接 doubao-port（runtime.sendMessage 到不了 content script）。
 // SW 休眠会掐断 Port：onDisconnect 指数退避重连（架构 §7）。
 // 依赖注入便于单测：connect/send 均可替换。
+import { browser } from 'wxt/browser';
+
 export type SummaryEventType =
   | 'SUMMARY_PROGRESS'
   | 'SUMMARY_DONE'
@@ -13,7 +15,11 @@ export type SummaryEventType =
   | 'SEGMENT_NOTE_FAILED';
 
 export interface UiEvent {
-  type: SummaryEventType | 'SESSION_STATE' | 'SEEK_TO' | 'LOGIN_STATE';
+  type: SummaryEventType | 'SESSION_STATE' | 'SEEK_TO' | 'LOGIN_STATE' | 'UPDATE_AVAILABLE' | 'WATCH_SETTINGS';
+  paused?: boolean;
+  restartWatcher?: boolean;
+  updateVersion?: string | null;
+  updateRevision?: number;
   videoKey?: string;
   jobId?: string;
   stage?: string;
@@ -44,6 +50,7 @@ export interface PortLike {
   onMessage: { addListener: (cb: (msg: unknown) => void) => void };
   onDisconnect: { addListener: (cb: () => void) => void };
   postMessage: (msg: unknown) => void;
+  disconnect?: () => void;
 }
 
 const PORT_NAME = 'doubao-port';
@@ -59,28 +66,25 @@ export class Bridge {
     deps?: Partial<BridgeDeps>,
   ) {
     this.#deps = {
-      connectPort: deps?.connectPort ?? ((name) => {
-        const b = (globalThis as { browser?: { runtime: { connect: (o: { name: string }) => PortLike } } }).browser;
-        return b!.runtime.connect({ name });
-      }),
-      send: deps?.send ?? ((msg) => {
-        const b = (globalThis as { browser?: { runtime: { sendMessage: (m: unknown) => Promise<unknown> } } }).browser;
-        return b!.runtime.sendMessage(msg);
-      }),
-      setTimeout: deps?.setTimeout ?? setTimeout,
+      connectPort: deps?.connectPort ?? ((name) => browser.runtime.connect({ name }) as unknown as PortLike),
+      send: deps?.send ?? ((msg) => browser.runtime.sendMessage(msg)),
+      setTimeout: deps?.setTimeout ?? (globalThis.setTimeout.bind(globalThis) as typeof setTimeout),
     };
   }
 
   connect(): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#port) return;
     try {
-      this.#port = this.#deps.connectPort(PORT_NAME);
+      const port = this.#deps.connectPort(PORT_NAME);
+      this.#port = port;
       this.#retry = 0;
-      this.#port.onMessage.addListener((msg) => {
+      port.onMessage.addListener((msg) => {
+        if (this.#port !== port) return;
         const e = msg as UiEvent;
         if (e && typeof e.type === 'string') this.onEvent(e);
       });
-      this.#port.onDisconnect.addListener(() => {
+      port.onDisconnect.addListener(() => {
+        if (this.#port !== port) return;
         this.#port = null;
         this.#reconnect();
       });
@@ -99,5 +103,13 @@ export class Bridge {
 
   request<T = unknown>(msg: Record<string, unknown>): Promise<T> {
     return this.#deps.send(msg) as Promise<T>;
+  }
+
+  /** 页面恢复时重连并由后台回放状态；旧连接排队中的消息不再消费。 */
+  syncState(): void {
+    const previous = this.#port;
+    this.#port = null;
+    try { previous?.disconnect?.(); } catch { /* 已断开 */ }
+    this.connect();
   }
 }

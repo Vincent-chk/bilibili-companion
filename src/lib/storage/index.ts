@@ -84,16 +84,21 @@ export async function updateVisitProgress(
   db: CompanionDB,
   where: { sessionId: string; videoKey: string },
   patch: Pick<VisitRow, 'watchedSeconds' | 'progressPct'> &
-    Partial<Pick<VisitRow, 'triggered' | 'lastSeenAt'>>,
+    Partial<Pick<VisitRow, 'triggered' | 'lastSeenAt'>> & { watchId?: string },
 ): Promise<void> {
   await db.transaction('rw', db.visits, async () => {
     const existing = await db.visits.where(where).first();
     if (!existing) return; // 无行可更（会话未建/已清除）——静默，watcher 下个 tick 重建
+    const { watchId, ...progress } = patch;
+    const previous = watchId ? existing.watchedByTracker?.[watchId] ?? 0 : 0;
+    const watchedSeconds = watchId
+      ? existing.watchedSeconds + Math.max(0, patch.watchedSeconds - previous)
+      : Math.max(existing.watchedSeconds, patch.watchedSeconds); // 兼容旧 content 消息
     await db.visits.put({
       ...existing,
-      ...patch,
-      // 刷新页面后 tracker 从 0 重新累计：取 max 保住会话累计口径，避免 watchedSeconds 回退
-      watchedSeconds: Math.max(existing.watchedSeconds, patch.watchedSeconds),
+      ...progress,
+      watchedSeconds,
+      ...(watchId ? { watchedByTracker: { ...existing.watchedByTracker, [watchId]: Math.max(previous, patch.watchedSeconds) } } : {}),
       lastSeenAt: patch.lastSeenAt ?? Date.now(),
     });
   });

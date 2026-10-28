@@ -271,6 +271,8 @@ export class MascotController {
   #applyPos(p: { x: number; y: number }): void {
     this.#el.wrap.style.left = `${p.x}px`;
     this.#el.wrap.style.top = `${p.y}px`;
+    // 贴近右侧时让缩小和展开都从右边缘向内展开，气泡也朝屏幕内对齐。
+    this.#el.wrap.classList.toggle('edge-right', p.x + 85 > this.#viewport().vw / 2);
   }
 
   /** P3.1：视口变化（进/退全屏、窗口缩放）后按当前视口重钳位，防豆包出界不可达。 */
@@ -295,6 +297,7 @@ export class MascotController {
     const onDown = (e: PointerEvent): void => {
       dragging = true;
       moved = false;
+      this.#el.wrap.classList.add('dragging');
       sx = e.clientX;
       sy = e.clientY;
       ox = this.#el.wrap.offsetLeft;
@@ -313,6 +316,7 @@ export class MascotController {
     const onUp = (): void => {
       if (!dragging) return;
       dragging = false;
+      this.#el.wrap.classList.remove('dragging');
       // 无论 moved 与否，原生 click 都会随后派发（pointerdown 的 preventDefault 不抑制 click）
       // ——凡源自 pointer 的 up 一律先记时间戳，click 兜底据此去重，防拖拽结束误触发
       lastPointerClickAt = Date.now();
@@ -337,10 +341,14 @@ export class MascotController {
     this.#el.mascot.addEventListener('pointerdown', onDown as EventListener);
     doc.addEventListener('pointermove', onMove as EventListener);
     doc.addEventListener('pointerup', onUp as EventListener);
+    doc.addEventListener('pointercancel', () => {
+      dragging = false;
+      this.#el.wrap.classList.remove('dragging');
+    });
     // 合成激活兜底：element.click() / 键盘触发不产生 pointer 事件（自动化与无障碍路径）；
     // 真鼠标路径在 pointerup 已处理并随后派发 click——400ms 内去重防双触发
-    this.#el.mascot.addEventListener('click', () => {
-      if (Date.now() - lastPointerClickAt < 400) return;
+    this.#el.mascot.addEventListener('click', (e) => {
+      if (e.detail !== 0 && Date.now() - lastPointerClickAt < 400) return;
       this.#onClick();
     });
   }

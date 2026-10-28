@@ -56,11 +56,18 @@ describe('位置钳位与默认位', () => {
   });
   it('正常值原样通过', () => {
     expect(clampMascotPos(800, 600, 1440, 900)).toEqual({ x: 800, y: 600 });
+    expect(clampMascotPos(100, 170, 1280, 320)).toEqual({ x: 100, y: 170 });
   });
-  it('默认位在右下区、y≥170', () => {
-    const p = defaultMascotPos(1440, 900);
-    expect(p.x).toBeGreaterThan(1440 - 500);
-    expect(p.y).toBeGreaterThanOrEqual(170);
+  it.each([272, 150, 100, 48])('高度 %ipx 时收起入口仍完整位于视口内', (height) => {
+    const p = clampMascotPos(0, 170, 1280, height);
+    expect(p.y + 150 - 48).toBeGreaterThanOrEqual(0);
+    expect(p.y + 150).toBeLessThanOrEqual(height);
+  });
+  it('视口不足入口高度时优先显示入口顶部', () => {
+    expect(clampMascotPos(0, 170, 1280, 30).y + 150 - 48).toBe(0);
+  });
+  it('没有保存位置时默认贴近左下边缘', () => {
+    expect(defaultMascotPos(1280, 800)).toEqual({ x: 4, y: 640 });
   });
 });
 

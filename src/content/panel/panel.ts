@@ -19,6 +19,7 @@ import {
   fmtCountdown,
   fmtSec,
   isJobActive,
+  isCorruptStoredSummary,
   relativeTimeLabel,
   sortListItems,
   starsHtml,
@@ -41,6 +42,8 @@ export interface ListQueryResponse {
   /** P2.5：「暂停陪看」总开关（状态行提示与设置开关数据源）。 */
   paused?: boolean;
   loggedIn: boolean | null; // P1.10 引导卡数据源（SW 30s 缓存）
+  updateVersion?: string | null;
+  updateRevision?: number;
 }
 
 /** P1.11 F13 分段解读注记视图模型（与 storage.SegmentNote 同形）。 */
@@ -75,13 +78,15 @@ export class PanelController {
   #view: 'list' | 'detail' | 'settings' = 'list';
   #detailKey: string | null = null;
   #items: ListItemVM[] = [];
-  #triggerSeconds = 20;
+  #triggerSeconds = 10;
   #sessionState = 'INACTIVE';
   /** P2.5：暂停陪看（状态行提示）。 */
   #paused = false;
   /** 当前详情的流式累计（LLM 原始 JSON token 流）。 */
   #stream: { videoKey: string; acc: string; stage?: string } | null = null;
   #refreshTimer: unknown = null;
+  #updateRevision = -1;
+  #refreshRevision = 0;
   /** 路由代数：followVideo 递增，作废在途 #openDetail 应答（审查 P2-5）。 */
   #routeGen = 0;
   /** P1.10 登录态（null=未知）：引导卡显隐依据。 */
@@ -210,15 +215,17 @@ export class PanelController {
   /** LIST_QUERY → 渲染当前视图。 */
   async refresh(): Promise<void> {
     const t0 = performance.now(); // P3.2 性能探针：列表态「数据往返+渲染」耗时（面板 ≤300ms 指标）
+    const revision = ++this.#refreshRevision;
     try {
       const r = await this.deps.bridge.request<ListQueryResponse>({ type: 'LIST_QUERY' });
-      if (!r?.ok) return;
+      if (!r?.ok || revision !== this.#refreshRevision) return;
       this.#items = sortListItems((r.items ?? []).map(toListItemVM));
       this.#sessionState = r.sessionState ?? 'INACTIVE';
       this.#retainUntil = r.retainUntil ?? null; // P2.1 倒计时（应答经 SW 静默判定后的最新值）
-      this.#triggerSeconds = r.triggerSeconds ?? 20;
+      this.#triggerSeconds = r.triggerSeconds ?? 10;
       this.#paused = r.paused === true; // P2.5：状态行「已暂停」提示
       this.setLoginState(r.loggedIn ?? null); // P1.10 引导卡（SW 缓存值；强制复核在 open()）
+      this.#renderUpdate(r.updateVersion ?? null, r.updateRevision ?? 0);
       this.#renderStatus();
       if (this.#view === 'list') {
         this.#renderList();
@@ -360,7 +367,7 @@ export class PanelController {
     }
     // P2.5：「暂停陪看」状态行提示（任何会话态都可叠加；解除后消失）
     if (this.#paused) {
-      el.innerHTML = `${el.innerHTML}<span class="countdown-pill" style="margin-left:6px">⏸ 已暂停 · 不采集不请求（设置中可恢复）</span>`;
+      el.innerHTML = `${el.innerHTML}<span class="countdown-pill" style="margin-left:6px">⏸ 已暂停 · 停止记录及新任务（设置中可恢复）</span>`;
     }
   }
 
@@ -669,7 +676,9 @@ export class PanelController {
         ? `${esc(partial)}<span class="caret"></span>`
         : `<div class="d-summary-empty"><span class="spinner"></span>${stage}</div>`;
     } else if (s?.status === 'done' && s.summary) {
-      summaryHtml = esc(s.summary);
+      summaryHtml = isCorruptStoredSummary(s)
+        ? '<div class="d-summary-empty">摘要生成不完整，请点击重新生成</div>'
+        : esc(s.summary) + (!s.outline?.length ? '<div class="d-summary-empty">未生成要点大纲，可点击重新生成</div>' : '');
     } else if (s?.status === 'need_asr') {
       // P2.3 F6-①：卡片文案逐字（总纲口径）；【调用 ASR 解析】【暂不】+ 超长预告（音频估算 >25MB）
       const estMB = Math.round(estimateAudioBytes(v?.duration ?? 0) / 1048576);
@@ -691,6 +700,10 @@ export class PanelController {
           : '');
     } else {
       summaryHtml = '<div class="d-summary-empty">还没有摘要</div>';
+    }
+
+    if (!streaming && s?.status === 'done' && !isJobActive(item.job) && item.lastJob?.type === 'REGENERATE' && item.lastJob.status === 'failed') {
+      summaryHtml += `<div class="d-summary-empty">上次重新生成失败：${esc(item.lastJob.error?.msg ?? '请稍后重试')}</div>`;
     }
 
     // P1.11 F13：大纲条目 = seek 行（.ol-row）+ 独立【AI 解读】入口 + 内联注记容器（流式/缓存/失败重试）
@@ -748,7 +761,7 @@ export class PanelController {
     for (const i of this.#segOpen) this.#paintSegNote(i);
     root.getElementById('d-copy')?.addEventListener('click', () => {
       const text = s?.summary ?? '';
-      if (!text) return;
+      if (!text || isCorruptStoredSummary(s)) return;
       void navigator.clipboard
         ?.writeText(text)
         .then(() => toast(this.deps.ui, '摘要已复制到剪贴板'))
@@ -761,6 +774,14 @@ export class PanelController {
   // ---- 桥事件 ----
 
   handleEvent(e: UiEvent): void {
+    if (e.type === 'WATCH_SETTINGS') {
+      if (this.#open) void this.refresh();
+      return;
+    }
+    if (e.type === 'UPDATE_AVAILABLE') {
+      this.#renderUpdate(e.updateVersion ?? null, e.updateRevision ?? 0);
+      return;
+    }
     if (e.type === 'LOGIN_STATE') {
       this.setLoginState(e.loggedIn ?? null); // P1.10 引导卡实时翻转
       return;
@@ -813,6 +834,15 @@ export class PanelController {
         else void this.refresh();
       }, 300);
     }
+  }
+
+  #renderUpdate(version: string | null, revision: number): void {
+    if (revision < this.#updateRevision) return;
+    this.#updateRevision = revision;
+    const banner = this.deps.ui.root.getElementById('update-banner');
+    if (!banner) return;
+    banner.classList.toggle('hidden', !version);
+    banner.innerHTML = version ? `发现新版本 <a href="https://github.com/Vincent-chk/bilibili-companion/releases/latest" target="_blank" rel="noopener noreferrer">${esc(version)} · 查看更新</a>` : '';
   }
 
   /** 流式打字：只重绘摘要区，避免整屏 innerHTML 重建打断阅读/滚动。 */

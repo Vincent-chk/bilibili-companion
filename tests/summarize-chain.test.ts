@@ -277,6 +277,22 @@ describe('runSummarizeJob 全链', () => {
     await db.delete();
   });
 
+  it('截断的结构化输出不得写成已完成摘要，而应提示用户重新生成', async () => {
+    const db = freshDb();
+    await db.videos.put({ key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: 't',
+      cover: '', owner: '', duration: 600, page: 1, fetchedAt: Date.now() });
+    const server = await startMockLlm(() => ({ chunks: ['{"summary":"摘要", "outline":[{"time":9,'] }));
+    servers.push(server);
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob({ db, bili: fakeBili({}), llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } }, { videoKey: VIDEO_KEY }, ctx);
+    expect(outcome.result).toBe('failed');
+    const row = await db.summaries.get(summaryKey(VIDEO_KEY, 'm1'));
+    expect(row?.status).toBe('failed');
+    expect(row?.summary).not.toContain('{');
+    expect(row?.error?.msg).toContain('重新生成');
+    await db.delete();
+  });
+
   it('字幕轨存在但 cues 为空 → failed + NO_CONTENT', async () => {
     const db = freshDb();
     await db.videos.put({
@@ -359,6 +375,28 @@ describe('2.7a force 重新生成（REGENERATE 执行体语义）', () => {
     expect(row?.createdAt).toBeGreaterThan(1);
     expect(row?.segmentNotes).toBeUndefined(); // 分段缓存随重生成失效（2.7a 策略）
     expect(server.calls).toHaveLength(1);
+    await db.delete();
+  });
+
+  it('重生成只得到更少且不完整的大纲时保留旧摘要和已生成解读', async () => {
+    const db = freshDb();
+    await seedDone(db);
+    const oldKey = summaryKey(VIDEO_KEY, 'm1');
+    const oldOutline = Array.from({ length: 6 }, (_, i) => ({ time: i * 60, text: `旧要点${i}` }));
+    await db.summaries.update(oldKey, { outline: oldOutline });
+    const candidate = JSON.stringify({ summary: '新摘要', outline: [{ time: 0, text: '仅一个要点' }], evaluation: '新点评', rating: 4 });
+    const server = await startMockLlm(() => ({ chunks: [candidate] }));
+    servers.push(server);
+    const { ctx } = ctxLog();
+    const outcome = await runSummarizeJob(
+      { db, bili: fakeBili({}), llm: { baseUrl: server.url, model: 'm1', apiKey: 'k' } },
+      { videoKey: VIDEO_KEY }, ctx, { force: true },
+    );
+    expect(outcome.result).toBe('failed');
+    const row = await db.summaries.get(oldKey);
+    expect(row?.summary).toBe('旧摘要');
+    expect(row?.outline).toEqual(oldOutline);
+    expect(row?.segmentNotes?.[0]?.text).toBe('旧注记');
     await db.delete();
   });
 

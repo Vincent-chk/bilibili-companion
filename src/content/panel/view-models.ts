@@ -1,6 +1,7 @@
 // P1.5 · 面板视图模型（纯函数，无 DOM/browser 依赖，单测覆盖）：
 // LIST_QUERY 原始行 → 列表/详情展示模型；徽章五态映射（F4）；流式摘要抽取（F5/F7）。
 import type { JobRow, SummaryRow, TranscriptRow, VideoRow, VisitRow } from '../../lib/storage';
+import { looksLikeStructuredSummary } from '../../lib/llm/summary';
 
 // ---- 后端 LIST_QUERY / SUMMARY_OPEN 的行形状（background 组装，见 handleListQuery） ----
 
@@ -27,7 +28,7 @@ export interface ListQueryItem {
   summary?: SummaryInfo;
   job?: JobInfo;
   /** P2.3 审查 P1-1：最近一次 job 终态（failed 时的 error 是 need_asr 卡片的失败反馈数据源）。 */
-  lastJob?: { status: JobRow['status']; error?: { code: string; msg: string } };
+  lastJob?: { type?: JobRow['type']; status: JobRow['status']; error?: { code: string; msg: string } };
 }
 
 export interface ListItemVM {
@@ -55,9 +56,14 @@ export const isJobActive = (j?: JobInfo): boolean =>
  * failed（且无活动任务）→ 解析失败（红）；其余 → 未生成（灰）。
  * 优先级：生成中 > 已总结 > 待确认 > 失败 > 未生成（done+新任务=重生成中，以任务为准）。
  */
+/** 旧版降级行没有大纲与点评：只对这种记录检查误存的 JSON。 */
+export function isCorruptStoredSummary(s?: SummaryInfo): boolean {
+  return s?.status === 'done' && !s.outline?.length && !s.evaluation && looksLikeStructuredSummary(s.summary ?? '');
+}
+
 export function badgeFor(item: { summary?: SummaryInfo; job?: JobInfo }): BadgeKind {
   if (isJobActive(item.job) && item.job?.status !== 'need_confirm') return 'generating';
-  if (item.summary?.status === 'done') return 'summarized';
+  if (item.summary?.status === 'done') return isCorruptStoredSummary(item.summary) ? 'failed' : 'summarized';
   if (item.summary?.status === 'need_asr' || item.job?.status === 'need_confirm') return 'nosub';
   if (item.summary?.status === 'failed') return 'failed';
   return 'ungenerated';

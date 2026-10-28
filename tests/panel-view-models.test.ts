@@ -42,6 +42,20 @@ describe('五态徽章映射（F4）', () => {
   it('摘要 done → 已总结（绿）', () => {
     expect(badgeFor({ summary: { status: 'done' } as never })).toBe('summarized');
   });
+  it('旧版保存的截断 JSON 不应显示为已总结', () => {
+    const summary = { status: 'done', summary: '{"summary":"摘要", "outline":[{"time":9,' } as never;
+    expect(badgeFor({ summary })).toBe('failed');
+  });
+  it('普通文本提到 JSON 字段或以普通花括号开头时仍显示已总结', () => {
+    for (const summary of ['视频解释字段 "summary": 的含义。', '{模型参数} 包含温度和长度']) {
+      expect(badgeFor({ summary: { status: 'done', summary, outline: [], evaluation: '' } as never })).toBe('summarized');
+    }
+  });
+  it('有效结构化结果的摘要正文即使以 JSON 示例开头也不误判为旧损坏记录', () => {
+    const summary = { status: 'done', summary: '{"summary":"示例"} 是视频展示的代码。',
+      outline: [{ time: 0, text: '讲解示例' }], evaluation: '点评' } as never;
+    expect(badgeFor({ summary })).toBe('summarized');
+  });
   it('need_asr / need_confirm 任务 → 无字幕·待确认（橙）', () => {
     expect(badgeFor({ summary: { status: 'need_asr' } as never })).toBe('nosub');
     expect(badgeFor({ job: { status: 'need_confirm' } })).toBe('nosub');

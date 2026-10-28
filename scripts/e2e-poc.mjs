@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // 扩展端到端真机验证（E2E）· Phase 0 任务 0.5 建立，P1.4 起驱动真实触发链
 //
-// 链路：pnpm build（注入 mock LLM 地址）→ 干净临时 user-data-dir
+// 链路：pnpm build → 干净临时 user-data-dir
 //   → headless Chrome for Testing + --load-extension（branded Chrome 137+ 屏蔽该开关）
 //   → 登录态注入（提取器从真实 Chrome 解密取 Cookie → bilibili.com 页 document.cookie 写入）
 //   → SW 注入 sessionPointer+低阈值 → reload → 页面 muted play() 让 watcher 真实累计 5s
@@ -79,14 +79,11 @@ async function main() {
     log('REAL LLM mode:', llmCfg.baseUrl, llmCfg.modelId, `(Key 不打印，长度 ${llmCfg.apiKey.length})`); // 审查 P2-2：前缀也不打，红线零例外
   }
 
-  // 2) 带 LLM 环境重新构建（Key 只进构建 env，绝不入仓库）
-  log(`rebuilding extension with ${REAL ? 'REAL' : 'mock'} LLM env …`);
+  // 2) 重新构建。端点和 Key 只在 onboarding 中输入，不进入构建产物。
+  log('rebuilding extension without LLM credentials …');
   const env = {
     ...process.env,
     PATH: `/opt/homebrew/bin:${path.join(os.homedir(), '.npm-global/bin')}:${process.env.PATH}`,
-    POC_LLM_BASE_URL: llmCfg.baseUrl,
-    POC_LLM_MODEL: llmCfg.modelId,
-    POC_LLM_API_KEY: llmCfg.apiKey,
     ...(REAL ? { POC_LLM_TIMEOUT_MS: process.env.POC_LLM_TIMEOUT_MS || '300000' } : {}),
   };
   const build = spawnSync('pnpm', ['build'], { cwd: ROOT, env, encoding: 'utf8' });
@@ -174,7 +171,7 @@ async function main() {
             expression: 'chrome.runtime.getManifest().name',
             returnByValue: true,
           }, sessionId).then((rr) => {
-            if (rr?.result?.result?.value === '豆包陪看助手（PoC）') {
+            if (rr?.result?.result?.value === '豆包陪看助手') {
               swSessionId = sessionId;
               log(`sw session 认领（manifest.name 匹配）: ${t.url.slice(0, 60)}`);
             }
@@ -1926,9 +1923,9 @@ async function main() {
               String(containerReset?.status ?? '').includes('未激活'),
           };
           log('P2.5 llmClear 子值:', JSON.stringify({
-            clearModal, clearedLlm: clearedStore?.settings?.llm, onboarded: clearedStore?.onboarded,
-            pointer: clearedPointer, reLlm: reconfigured?.settings?.llm?.apiKey, reOnboarded: reconfigured?.onboarded,
-            asrAfterClear: asrClearedStore?.settings?.asr }));
+            clearModal, clearedLlm: !!clearedStore?.settings?.llm, onboarded: clearedStore?.onboarded,
+            pointer: clearedPointer, reLlmMatches: reconfigured?.settings?.llm?.apiKey === llmCfg.apiKey, reOnboarded: reconfigured?.onboarded,
+            asrAfterClear: !!asrClearedStore?.settings?.asr }));
           log('P2.5 判定项:', JSON.stringify(settingsProbe));
 
           // ============================================================
@@ -2246,7 +2243,7 @@ async function main() {
       networkWhitelist: netUrls.length > 0 && netUrls.every((u) => {
         try {
           const h = new URL(u).hostname;
-          return h === '127.0.0.1' ||
+          return u === 'https://api.github.com/repos/Vincent-chk/bilibili-companion/releases/latest' || h === '127.0.0.1' ||
             /(^|\.)(bilibili\.com|hdslb\.com|bilivideo\.com|bilivideo\.cn)$/.test(h) ||
             h === new URL(llmCfg.baseUrl).hostname;
         } catch { return false; }

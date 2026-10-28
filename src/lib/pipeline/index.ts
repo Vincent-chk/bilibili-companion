@@ -35,6 +35,8 @@ export interface PipelineOptions {
   onTransition?: (job: JobRow) => void;
   /** 通道过滤：本实例只 drain 这些类型（缺省=全部）。多实例分 lane 并行（每 lane 并发仍=1）。 */
   lane?: JobType[];
+  /** 每个任务前重新检查暂停等运行门槛，保留 pending 等待恢复。 */
+  canRun?: (job: JobRow) => Promise<boolean>;
 }
 
 const ACTIVE_STATUSES: JobRow['status'][] = ['pending', 'running', 'need_confirm'];
@@ -47,7 +49,10 @@ export class Pipeline {
   readonly #now: () => number;
   readonly #onTransition?: (job: JobRow) => void;
   readonly #lane?: JobType[];
+  readonly #canRun?: (job: JobRow) => Promise<boolean>;
   #busy = false;
+  #drainRequested = false;
+  #workAddedWhileBusy = false;
 
   constructor(db: CompanionDB, handlers: PipelineHandlers, opts: PipelineOptions = {}) {
     this.#db = db;
@@ -56,6 +61,7 @@ export class Pipeline {
     this.#now = opts.now ?? Date.now;
     this.#onTransition = opts.onTransition;
     this.#lane = opts.lane;
+    this.#canRun = opts.canRun;
   }
 
   /**
@@ -68,7 +74,7 @@ export class Pipeline {
     videoKey: string;
     sessionId: string;
     segIndex?: number;
-    prio?: number; // 缺省 0；1=后台预取（同通道内被用户任务插队）
+    prio?: number; // 缺省 0；-1=主动摘要，1=后台预取
   }): Promise<JobRow> {
     return this.#db.transaction('rw', this.#db.jobs, async () => {
       const active = await this.#db.jobs
@@ -97,6 +103,7 @@ export class Pipeline {
         updatedAt: now,
       };
       await this.#db.jobs.put(row);
+      if (this.#busy) this.#workAddedWhileBusy = true;
       this.#emit(row);
       return row;
     });
@@ -121,7 +128,10 @@ export class Pipeline {
     let pending = await this.#db.jobs.where('status').equals('pending').toArray();
     if (this.#lane) pending = pending.filter((j) => this.#lane!.includes(j.type));
     pending.sort((a, b) => (a.prio ?? 0) - (b.prio ?? 0) || a.createdAt - b.createdAt);
-    const job = pending[0];
+    let job: JobRow | undefined;
+    for (const candidate of pending) {
+      if (!this.#canRun || await this.#canRun(candidate)) { job = candidate; break; }
+    }
     if (!job) return false;
     await this.#set({ ...job, status: 'running', updatedAt: this.#now() });
     const ctx: JobContext = {
@@ -166,15 +176,24 @@ export class Pipeline {
     return true;
   }
 
-  /** 串行清空 pending（并发=1；重入时等当前轮结束再补一轮；网络挂起即停轮）。 */
-  async drain(): Promise<void> {
-    if (this.#busy) return;
+  /** 串行清空 pending。只有显式恢复信号才在忙时请求补跑，普通刷新不破坏 wait 停轮。 */
+  async drain(resume = false): Promise<void> {
+    if (this.#busy) { if (resume) this.#drainRequested = true; return; }
     this.#busy = true;
     try {
-      for (;;) {
-        const r = await this.tick();
-        if (!r || r === 'wait') break; // wait=网络挂起，等恢复后续跑
-      }
+      do {
+        this.#drainRequested = false;
+        this.#workAddedWhileBusy = false;
+        for (;;) {
+          const r = await this.tick();
+          if (r === 'wait') break; // 不因入队立即重跑网络等待中的任务
+          if (!r) {
+            // 空查询期间发生新入队时，查询快照可能已过期，需重查一次。
+            if (this.#workAddedWhileBusy) { this.#workAddedWhileBusy = false; continue; }
+            break;
+          }
+        }
+      } while (this.#drainRequested);
     } finally {
       this.#busy = false;
     }
@@ -192,6 +211,7 @@ export class Pipeline {
     const job = await this.#db.jobs.get(jobId);
     if (!job || job.status !== 'failed') return;
     await this.#set({ ...job, status: 'pending', retries: 0, updatedAt: this.#now() });
+    if (this.#busy) this.#workAddedWhileBusy = true;
   }
 
   async #set(row: JobRow, silent = false): Promise<void> {

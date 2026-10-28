@@ -21,6 +21,31 @@ const jsonResponse = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
 describe('P2.6 · -412 跨请求熔断门禁（F11：60s 内不再请求，恢复自动续）', () => {
+  it('字幕 CDN 的 HTTP 412 同样报告共享风控并阻止后续请求', async () => {
+    let riskHits = 0;
+    let calls = 0;
+    const client = new BiliClient({ intervalMs: 0, breakerWaitMs: 60_000, onRiskControl: async () => { riskHits++; }, fetchImpl: async () => { calls++; return new Response('', { status: 412 }); } });
+    await expect(client.fetchTranscript('https://i0.hdslb.com/test.json')).rejects.toMatchObject({ code: -412 });
+    expect(riskHits).toBe(1);
+    await expect(client.getView('BV1x')).rejects.toBeInstanceOf(BiliApiError);
+    expect(calls).toBe(1);
+  });
+  it('不同客户端通过共享请求门禁共同遵守风控冷却', async () => {
+    let blocked = false;
+    let secondCalls = 0;
+    const shared = {
+      beforeRequest: async () => { if (blocked) throw new BiliApiError(-412, 'shared', '风控熔断中'); },
+      onRiskControl: async () => { blocked = true; },
+    };
+    const a = new BiliClient({ ...shared, intervalMs: 0, breakerWaitMs: 0, fetchImpl: async () => jsonResponse({ code: -412 }) });
+    const b = new BiliClient({ ...shared, intervalMs: 0, breakerWaitMs: 0, fetchImpl: async () => { secondCalls++; return jsonResponse({ code: 0, data: { aid: 1, title: 'x', duration: 1 } }); } });
+    await expect(a.getView('BV1x')).rejects.toBeInstanceOf(BiliApiError);
+    await expect(b.getView('BV1y')).rejects.toThrow('风控熔断中');
+    expect(secondCalls).toBe(0);
+    blocked = false;
+    await expect(b.getView('BV1y')).resolves.toMatchObject({ title: 'x' });
+    expect(secondCalls).toBe(1);
+  });
   // 真实 sleep=breakerWaitMs（保持小值快速）；熔断门禁时钟用注入的 fake now（冻结/步进可控）
   const makeClient = (fetchImpl: (url: string) => Promise<Response>, nowRef: { t: number }) =>
     new BiliClient({ fetchImpl, intervalMs: 0, breakerWaitMs: 30, now: () => nowRef.t });
@@ -76,11 +101,11 @@ describe('P2.6 · -412 跨请求熔断门禁（F11：60s 内不再请求，恢�
 });
 
 describe('P2.6 · mapLlmError：-412 → RISK_CONTROL（可读文案，不再落 UNKNOWN）', () => {
-  it('BiliApiError(-412) 映射 RISK_CONTROL + 熔断口径文案（审查 P2-5：指向点击重试非自动恢复）', () => {
+  it('BiliApiError(-412) 映射 RISK_CONTROL，说明冷却后自动恢复', () => {
     const r = mapLlmError(new BiliApiError(-412, '/x/player/wbi/v2'));
     expect(r.code).toBe('RISK_CONTROL');
     expect(r.msg).toContain('风控');
-    expect(r.msg).toContain('重试');
+    expect(r.msg).toContain('自动恢复');
   });
   it('401 → KEY_INVALID 不受影响（回归）', () => {
     const r = mapLlmError(new LlmHttpError(401, 'denied'));

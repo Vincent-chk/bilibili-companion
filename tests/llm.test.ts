@@ -123,6 +123,38 @@ describe('llm client + summary', () => {
     expect(out.attempts).toBe(2);
   });
 
+  it('格式完整但字数或大纲条数未达建议值时，重试失败仍保留可用摘要和大纲', async () => {
+    const candidate = { summary: '客观摘要', outline: [{ time: 9, text: '第一段要点' }, { time: 19, text: '第二段要点' }], evaluation: '点评', rating: 4 };
+    let calls = 0;
+    const base = await start(async (req, res) => {
+      await readBody(req);
+      writeSse(res, ++calls === 1 ? JSON.stringify(candidate) : '{"summary":"截断');
+    });
+    const out = await summarize({ baseUrl: base, model: 'mock', apiKey: 'test' }, META, '字幕');
+    expect(out.attempts).toBe(2);
+    expect(out.degraded).toBe(false);
+    expect(out.summaryResult).toEqual(candidate);
+  });
+
+  it('两轮截断 JSON 不能作为纯文本摘要交给界面', async () => {
+    const base = await start(async (req, res) => {
+      await readBody(req);
+      writeSse(res, '{"summary":"客观摘要", "outline":[{"time":9,"text":"第一段"},');
+    });
+    const out = await summarize({ baseUrl: base, model: 'mock', apiKey: 'test' }, META, '字幕');
+    expect(out.degraded).toBe(true);
+    expect(out.plainText).toBeNull();
+    expect(out.summaryResult).toBeNull();
+  });
+
+  it('纯文本说明 JSON 字段时仍可作为普通摘要降级展示', async () => {
+    const text = '{模型参数} 中的 "summary": 表示摘要字段。';
+    const base = await start(async (req, res) => { await readBody(req); writeSse(res, text); });
+    const out = await summarize({ baseUrl: base, model: 'mock', apiKey: 'test' }, META, '字幕');
+    expect(out.degraded).toBe(true);
+    expect(out.plainText).toBe(text);
+  });
+
   it('④ 请求头确实带 Authorization: Bearer <apiKey>', async () => {
     let auth = '';
     const base = await start(async (req, res) => {
@@ -159,7 +191,7 @@ describe('llm client + summary', () => {
     expect(r.text).toBe('半截流水测试🫘尾段');
   });
 
-  it('⑥ 非 2xx 错误 body 中含 Key 会被打码，错误只含 status + 前 200 字符', async () => {
+  it('⑥ 非 2xx 错误不暴露服务端返回的 Key，保留状态码', async () => {
     const apiKey = 'ark-t6-abcdef1234567890';
     const base = await start((_req, res) => {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -175,8 +207,24 @@ describe('llm client + summary', () => {
     expect(httpErr.status).toBe(401);
     expect(httpErr.message).not.toContain(apiKey);
     expect(httpErr.body).not.toContain(apiKey);
-    expect(httpErr.body).toContain('***');
-    expect(httpErr.body.length).toBeLessThanOrEqual(200);
+    expect(httpErr.body).toBe('服务端错误详情已隐藏');
+  });
+
+  it('服务商错误体回显字幕和会话凭据时不暴露在错误对象中', async () => {
+    const subtitle = '模拟私密字幕仅供测试';
+    const cookie = 'SESSDATA=example-session-value';
+    const base = await start((_req, res) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `${subtitle} ${cookie}` } }));
+    });
+    const err = await streamChatCompletion({ baseUrl: base, model: 'mock', apiKey: 'test-key' }, [
+      { role: 'user', content: subtitle },
+    ]).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(LlmHttpError);
+    const httpErr = err as LlmHttpError;
+    expect(httpErr.status).toBe(500);
+    expect(`${httpErr.message} ${httpErr.body}`).not.toContain(subtitle);
+    expect(`${httpErr.message} ${httpErr.body}`).not.toContain(cookie);
   });
 
   it('⑦ 服务端不响应 → 超时归类为 LlmNetworkError', async () => {
@@ -200,6 +248,21 @@ describe('llm client + summary', () => {
     expect(none.config).toBeNull();
     expect(none.source).toBe('none');
     expect(none.error).toBeTruthy();
+  });
+
+  it('未配置时不从构建期变量回退读取密钥', () => {
+    const g = globalThis as Record<string, unknown>;
+    g.__POC_LLM_BASE_URL__ = 'https://example.test/v1';
+    g.__POC_LLM_MODEL__ = 'example';
+    g.__POC_LLM_KEY__ = 'test-only-secret';
+    try {
+      expect(resolveConfig().config).toBeNull();
+      expect(resolveConfig().source).toBe('none');
+    } finally {
+      delete g.__POC_LLM_BASE_URL__;
+      delete g.__POC_LLM_MODEL__;
+      delete g.__POC_LLM_KEY__;
+    }
   });
 
   it('⑧b resolveConfig.timeoutMs：缺省 60s；POC_LLM_TIMEOUT_MS 注入优先；非法值回退', () => {

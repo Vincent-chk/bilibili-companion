@@ -4,7 +4,7 @@
 // 注意：offscreen 文档 API 受限（实测 chrome.storage/browser.storage 均不可用），
 // 因此 LLM 配置与 persona 由 SW 解析后随消息传入，offscreen 不读 storage。
 import { browser } from 'wxt/browser';
-import { BiliClient } from '../../src/lib/bilibili/client';
+import { BiliApiError, BiliClient } from '../../src/lib/bilibili/client';
 import { runSummarizeJob } from '../../src/lib/summarize/chain';
 import { runAsrJob } from '../../src/lib/summarize/asr';
 import { runSegmentJob } from '../../src/lib/summarize/segment';
@@ -12,6 +12,13 @@ import { CompanionDB } from '../../src/lib/storage';
 import type { LlmConfig } from '../../src/lib/llm/types';
 
 const db = new CompanionDB();
+const bili = new BiliClient({
+  beforeRequest: async () => {
+    const reply = await browser.runtime.sendMessage({ type: 'BILI_REQUEST_GATE', runningJob: true }) as { ok?: boolean; code?: number; msg?: string } | undefined;
+    if (!reply?.ok) throw new BiliApiError(reply?.code ?? -412, 'request-gate', reply?.msg ?? '请求暂缓');
+  },
+  onRiskControl: async () => { await browser.runtime.sendMessage({ type: 'BILI_RISK_HIT' }); },
+});
 
 interface RunJobMsg {
   type?: 'OFFSCREEN_RUN_JOB';
@@ -90,7 +97,7 @@ async function handleRun(
             error: { code: 'BAD_JOB', msg: 'SEGMENT_ANALYZE 缺 segIndex（审查 P2-9：不得静默解读第 0 段写脏缓存）' },
           }
         : await runSegmentJob(
-            { db, bili: new BiliClient(), llm, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
+            { db, bili, llm, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
             { videoKey: job.videoKey, segIndex: job.segIndex },
             ctx,
           )
@@ -99,7 +106,7 @@ async function handleRun(
           ? await runAsrJob(
               {
                 db,
-                bili: new BiliClient(),
+                bili,
                 llm,
                 persona,
                 timeoutMs,
@@ -116,7 +123,7 @@ async function handleRun(
               error: { code: 'NEED_ASR_CONFIG', msg: 'ASR 未配置（配置未随任务下发）' },
             }
         : await runSummarizeJob(
-            { db, bili: new BiliClient(), llm, persona, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
+            { db, bili, llm, persona, timeoutMs, onDelta: (t) => ctx.pushDelta(t) },
             job,
             ctx,
             { force: job.type === 'REGENERATE' }, // 2.7a：重新生成绕过 done 缓存，成功整行覆盖
