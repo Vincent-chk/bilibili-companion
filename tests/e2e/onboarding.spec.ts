@@ -397,6 +397,120 @@ test('豆包默认贴边缩小，不拦截推荐，悬停和键盘聚焦时展�
   await expect(page.locator('#modal-root')).toHaveClass(/show/);
 });
 
+test('提示气泡紧贴豆包并在左右贴边、悬停和聚焦时对准人物', async () => {
+  test.setTimeout(45_000);
+  const worker = context.serviceWorkers().find(w => w.url().startsWith('chrome-extension://'));
+  if (!worker) throw new Error('扩展后台未启动');
+  for (const scenario of [
+    { label: 'left', width: 1280, x: 0, y: 0.8 },
+    { label: 'right', width: 1280, x: 1, y: 0.8 },
+    { label: 'narrow', width: 240, x: 1, y: 0.8 },
+    { label: 'top-left', width: 1280, x: 0, y: 0 },
+  ]) {
+    await worker.evaluate(async ({ x, y }) => chrome.storage.local.set({ mascotPos: { x, y } }), scenario);
+    const page = await context.newPage();
+    await page.setViewportSize({ width: scenario.width, height: 600 });
+    await page.goto(videoUrl, { waitUntil: 'domcontentloaded' });
+    const mascot = page.locator('#mascot');
+    const bubble = page.locator('#mascot-bubble');
+    const button = page.locator('#btn-start');
+    await expect(button).toBeVisible();
+    await page.mouse.move(Math.floor(scenario.width / 2), 10);
+    await page.waitForTimeout(350); // 等气泡入场动画结束后测量
+    const check = async (expectedWidth: number) => {
+      const result = await bubble.evaluate(el => {
+        const bubbleRect = el.getBoundingClientRect();
+        const mascotRect = el.parentElement!.querySelector('#mascot')!.getBoundingClientRect();
+        const style = getComputedStyle(el, '::after');
+        const arrowWidth = parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth);
+        const left = style.left === 'auto' ? bubbleRect.width - parseFloat(style.right) - arrowWidth : parseFloat(style.left);
+        const transform = style.transform === 'none' ? 0 : new DOMMatrixReadOnly(style.transform).m41;
+        return { bubble: { left: bubbleRect.left, right: bubbleRect.right, top: bubbleRect.top, bottom: bubbleRect.bottom }, mascot: { left: mascotRect.left, width: mascotRect.width, top: mascotRect.top }, arrowX: bubbleRect.left + left + arrowWidth / 2 + transform };
+      });
+      expect(result.mascot.width).toBeCloseTo(expectedWidth, 0);
+      expect(result.mascot.top - result.bubble.bottom).toBeCloseTo(10, 0);
+      expect(result.arrowX).toBeCloseTo(result.mascot.left + result.mascot.width / 2, 0);
+      expect(result.bubble.left).toBeGreaterThanOrEqual(0);
+      expect(result.bubble.right).toBeLessThanOrEqual(scenario.width);
+      expect(result.bubble.top).toBeGreaterThanOrEqual(0);
+    };
+    await check(48);
+    await page.screenshot({ path: test.info().outputPath(`${scenario.label}-collapsed.png`), animations: 'disabled' });
+    await mascot.hover();
+    await check(150);
+    await page.screenshot({ path: test.info().outputPath(`${scenario.label}-hover.png`), animations: 'disabled' });
+    const expandedButton = await button.boundingBox();
+    if (!expandedButton) throw new Error('展开时气泡按钮不可见');
+    await page.mouse.move(expandedButton.x + expandedButton.width / 2, expandedButton.y + expandedButton.height / 2, { steps: 20 });
+    expect(await button.evaluate(el => el.matches(':hover'))).toBe(true);
+    await page.waitForTimeout(350);
+    await check(150);
+    await page.mouse.move(Math.floor(scenario.width / 2), 10);
+    await mascot.focus();
+    await check(150);
+    await page.screenshot({ path: test.info().outputPath(`${scenario.label}-focus.png`), animations: 'disabled' });
+    await mascot.blur();
+    await page.mouse.move(Math.floor(scenario.width / 2), 10);
+    await expect.poll(async () => (await mascot.boundingBox())?.width).toBe(48);
+    await button.hover();
+    await page.waitForTimeout(350);
+    await check(48);
+    await page.mouse.move(Math.floor(scenario.width / 2), 10);
+    await mascot.hover();
+    const originalButton = await button.boundingBox();
+    if (!originalButton) throw new Error('展开时气泡按钮不可见');
+    const bx = originalButton.x + originalButton.width / 2;
+    const by = originalButton.y + originalButton.height / 2;
+    await page.mouse.move(bx, by, { steps: 20 });
+    expect(await button.evaluate(el => el.matches(':hover'))).toBe(true);
+    await page.mouse.click(bx, by);
+    await expect(page.locator('#modal-root')).toHaveClass(/show/);
+    await page.close();
+  }
+});
+
+test('结束陪看后的睡眠气泡贴近右侧缩小人物', async () => {
+  const worker = context.serviceWorkers().find(w => w.url().startsWith('chrome-extension://'));
+  if (!worker) throw new Error('扩展后台未启动');
+  await worker.evaluate(() => chrome.storage.local.set({ mascotPos: { x: 1, y: 0.8 } }));
+  const page = await context.newPage();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await activateForVideo(page);
+  await page.getByRole('button', { name: '豆包' }).click();
+  await page.locator('#btn-end').click();
+  const bubble = page.locator('#mascot-bubble');
+  await expect(bubble).toContainText('数据帮你留着哦', { timeout: 5000 });
+  await page.locator('#btn-close').click();
+  await page.mouse.move(600, 100);
+  await expect(page.locator('#mascot')).toHaveClass(/st-sleep/);
+  const mascot = await page.locator('#mascot').boundingBox();
+  const b = await bubble.boundingBox();
+  if (!mascot || !b) throw new Error('豆包或睡眠气泡不可见');
+  expect(mascot.width).toBe(48);
+  expect(mascot.y - (b.y + b.height)).toBeCloseTo(10, 0);
+  await page.screenshot({ path: test.info().outputPath('sleep-bubble.png'), animations: 'disabled' });
+});
+
+test('键盘从展开人物移到气泡按钮时布局稳定且可以激活', async () => {
+  const page = await context.newPage();
+  await page.goto(videoUrl, { waitUntil: 'domcontentloaded' });
+  const mascot = page.locator('#mascot');
+  const button = page.locator('#btn-start');
+  await expect(button).toBeVisible();
+  await page.mouse.move(600, 100);
+  await mascot.focus();
+  expect((await mascot.boundingBox())?.width).toBe(150);
+  await page.locator('#mascot-bubble').evaluate(el => Promise.allSettled(el.getAnimations().map(animation => animation.finished)));
+  const before = await button.boundingBox();
+  await page.keyboard.press('Shift+Tab');
+  await expect(button).toBeFocused();
+  expect((await mascot.boundingBox())?.width).toBe(150);
+  // 入场动画可能仍在结束，允许不足 2px 的亚像素变化；错误收起会移动约 102px。
+  expect(Math.abs((await button.boundingBox())!.y - before!.y)).toBeLessThan(2);
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#modal-root')).toHaveClass(/show/);
+});
+
 test('拖到右侧后保留位置，重新加载仍可展开且提示不出屏', async () => {
   const page = await context.newPage();
   await page.setViewportSize({ width: 1280, height: 800 });

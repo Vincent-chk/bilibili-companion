@@ -91,6 +91,25 @@ export class MascotController {
     // P1.9 准则#1：hover/按压即恢复全透明并重计闲时
     wrap.addEventListener('pointerenter', () => this.#wake());
     wrap.addEventListener('pointerdown', () => this.#wake());
+    // 从展开的人物移到上方气泡要经过小间隙；短暂保持展开，避免按钮在指针下方跳走。
+    // 直接移入收起态气泡时不展开人物。
+    let hoverTimer: unknown = null;
+    const cancelHoverTimer = () => {
+      if (hoverTimer !== null) this.#timers.clearTimeout(hoverTimer);
+      hoverTimer = null;
+    };
+    const deferCollapse = () => {
+      if (!wrap.classList.contains('hover-expanded')) return;
+      cancelHoverTimer();
+      hoverTimer = this.#timers.setTimeout(() => {
+        hoverTimer = null;
+        if (!mascot.matches(':hover') && !bubble.matches(':hover')) wrap.classList.remove('hover-expanded');
+      }, 300);
+    };
+    mascot.addEventListener('pointerenter', () => { cancelHoverTimer(); wrap.classList.add('hover-expanded'); });
+    mascot.addEventListener('pointerleave', deferCollapse);
+    bubble.addEventListener('pointerenter', () => { if (wrap.classList.contains('hover-expanded')) cancelHoverTimer(); });
+    bubble.addEventListener('pointerleave', deferCollapse);
     this.#armIdle();
   }
 
@@ -250,6 +269,7 @@ export class MascotController {
     this.#stopTimers();
     this.#el.bubble.classList.add('hidden');
     this.#el.bubble.innerHTML = '';
+    if (!this.#el.mascot.matches(':hover')) this.#el.wrap.classList.remove('hover-expanded');
   }
 
   #stopTimers(): void {
