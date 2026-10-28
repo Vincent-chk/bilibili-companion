@@ -38,6 +38,7 @@ export interface SummaryMessagesOptions {
   persona?: string;
   /** user 正文里内容的标签（单趟=紧凑字幕；Map-Reduce Reduce=各段要点）。 */
   bodyLabel?: string;
+  outlineCoverage?: { from: number; to: number };
 }
 
 /** 紧凑内容（[mm:ss]文本行）由调用方拼好传入，lib 层不碰 bilibili 数据源。 */
@@ -47,7 +48,9 @@ export function buildSummaryMessages(
   mo: SummaryMessagesOptions = {},
 ): LlmMessage[] {
   const label = mo.bodyLabel ?? '紧凑字幕（[mm:ss]文本）';
-  const user = `视频标题：${videoMeta.title}\n时长：${videoMeta.duration}秒\n字幕条数：${videoMeta.cueCount}\n\n${label}：\n${transcriptText}`;
+  const coverage = mo.outlineCoverage;
+  const coverageHint = coverage ? `\n这是长视频。字幕实际范围为 ${Math.floor(coverage.from)}–${Math.floor(coverage.to)} 秒。先通读全部内容，再将全片章节合并为 6–12 条大纲；必须同时覆盖前段、中段和最后四分之一的内容，不能只用开头细节凑满条数。每条仍须使用该内容的真实时间戳，禁止为满足覆盖范围而虚构时间。` : '';
+  const user = `视频标题：${videoMeta.title}\n时长：${videoMeta.duration}秒\n字幕条数：${videoMeta.cueCount}${coverageHint}\n\n${label}：\n${transcriptText}`;
   return [
     { role: 'system', content: summarySystemPrompt(mo.persona) },
     { role: 'user', content: user },
@@ -129,6 +132,8 @@ export interface SummarizeOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   onDelta?: (ev: StreamEvent) => void;
+  /** 长视频按实际字幕范围检查大纲，拒绝只覆盖开头的结果。 */
+  outlineCoverage?: { from: number; to: number };
 }
 
 export interface SummarizeOutcome {
@@ -165,6 +170,15 @@ export async function completeStructured(
     const r = await run(messages);
     const { value, error } = parseSummary(r.text);
     const errs = error ? [error] : validateSummary(value);
+    const range = opts.outlineCoverage;
+    if (value && range && Array.isArray(value.outline) && value.outline.length && value.outline.every(o => typeof o?.time === 'number' && Number.isFinite(o.time))) {
+      const times = value.outline.map(o => o.time);
+      const span = range.to - range.from;
+      if (times.some((time, i) => time < Math.floor(range.from) || time > Math.ceil(range.to) || (i > 0 && time <= times[i - 1]!))) errs.push('outline 时间戳须位于字幕范围内并严格递增');
+      if (span > 0 && (times[0]! > range.from + span * .25 || times.at(-1)! < range.from + span * .75 || !times.some(t => t >= range.from + span * .25 && t <= range.from + span * .75))) {
+        errs.push(`outline 覆盖不足：需依据真实字幕同时概括前段、中段和最后四分之一（${Math.floor(range.from + span * .75)}秒以后），请合并开头细节并补充后半段章节`);
+      }
+    }
     if (value && errs.length === 0) {
       return {
         degraded: false,
@@ -206,7 +220,7 @@ export async function summarize(
   opts: SummarizeOptions & SummaryMessagesOptions = {},
 ): Promise<SummarizeOutcome> {
   const { persona, bodyLabel, ...streamOpts } = opts;
-  return completeStructured(cfg, buildSummaryMessages(videoMeta, transcriptText, { persona, bodyLabel }), streamOpts);
+  return completeStructured(cfg, buildSummaryMessages(videoMeta, transcriptText, { persona, bodyLabel, outlineCoverage: opts.outlineCoverage }), streamOpts);
 }
 
 export interface StoredLlmConfig {

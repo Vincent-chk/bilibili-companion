@@ -9,6 +9,7 @@ import {
   chunkCues,
   compactCues,
   mapReduceSummarize,
+  runMap,
 } from '../src/lib/summarize/mapReduce';
 import type { StoredCue } from '../src/lib/storage';
 
@@ -145,4 +146,11 @@ describe('mapReduceSummarize 集成（mock SSE）', () => {
     expect(out.degraded).toBe(false);
     expect(peak).toBe(MAP_CONCURRENCY); // 5 块、上限 3：峰值恰为 3（既证明并行也证明封顶）
   });
+});
+
+
+it('分块返回空内容时显式失败，不把缺失块当成完整输入', async () => {
+  const server = await startMockLlm(() => ({ chunks: ['   '] }));
+  servers.push(server);
+  await expect(runMap({ baseUrl: server.url, model: 'mock', apiKey: 'test-only' }, 'T', [cue(0, '字幕')], {})).rejects.toThrow('字幕分块要点为空');
 });

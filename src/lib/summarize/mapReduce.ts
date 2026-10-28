@@ -65,15 +65,16 @@ export function chunkCues(
 const MAP_SYSTEM_PROMPT = `你是视频字幕片段分析器。把给出的字幕片段整理成要点清单，每条一行，格式 "[mm:ss] 要点（不超过30字）"。
 只输出清单本身（8-15 行），不要解释、不要 Markdown。时间戳必须来自所给字幕。`;
 
-async function runMap(cfg: LlmConfig, title: string, chunk: StoredCue[], opts: SummarizeOptions): Promise<string> {
+export async function runMap(cfg: LlmConfig, title: string, chunk: StoredCue[], opts: SummarizeOptions): Promise<string> {
   const r = await streamChatCompletion(
     cfg,
     [
       { role: 'system', content: MAP_SYSTEM_PROMPT },
-      { role: 'user', content: `视频标题：${title}\n\n字幕片段（[mm:ss]文本）：\n${compactCues(chunk)}` },
+      { role: 'user', content: `视频标题：${title}\n本片段时间范围 ${Math.floor(chunk[0]?.from ?? 0)}–${Math.ceil(chunk.at(-1)?.to ?? 0)}秒。请覆盖整段到结尾的关键内容，不要只整理开头。\n\n字幕片段（[mm:ss]文本）：\n${compactCues(chunk)}` },
     ],
-    { fetchImpl: opts.fetchImpl, timeoutMs: opts.timeoutMs },
+    { fetchImpl: opts.fetchImpl, timeoutMs: opts.timeoutMs, disableThinking: true },
   );
+  if (!r.text.trim()) throw new Error('字幕分块要点为空，请重试');
   return r.text;
 }
 
@@ -118,8 +119,9 @@ export async function mapReduceSummarize(
     cfg,
     buildSummaryMessages(videoMeta, notes.join('\n'), {
       persona: opts.persona,
+      outlineCoverage: opts.outlineCoverage,
       bodyLabel: '各段要点（[mm:ss]文本，已按时间合并）',
     }),
-    { fetchImpl: opts.fetchImpl, timeoutMs: remaining(), onDelta: opts.onDelta },
+    { fetchImpl: opts.fetchImpl, timeoutMs: remaining(), onDelta: opts.onDelta, outlineCoverage: opts.outlineCoverage },
   );
 }

@@ -109,6 +109,30 @@ const silentBili = (): BiliApi => ({
   },
 });
 
+it('超长分段完整读取尾部字幕，再合并解读，不截掉 6000 字以后的内容', async () => {
+  const db = freshDb();
+  await seedDoneSummary(db);
+  await db.videos.update(VIDEO_KEY, { duration: 3600 });
+  const longCues = Array.from({ length: 100 }, (_, i) => ({ from: 1800 + i * 18, to: 1818 + i * 18, text: i === 99 ? '片尾独有结论' : `第${i}句` + '内容'.repeat(50) }));
+  await db.transcripts.put({ key: VIDEO_KEY, source: 'ai_sub', lan: 'ai-zh', cues: longCues, charCount: longCues.reduce((n, c) => n + c.text.length + 1, 0), cachedAt: Date.now() });
+  await writeSegmentNote(db, SKEY, 2, { text: '旧的截断解读', status: 'done', truncated: true, createdAt: 1 });
+  const requests: { system: string; user: string }[] = [];
+  const fetchImpl: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    const system = body.messages[0].content as string;
+    const user = body.messages[1].content as string;
+    requests.push({ system, user });
+    const text = system.includes('字幕片段分析器') ? (user.includes('片尾独有结论') ? '[59:42] 片尾独有结论' : '[30:00] 前段要点') : '完整分段解读';
+    return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\ndata: [DONE]\n\n`, { status: 200 });
+  };
+  const result = await runSegmentJob({ db, bili: silentBili(), llm: { baseUrl: 'https://fixture.example/v1', model: 'mock-model', apiKey: 'test-only' }, fetchImpl }, { videoKey: VIDEO_KEY, segIndex: 2 });
+  expect(result.result).toBe('done');
+  expect(requests.some(r => r.user.includes('片尾独有结论'))).toBe(true);
+  expect(requests.at(-1)!.user).toContain('片尾独有结论');
+  expect((await db.summaries.get(SKEY))!.segmentNotes![2]!.truncated).not.toBe(true);
+  await db.delete();
+});
+
 describe('segmentRange（段定义：本条 time → 下条 time，末条以时长封底）', () => {
   it('中间段与末段', () => {
     expect(segmentRange(outline, 0, 200)).toEqual({ from: 0, to: 60 });
@@ -132,7 +156,7 @@ describe('sliceCues（与段区间有重叠即入，不拆行）', () => {
 });
 
 describe('buildSegmentMessages', () => {
-  it('全片大纲压缩 + <transcript> 边界 + 伪标签中和 + 截断标记', () => {
+  it('全片大纲压缩与 transcript 边界保留完整尾部，长段由执行体分块', () => {
     const big = Array.from({ length: 400 }, (_, i) => ({ from: i, to: i + 1, text: '字'.repeat(30) }));
     const { messages, truncated } = buildSegmentMessages({
       title: 'T',
@@ -141,7 +165,7 @@ describe('buildSegmentMessages', () => {
       range: { from: 60, to: 150 },
       cues: big,
     });
-    expect(truncated).toBe(true);
+    expect(truncated).toBe(false);
     const user = messages[1]!.content;
     expect(user).toContain('<transcript>');
     expect(user).toContain('[0|0s] 开场');
@@ -149,8 +173,8 @@ describe('buildSegmentMessages', () => {
     expect(messages[0]!.content).toContain('120–200 字');
     const inner = user.slice(user.indexOf('<transcript>'), user.lastIndexOf('</transcript>'));
     expect(inner).not.toContain('</transcript>');
-    // 截断后正文不超过预算
-    expect(inner.length).toBeLessThanOrEqual(SEGMENT_CUES_CHAR_LIMIT + 40);
+    expect(inner).toContain('[06:39]');
+    expect(inner.length).toBeGreaterThan(SEGMENT_CUES_CHAR_LIMIT);
   });
   it('未超预算不截断；system 无人设口吻指令（F15 信息质量护栏）', () => {
     const { truncated, messages } = buildSegmentMessages({ title: 'T', outline, segIndex: 0, range: { from: 0, to: 60 }, cues });

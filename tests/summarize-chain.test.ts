@@ -94,6 +94,45 @@ describe('parseVideoKey / mapLlmError', () => {
 });
 
 describe('runSummarizeJob 全链', () => {
+  it('21 分钟视频使用全部字幕，发现大纲只覆盖前段时重试并保留后半段要点', async () => {
+    const db = freshDb();
+    await db.videos.put({ key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: '21 分钟长视频', cover: 'c', owner: 'up', duration: 1272, page: 1, fetchedAt: Date.now() });
+    const longCues = Array.from({ length: 587 }, (_, i) => ({ from: i * 1270 / 587, to: (i + 1) * 1270 / 587, content: i === 586 ? '后半结论与片尾独有内容' : `内容${i}` }));
+    const base = JSON.parse(validSummaryJson());
+    const server = await startMockLlm((_call, n) => ({ chunks: [JSON.stringify({ ...base, outline: (n === 1 ? [0, 10, 11, 50, 70, 76, 150, 200, 408, 467] : [0, 250, 500, 750, 1000, 1200]).map(time => ({ time, text: `要点 ${time}` })) })] }));
+    servers.push(server);
+    const result = await runSummarizeJob({ db, bili: fakeBili({ cues: longCues }), llm: { baseUrl: server.url, model: 'm', apiKey: 'test-only' } }, { videoKey: VIDEO_KEY }, ctxLog().ctx);
+    expect(server.calls[0]!.body.messages![1]!.content).toContain('后半结论与片尾独有内容');
+    expect(server.calls).toHaveLength(2);
+    expect(result.result).toBe('done');
+    expect((await db.summaries.toArray())[0]!.outline.at(-1)!.time).toBe(1200);
+    await db.delete();
+  });
+
+  it('长视频 ASR 无分段时间戳时保留现有全文摘要能力，不强迫虚构时间', async () => {
+    const db = freshDb();
+    await db.videos.put({ key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: 'ASR 长视频', cover: 'c', owner: 'up', duration: 2400, page: 1, fetchedAt: Date.now() });
+    await db.transcripts.put({ key: VIDEO_KEY, source: 'asr', lan: 'zh', cues: [{ from: 0, to: 2400, text: 'ASR 完整全文' }], charCount: 10, cachedAt: Date.now() });
+    const base = JSON.parse(validSummaryJson());
+    const server = await startMockLlm(() => ({ chunks: [JSON.stringify({ ...base, outline: base.outline.map((o: {text: string}) => ({ ...o, time: 0 })) })] }));
+    servers.push(server);
+    const result = await runSummarizeJob({ db, bili: fakeBili({}), llm: { baseUrl: server.url, model: 'm', apiKey: 'test-only' } }, { videoKey: VIDEO_KEY }, ctxLog().ctx);
+    expect(result.result).toBe('done');
+    expect(server.calls).toHaveLength(1);
+    await db.delete();
+  });
+
+  it('长视频两次都只给前段大纲时明确失败，不把不完整大纲保存成成功', async () => {
+    const db = freshDb();
+    await db.videos.put({ key: VIDEO_KEY, bvid: 'BV1XynB6EEiM', aid: 1, cid: 123456, title: '长视频', cover: 'c', owner: 'up', duration: 2400, page: 1, fetchedAt: Date.now() });
+    const base = JSON.parse(validSummaryJson());
+    const server = await startMockLlm(() => ({ chunks: [JSON.stringify(base)] }));
+    servers.push(server);
+    const result = await runSummarizeJob({ db, bili: fakeBili({ cues: [{ from: 0, to: 30, content: '开始内容' }, { from: 2350, to: 2390, content: '后半结论' }] }), llm: { baseUrl: server.url, model: 'm', apiKey: 'test-only' } }, { videoKey: VIDEO_KEY }, ctxLog().ctx);
+    expect(result.result).toBe('failed');
+    expect((await db.summaries.toArray())[0]!.status).toBe('failed');
+    await db.delete();
+  });
   it('字幕链路：选轨→字幕归一落库→单趟 LLM→summaries done；进度 stage 有序', async () => {
     const db = freshDb();
     await db.videos.put({
@@ -221,9 +260,9 @@ describe('runSummarizeJob 全链', () => {
     });
     const server = await startMockLlm((call) => {
       if (call.body.messages?.[0]?.content.includes('字幕片段分析器')) {
-        return { chunks: ['[00:00] 要点甲\n[30:00] 要点乙\n[60:00] 要点丙'] };
+        return { chunks: ['[00:00] 要点甲\n[30:00] 要点乙\n[60:00] 要点丙\n[90:00] 要点丁\n[105:00] 结尾要点'] };
       }
-      return { chunks: [validSummaryJson()] };
+      return { chunks: [JSON.stringify({ ...JSON.parse(validSummaryJson()), outline: [0, 900, 1800, 2700, 3600, 4500, 5400, 6300].map(time => ({ time, text: '章节要点' })) })] };
     });
     servers.push(server);
     const longCues = Array.from({ length: 40 }, (_, i) => ({ from: i * 180, to: i * 180 + 179, content: `第${i}段：` + '超长解说内容'.repeat(60) }));

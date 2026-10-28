@@ -721,7 +721,7 @@ export class PanelController {
           </div></div>`
         : '';
     const trHtml = transcript
-      ? `<details class="d-sec d-transcript"><summary>📄 转写节选（共 ${transcript.total} 条${transcript.total > transcript.cues.length ? `，前 ${transcript.cues.length} 条` : ''}）</summary>${transcript.cues
+      ? `<details class="d-sec d-transcript"><summary>📄 转写节选（共 ${transcript.total} 条${transcript.total > transcript.cues.length ? `，前 ${transcript.cues.length} 条` : ''}）</summary>${transcript.total > transcript.cues.length ? '<p>此处仅展示前 200 条，摘要和分段解读使用完整转写。</p>' : ''}${transcript.cues
           .map((c) => `<div class="tr-line" data-sec="${Math.max(0, Math.floor(c.from))}"><span class="tt">[${fmtSec(c.from)}]</span><span>${esc(c.text)}</span></div>`)
           .join('')}</details>`
       : '';
@@ -871,8 +871,8 @@ export class PanelController {
     const st = this.#segNotes.get(i);
     // 审查 P2-6：残留 streaming（终态广播被 SW 死亡/断连吞掉）重展开也重发 OPEN 自愈
     // （OPEN 幂等：健康流式中仅多一条消息、不覆盖已累计文本；残留态触发重建）
-    if (!st || st.status === 'streaming') {
-      if (!st) this.#segNotes.set(i, { status: 'streaming', text: '' });
+    if (!st || st.status === 'streaming' || st.truncated) {
+      if (!st || st.truncated) this.#segNotes.set(i, { status: 'streaming', text: '' });
       this.#paintSegNote(i);
       await this.#requestSegNote(i, 0);
     } else {

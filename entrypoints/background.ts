@@ -1088,13 +1088,13 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
   }
   const cached = summary.segmentNotes?.[segIndex];
   const active = await activeSegmentJob(videoKey, segIndex);
-  if (cached?.status === 'done' && !active) {
+  if (cached?.status === 'done' && !cached.truncated && !active) {
     console.log(`[doubao] segment note cache hit: ${videoKey}#${segIndex}`);
     return { ok: true, note: cached, cacheHit: true };
   }
   if (!active) {
     const allow =
-      (cached === undefined ||
+      (cached === undefined || cached.truncated === true ||
         cached.status === 'streaming' || // 残留 streaming（SW 死亡）→ 点击重建
         (cached.status === 'failed' && retry === 1)) && // 用户显式重试
       !(await isPaused()); // P2.5：暂停期间分段解读只读缓存，不发 LLM 请求

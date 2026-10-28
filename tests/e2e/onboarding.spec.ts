@@ -26,6 +26,9 @@ let releaseModel: (() => void) | null;
 let biliRequestTimes: number[];
 let riskOnNextPlayer: boolean;
 let riskReturnedAt: number;
+let longFixture: { duration: number; count: number; dense: boolean } | null;
+let longSummaryAttempts: number;
+const tailMarker = "结尾独有事实：最终方案采用海水储能";
 let segmentStarts: number;
 let segmentGate: Promise<void> | null;
 let releaseSegment: (() => void) | null;
@@ -89,11 +92,12 @@ function fixtureResponse(address: string, method: string, requestBody: string, a
     }
     let data: unknown;
     if (url.pathname === '/x/web-interface/nav') data = { isLogin: true, wbi_img: { img_url: 'https://i.test/abcdefghijklmnopqrstuvwxyz123456.png', sub_url: 'https://i.test/0123456789abcdefghijklmnopqrstuv.png' } };
-    else if (url.pathname === '/x/web-interface/view') data = { aid: 1, title: '测试视频', duration: 20, owner: { name: '测试作者' }, pages: [{ cid: 100, page: 1, part: '测试', duration: 20 }] };
+    else if (url.pathname === '/x/web-interface/view') data = { aid: 1, title: '测试视频', duration: longFixture?.duration ?? 20, owner: { name: '测试作者' }, pages: [{ cid: 100, page: 1, part: '测试', duration: longFixture?.duration ?? 20 }] };
     else if (url.pathname === '/x/player/wbi/v2') data = { subtitle: { subtitles: [{ lan: 'ai-zh', subtitle_url: 'https://i0.hdslb.com/fixture.json' }] } };
     else return { status: 404, contentType: 'text/plain', body: 'unknown fixture' };
     return { status: 200, contentType: 'application/json', body: JSON.stringify({ code: 0, data }) };
   }
+  if (url.href === 'https://i0.hdslb.com/fixture.json' && longFixture) return { status: 200, contentType: 'application/json', body: JSON.stringify({ body: Array.from({ length: longFixture.count }, (_, i) => ({ from: i * (longFixture!.duration - 2) / longFixture!.count, to: (i + 1) * (longFixture!.duration - 2) / longFixture!.count, content: i === longFixture!.count - 1 ? tailMarker : `字幕第${i}句，` + '本段讨论能源方案与实验结果。'.repeat(longFixture!.dense ? 8 : 1) })) }) };
   if (url.href === 'https://i0.hdslb.com/fixture.json') return { status: 200, contentType: 'application/json', body: JSON.stringify({ body: Array.from({ length: 8 }, (_, i) => ({ from: i * 2, to: i * 2 + 1, content: `模拟字幕第 ${i + 1} 句` })) }) };
   if (url.href === 'https://api.github.com/repos/Vincent-chk/bilibili-companion/releases/latest') return { status: 200, contentType: 'application/json', body: JSON.stringify({ tag_name: 'v1.1.0' }) };
   if (url.href === 'https://model.example/v1/chat/completions') {
@@ -107,6 +111,20 @@ function fixtureResponse(address: string, method: string, requestBody: string, a
       }
       if (modelTruncatedJson) {
         const content = '{"summary":"这是模型生成的摘要","outline":[{"time":9,"text":"要点"},';
+        return { status: 200, contentType: 'text/event-stream', body: `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n` };
+      }
+      if (longFixture) {
+        const prompt = JSON.stringify(input.messages);
+        let content: string;
+        if (prompt.includes('视频字幕片段分析器')) {
+          const lines = input.messages[1].content.split('\n').filter((line: string) => /^\[\d+:\d+\]/.test(line));
+          content = [lines[0], lines[Math.floor(lines.length / 2)], lines.at(-1)].join('\n');
+        } else if (prompt.includes('分段解读')) content = prompt.includes(tailMarker) ? tailMarker + '。结尾内容已参与本段分析。' : '本段讨论能源方案与实验结果。';
+        else {
+          longSummaryAttempts++;
+          const times = longSummaryAttempts === 1 ? [0, 10, 50, 76, 150, 467] : [0, .2, .4, .6, .8, .9].map(n => Math.floor(n * longFixture!.duration));
+          content = JSON.stringify({ summary: summary + (prompt.includes(tailMarker) ? tailMarker : ''), outline: times.map((time, i) => ({ time, text: `全片章节 ${i + 1}` })), evaluation, rating: 4 });
+        }
         return { status: 200, contentType: 'text/event-stream', body: `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n` };
       }
       const content = JSON.stringify(input.messages).includes('分段解读')
@@ -154,6 +172,8 @@ test.beforeEach(async ({}, testInfo) => {
   biliRequestTimes = [];
   riskOnNextPlayer = testInfo.title.includes('全局风控');
   riskReturnedAt = 0;
+  longFixture = testInfo.title.includes('模拟长视频') ? (testInfo.title.includes('41分钟') ? { duration: 2466, count: 1200, dense: true } : { duration: 1272, count: 587, dense: false }) : null;
+  longSummaryAttempts = 0;
   segmentStarts = 0;
   releaseSegment = null;
   segmentGate = testInfo.title.includes('结束后停止排队预取') ? new Promise<void>(resolve => { releaseSegment = resolve; }) : null;
@@ -1792,4 +1812,28 @@ test('扩展后台休眠重启时保留正在陪看的状态', async () => {
   await expect.poll(async () => (await restoredWorker.evaluate(() => chrome.storage.local.get('sessionPointer'))).sessionPointer).toMatchObject({
     sessionId: 'worker-restart-fixture', state: 'ACTIVE',
   });
+});
+
+
+for (const minutes of [21, 41]) test(`模拟长视频${minutes}分钟：完整字幕、大纲补全和末段解读`, async () => {
+  test.setTimeout(90_000);
+  const page = await context.newPage();
+  await activateForVideo(page);
+  await page.locator('video').evaluate((v: HTMLVideoElement) => v.play());
+  await page.getByRole('button', { name: '豆包' }).click();
+  await expect(page.locator('.v-item .badge')).toHaveText('✓ 已总结', { timeout: 45_000 });
+  await page.locator('.v-item').click();
+  await expect(page.locator('#d-summary')).toContainText(tailMarker);
+  await expect(page.locator('.d-outline li')).toHaveCount(6);
+  expect(longSummaryAttempts).toBe(2); // 首次仅覆盖前 7:47，必须纠正后才能完成
+  const lastTime = Math.floor(longFixture!.duration * .9);
+  await expect(page.locator('.d-outline li').last()).toContainText(`${String(Math.floor(lastTime / 60)).padStart(2, '0')}:${String(lastTime % 60).padStart(2, '0')}`);
+  await expect(page.locator('.d-transcript summary')).toContainText(`共 ${longFixture!.count} 条`);
+  await expect(page.locator('.d-transcript summary')).toContainText('前 200 条');
+  await page.locator('.seg-btn').last().click();
+  await expect(page.locator('.seg-note').last()).toContainText(tailMarker, { timeout: 45_000 });
+  await expect(page.locator('.seg-note').last()).not.toContainText('已截断');
+  expect(modelRequests.some(r => r.body.includes(tailMarker))).toBe(true);
+  if (minutes === 41) expect(modelRequests.filter(r => r.body.includes('视频字幕片段分析器')).length).toBeGreaterThan(2);
+  await page.screenshot({ animations: 'disabled', path: test.info().outputPath(`long-${minutes}-tail.png`) });
 });

@@ -229,6 +229,7 @@ export async function runLlmAndPersist(
   const llmOpts = {
     fetchImpl: deps.fetchImpl,
     persona,
+    ...(video.duration >= 1200 && transcript.cues.length && !(transcript.source === 'asr' && transcript.cues.length === 1) ? { outlineCoverage: transcript.cues.reduce((r, c) => ({ from: Math.min(r.from, c.from), to: Math.max(r.to, c.to) }), { from: transcript.cues[0]!.from, to: transcript.cues[0]!.to }) } : {}),
     ...(deps.timeoutMs ? { timeoutMs: deps.timeoutMs } : {}),
     ...(deps.onDelta
       ? { onDelta: (ev: StreamEvent) => { if (ev.type === 'delta') deps.onDelta?.(ev.text); } }
