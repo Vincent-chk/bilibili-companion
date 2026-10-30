@@ -59,7 +59,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 export const validSummaryJson = () =>
   JSON.stringify({
     summary: '这是一段用于测试的客观视频摘要。'.repeat(10), // 160 字
-    outline: Array.from({ length: 8 }, (_, i) => ({ time: i * 60, text: `第${i + 1}段要点：内容概述` })),
+    outline: Array.from({ length: 8 }, (_, i) => ({ time: i === 7 ? 480 : i * 60, text: `第${i + 1}段要点：内容概述` })),
     evaluation: '本豆锐评：节奏尚可但有点水，豆沙含量一般。'.repeat(2), // 42 字
     rating: 4,
   });

@@ -36,7 +36,7 @@ export default defineContentScript({
     let uiSessionState: string | null = null;
     let watchPaused = true;
     const syncCollection = (restart = false): void => {
-      const enabled = uiSessionState === 'ACTIVE' && !watchPaused;
+      const enabled = !extensionInvalidated && uiSessionState === 'ACTIVE' && !watchPaused;
       if (enabled === collectionEnabled && !restart) return;
       collectionEnabled = enabled;
       report(enabled ? detectBvid(location.href) : null);
@@ -81,6 +81,10 @@ export default defineContentScript({
     };
 
     const bridge = new Bridge((e: UiEvent) => {
+      if (e.type === 'EXTENSION_RELOAD_REQUIRED') {
+        stopInvalidatedWatcher();
+        return;
+      }
       // P1.8：跨标签页 SEEK_TO 广播——只给「目标视频页」消费（判定纯函数见 seek.shouldConsumeSeek：
       // currentVideoKey 精确匹配优先；为 null 时退 URL bvid+分P 匹配，审查 P1-1 后兜底也带分P）。
       if (e.type === 'SEEK_TO' && shouldConsumeSeek(e, currentVideoKey, location.href)) {
@@ -209,12 +213,13 @@ export default defineContentScript({
             bridge.request<{ ok: boolean; msg: string }>({ type: 'TEST_CONNECTION', kind, llm: cfg }),
           save: (payload) => bridge.request<{ ok: boolean; error?: string }>({ type: 'SETTINGS_SAVE', ...payload }),
           onDismiss: () => toast(ui, '可稍后在设置中配置 ASR'),
-          onSaved: () => toast(ui, 'ASR 已配置，回到卡片点【调用 ASR 解析】', 3200),
+          onSaved: () => toast(ui, 'ASR 已配置，请留意所选服务的支持范围', 3200),
           asrOnly: true,
         });
       },
       // P2.5/2.7b：当前视频（人设切换联动询问对象）+ 隐藏豆包开关（内存态）
       getCurrentVideoKey: () => currentVideoKey,
+      getCurrentVideoUrl: () => location.href,
       mascotHidden: () => mascotHidden,
       onMascotHiddenChange: (h) => {
         if (h && (uiSessionState ?? 'INACTIVE') === 'INACTIVE') {
@@ -234,6 +239,7 @@ export default defineContentScript({
     setupThemeSync(document, ui.host);
     // P1.9 准则#5：VIDEO_ENTER 解析出当前视频后通知面板跟随（startWatcher 在模块层回调）
     onVideoKeyResolved = (videoKey) => panel?.followVideo(videoKey);
+    onExtensionInvalidated = () => toast(ui, '扩展已重新加载，请刷新当前页面后继续使用', 10000);
 
     bridge.connect(); // 连接后 SW 回放 SESSION_STATE → 豆包按当前会话态初始化表情/气泡
     document.addEventListener('visibilitychange', () => {
@@ -266,6 +272,7 @@ export default defineContentScript({
       const key = routeKey(href);
       if (key === lastKey) return;
       lastKey = key;
+      panel?.routeChanged(href);
       report(detectBvid(href));
     };
     window.addEventListener('popstate', () => onRoute());
@@ -302,6 +309,25 @@ let watchGen = 0;
 let currentVideoKey: string | null = null;
 /** P1.9 准则#5：main() 注入——VIDEO_ENTER 解析成功后通知面板上下文跟随。 */
 let onVideoKeyResolved: ((videoKey: string) => void) | null = null;
+let onExtensionInvalidated: (() => void) | null = null;
+let extensionInvalidated = false;
+
+/** 旧页面无法再通信；先失效代数再解绑，避免 dispose 的最后一次 tick 再次调用失效 API。 */
+function stopInvalidatedWatcher(): void {
+  if (extensionInvalidated) return;
+  extensionInvalidated = true;
+  ++watchGen;
+  collectionEnabled = false;
+  currentVideoKey = null;
+  const previous = watchSession;
+  watchSession = null;
+  previous?.dispose();
+  onExtensionInvalidated?.();
+}
+
+function invalidContext(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('Extension context invalidated');
+}
 
 async function startWatcher(bvid: string | null): Promise<void> {
   const gen = ++watchGen;
@@ -330,32 +356,44 @@ async function startWatcher(bvid: string | null): Promise<void> {
       durationSec: duration,
       thresholdSec: triggerSeconds,
       onTick: (p) => {
-        void browser.runtime
-          .sendMessage({ type: 'WATCH_TICK', ...p })
-          .then((r) => {
-            if (gen !== watchGen) return; // 旧监听器的迟到应答不能销毁恢复后的新实例
-            // 审查 P2-2：SW 拒收（暂停）→ dispose 本地计时，暂停窗口时长不追溯补记
-            if ((r as { ok?: boolean; reason?: string } | undefined)?.reason === 'paused') watchSession?.dispose();
-            if ((r as { summaryTriggered?: boolean } | undefined)?.summaryTriggered && mascot?.session === 'ACTIVE') {
-              mascot.setState('note');
-              void mascot.say('开始偷偷记笔记啦～', 4200, 'note');
-            }
-          })
-          .catch(() => {});
+        if (gen !== watchGen) return;
+        try {
+          void browser.runtime
+            .sendMessage({ type: 'WATCH_TICK', ...p })
+            .then((r) => {
+              if (gen !== watchGen) return; // 旧监听器的迟到应答不能销毁恢复后的新实例
+              // 审查 P2-2：SW 拒收（暂停）→ dispose 本地计时，暂停窗口时长不追溯补记
+              if ((r as { ok?: boolean; reason?: string } | undefined)?.reason === 'paused') watchSession?.dispose();
+              if ((r as { summaryTriggered?: boolean } | undefined)?.summaryTriggered && mascot?.session === 'ACTIVE') {
+                mascot.setState('note');
+                void mascot.say('开始偷偷记笔记啦～', 4200, 'note');
+              }
+            })
+            .catch((error: unknown) => { if (gen === watchGen && invalidContext(error)) stopInvalidatedWatcher(); });
+        } catch (error) {
+          if (!invalidContext(error)) throw error;
+          stopInvalidatedWatcher();
+        }
       },
       onTrigger: (p) => {
-        // 首次真实触发（去重后）→ 豆包 note 态 + 气泡（F2）；deduped=幂等重放不打扰
-        void browser.runtime
-          .sendMessage({ type: 'TRIGGER_SUMMARY', ...p })
-          .then((r2) => {
-            if (gen !== watchGen) return;
-            const res = r2 as { ok?: boolean; deduped?: boolean } | undefined;
-            if (res?.ok && !res.deduped && mascot?.session === 'ACTIVE') {
-              mascot.setState('note');
-              void mascot.say('开始偷偷记笔记啦～', 4200, 'note'); // kind=note：准则#4 限频
-            }
-          })
-          .catch(() => {});
+        if (gen !== watchGen) return;
+        try {
+          // 首次真实触发（去重后）→ 豆包 note 态 + 气泡（F2）；deduped=幂等重放不打扰
+          void browser.runtime
+            .sendMessage({ type: 'TRIGGER_SUMMARY', ...p })
+            .then((r2) => {
+              if (gen !== watchGen) return;
+              const res = r2 as { ok?: boolean; deduped?: boolean } | undefined;
+              if (res?.ok && !res.deduped && mascot?.session === 'ACTIVE') {
+                mascot.setState('note');
+                void mascot.say('开始偷偷记笔记啦～', 4200, 'note'); // kind=note：准则#4 限频
+              }
+            })
+            .catch((error: unknown) => { if (gen === watchGen && invalidContext(error)) stopInvalidatedWatcher(); });
+        } catch (error) {
+          if (!invalidContext(error)) throw error;
+          stopInvalidatedWatcher();
+        }
       },
     });
   } catch {

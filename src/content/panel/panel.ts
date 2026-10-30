@@ -7,14 +7,16 @@
 import { browser } from 'wxt/browser';
 import type { Bridge, UiEvent } from '../bridge';
 import { LOGIN_CARD_TEXT, shouldShowLoginCard } from '../login';
+import { tabMatchesVideo } from '../seek';
 import { estimateAudioBytes } from '../../lib/asr';
 import { esc, toast, type DoubaoUi } from '../ui/root';
 import {
   BADGE_HTML,
+  asrConsentText,
+  asrProgressView,
   SOURCE_LABEL,
   STAGE_LABEL,
   clockOf,
-  excerptOf,
   extractStreamingSummary,
   fmtCountdown,
   fmtSec,
@@ -67,6 +69,7 @@ export interface PanelDeps {
   onNeedAsrConfig: () => void;
   /** P2.5/2.7b：本页当前视频（人设切换联动询问的对象）；隐藏豆包开关（content 内存态）。 */
   getCurrentVideoKey?: () => string | null;
+  getCurrentVideoUrl?: () => string;
   mascotHidden?: () => boolean;
   onMascotHiddenChange?: (hidden: boolean) => void;
   /** 测试可注入的定时器。 */
@@ -77,18 +80,24 @@ export class PanelController {
   #open = false;
   #view: 'list' | 'detail' | 'settings' = 'list';
   #detailKey: string | null = null;
+  #transcriptPage = 0;
+  #transcriptExpanded = false;
+  #transcriptVideoKey: string | null = null;
+  #detailRequest = 0;
+  #detailVideo: {bvid:string;page:number} | null = null;
+  #currentUrl: string | undefined;
+  #detailFollowsCurrent = false;
+  #routeRevision = 0;
   #items: ListItemVM[] = [];
   #triggerSeconds = 10;
   #sessionState = 'INACTIVE';
   /** P2.5：暂停陪看（状态行提示）。 */
   #paused = false;
   /** 当前详情的流式累计（LLM 原始 JSON token 流）。 */
-  #stream: { videoKey: string; acc: string; stage?: string } | null = null;
+  #stream: { videoKey: string; acc: string; stage?: string; hideDraft?: boolean } | null = null;
   #refreshTimer: unknown = null;
   #updateRevision = -1;
   #refreshRevision = 0;
-  /** 路由代数：followVideo 递增，作废在途 #openDetail 应答（审查 P2-5）。 */
-  #routeGen = 0;
   /** P1.10 登录态（null=未知）：引导卡显隐依据。 */
   #loggedIn: boolean | null = null;
   /** P1.11 F13：分段解读注记视图状态（segIndex → 流式/成品/失败）与展开集合。 */
@@ -104,6 +113,7 @@ export class PanelController {
   readonly #setTimeout: (cb: () => void, ms?: number) => unknown;
 
   constructor(private readonly deps: PanelDeps) {
+    this.#currentUrl = deps.getCurrentVideoUrl?.();
     this.#setTimeout =
       deps.setTimeout ?? ((cb: () => void, ms?: number) => {
         setTimeout(cb, ms);
@@ -198,18 +208,43 @@ export class PanelController {
   }
 
   /**
-   * P1.9 准则#5 上下文自动跟随：SPA 切视频后若面板开着，刷新为当前视频卡片。
-   * 详情态且目标变化 → 回列表刷新（新视频置顶）；不自动开详情/不触发生成（零副作用跟随）。
+   * 当前视频解析完成后刷新列表；路由跟随由 routeChanged 同步处理，避免迟到应答打断历史详情。
    */
   followVideo(videoKey: string): void {
     if (!this.#open || !videoKey) return;
-    this.#routeGen += 1; // 作废在途 #openDetail 应答（审查 P2-5 竞态）
-    if (this.#view === 'detail' && this.#detailKey !== videoKey) {
+    void this.refresh();
+  }
+
+  /** 即使陪看暂停，页面变化也需更新详情所属视频的提示。 */
+  routeChanged(url: string): void {
+    const previous = this.#currentUrl;
+    const bvid = previous?.match(/\/video\/(BV[0-9A-Za-z]{10})/)?.[1];
+    let sameVideo = false;
+    if (previous && bvid) {
+      try {
+        const page = Number(new URL(previous).searchParams.get('p')) || 1;
+        sameVideo = tabMatchesVideo(url, bvid, page);
+      } catch { /* 异常 URL 不作为同一视频处理 */ }
+    }
+    if (!sameVideo && previous !== url) this.#routeRevision++;
+    this.#currentUrl = url;
+    if (this.#view === 'detail' && this.#detailFollowsCurrent && this.#detailVideo &&
+        !tabMatchesVideo(url, this.#detailVideo.bvid, this.#detailVideo.page)) {
       this.#view = 'list';
       this.#detailKey = null;
       this.#stream = null;
+      this.#detailFollowsCurrent = false;
+      if (this.#open) void this.refresh();
     }
-    void this.refresh();
+    this.#updateVideoContext();
+  }
+
+  #updateVideoContext(): void {
+    const badge = this.deps.ui.root.getElementById('d-video-context');
+    if (!badge || !this.#detailVideo) return;
+    const href = this.#currentUrl ?? this.deps.getCurrentVideoUrl?.();
+    badge.textContent = tabMatchesVideo(href, this.#detailVideo.bvid, this.#detailVideo.page)
+      ? '当前播放的视频' : '这不是当前播放的视频，以下是所选视频的内容';
   }
 
   /** LIST_QUERY → 渲染当前视图。 */
@@ -339,8 +374,7 @@ export class PanelController {
     acts?.classList.toggle('hidden', false);
     this.#stopCountdown();
     if (this.#sessionState === 'ACTIVE') {
-      // F1-③：激活期状态行的保留期「占位」——倒计时本体在 GRACE 态（结束后起算），此处预告规则
-      el.innerHTML = '<span class="dot-live"></span> 陪看中 · 仅记录激活期间的视频 · 结束后保留 1 小时';
+      el.innerHTML = this.#paused ? '' : '<span class="dot-live"></span> 陪看中';
       this.#renderActions(acts, '<button class="btn btn-ghost" id="btn-end" style="flex:1">⏻ 结束陪看</button>', () =>
         this.deps.onSessionEnd(),
       );
@@ -360,14 +394,14 @@ export class PanelController {
       el.innerHTML = '<span class="countdown-pill">⏸ 陪看数据已超保留期 · 待确认清除</span>';
       this.#renderActions(acts, '', () => undefined);
     } else {
-      el.textContent = '未激活 · 点豆包「开始陪看」';
+      el.textContent = '未激活';
       this.#renderActions(acts, '<button class="btn btn-primary" id="btn-start2" style="flex:1">▶ 开始陪看</button>', () =>
         this.deps.onSessionStart(),
       );
     }
     // P2.5：「暂停陪看」状态行提示（任何会话态都可叠加；解除后消失）
     if (this.#paused) {
-      el.innerHTML = `${el.innerHTML}<span class="countdown-pill" style="margin-left:6px">⏸ 已暂停 · 停止记录及新任务（设置中可恢复）</span>`;
+      el.innerHTML = `${el.innerHTML}<span class="countdown-pill">⏸ 已暂停 · 在设置中恢复</span>`;
     }
   }
 
@@ -473,15 +507,15 @@ export class PanelController {
     const box = this.deps.ui.root.getElementById('view-list');
     if (!box) return;
     // P2.5：手动清除入口已迁设置页危险操作（P2.2 过渡位 🗑 移除，验收记录 §2 N-2 收口）
-    const head = `<div class="list-head"><b>本次陪看 · ${this.#items.length} 个视频</b><span>点击条目查看摘要</span></div>`;
+    const head = `<div class="list-head"><b>本次陪看 · ${this.#items.length} 个视频</b></div>`;
     const body =
       this.#items.length === 0
-        ? `<div class="d-sec" style="text-align:center;padding:36px 16px;color:#9499a0;font-size:13px"><img class="empty-mascot" src="${browser.runtime.getURL('/mascot/mascot-idle.png')}" alt=""><br>还没有陪看记录<br>点击豆包「开始陪看」，<br>播放超过 ${this.#triggerSeconds} 秒我就会记笔记</div>`
+        ? `<div class="d-sec empty-state"><img class="empty-mascot" src="${browser.runtime.getURL('/mascot/mascot-idle.png')}" alt=""><b>还没有陪看记录</b><p>累计播放 ${this.#triggerSeconds} 秒后自动生成摘要</p></div>`
         : this.#items
         .map((it) => {
           const badge = BADGE_HTML[it.badge];
           const spinner = it.badge === 'generating' ? '<span class="spinner"></span>' : '';
-          const srcLabel = it.source ? `来源：${SOURCE_LABEL[it.source]}` : '&nbsp;';
+          const srcLabel = it.source ? `<span>${SOURCE_LABEL[it.source]}</span>` : '';
           return `<div class="v-item" data-video-key="${esc(it.videoKey)}">
             <div class="v-item-top">
               <div class="v-cover"><img src="${esc(it.cover)}" referrerpolicy="no-referrer" alt=""><span class="dur">${fmtSec(it.durationSec)}</span></div>
@@ -491,8 +525,8 @@ export class PanelController {
                 <div class="v-prog-row"><div class="v-prog"><i style="width:${it.progressPct}%"></i></div><span class="v-pct">${it.progressPct >= 100 ? '看完' : `${it.progressPct}%`}</span></div>
               </div>
             </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:9px">
-              <span style="font-size:11px;color:#9499a0">${srcLabel}</span>
+            <div class="v-item-meta">
+              ${srcLabel}
               <span class="badge badge-${it.badge}">${spinner}${badge}</span>
             </div>
           </div>`;
@@ -529,26 +563,35 @@ export class PanelController {
 
   // ---- 详情 ----
 
-  async #openDetail(videoKey: string, opts: { userClick?: boolean } = {}): Promise<void> {
-    const gen = this.#routeGen;
+  async #openDetail(videoKey: string, opts: { userClick?: boolean; transcriptPage?: number } = {}): Promise<void> {
+    const requestUrl = this.#currentUrl ?? this.deps.getCurrentVideoUrl?.();
+    const routeRevision = this.#routeRevision;
+    if(this.#transcriptVideoKey!==videoKey){this.#transcriptVideoKey=videoKey;this.#transcriptPage=0;this.#transcriptExpanded=false;}
+    if(opts.transcriptPage!==undefined){this.#transcriptPage=opts.transcriptPage;this.#transcriptExpanded=true;}
+    const request=++this.#detailRequest;
     try {
       const r = await this.deps.bridge.request<SummaryOpenResponse>({
         type: 'SUMMARY_OPEN',
         videoKey,
+        transcriptPage:this.#transcriptPage,
         ...(opts.userClick ? { retry: 1 } : {}),
       });
-      // 在途应答落地前路由已切（followVideo 递增代数）→ 作废，避免视图被旧视频详情抢回（审查 P2-5）
-      if (gen !== this.#routeGen) return;
+      if (request!==this.#detailRequest) return;
       if (!r?.ok || !r.item) {
         toast(this.deps.ui, '打开摘要失败，稍后再试');
         return;
       }
+      const bvid = r.item.video?.bvid ?? videoKey.split(':')[0]!;
+      const page = r.item.video?.page ?? 1;
+      const wasCurrent = tabMatchesVideo(requestUrl, bvid, page);
+      if (wasCurrent && routeRevision !== this.#routeRevision) return;
+      if (opts.userClick || this.#detailKey !== videoKey) this.#detailFollowsCurrent = wasCurrent;
       this.#view = 'detail';
       // P2.5：详情与列表共用 #view-list 容器——从设置视图（人设联动重生成）进入时须切回
       this.deps.ui.root.getElementById('view-settings')?.classList.add('hidden');
       this.deps.ui.root.getElementById('view-list')?.classList.remove('hidden');
       // 任务在跑 → 进入流式模式（重置累计）；否则直接渲染成品
-      this.#stream = isJobActive(r.item.job) && r.item.job?.status !== 'need_confirm' ? { videoKey, acc: '' } : null;
+      this.#stream = !r.recovery && isJobActive(r.item.job) && r.item.job?.status !== 'need_confirm' ? { videoKey, acc: '', hideDraft: r.item.job?.type === 'ASR_SUMMARIZE' || !!r.item.summary?.asrProgress } : null;
       // F13 注记状态仅随「视频真切换」重置（审查 P1-3：SUMMARY_* 广播重开同视频详情时
       // 保留已展开/流式中的段卡；缓存本体在 DB，切走的视频零请求可再取）；
       // 收口轮审查 P2-5：行上已无 segmentNotes 而内存仍有注记（重新生成覆盖旧行后）同样清空，
@@ -558,15 +601,19 @@ export class PanelController {
         this.#segOpen = new Set();
       }
       this.#detailKey = videoKey;
-      this.#renderDetail(r.item, r.transcript);
+      this.#renderDetail(r.item, r.transcript, r.asrCached === true, r.recovery);
     } catch {
-      if (gen !== this.#routeGen) return;
+      if (request!==this.#detailRequest) return;
       toast(this.deps.ui, '打开摘要失败，稍后再试');
     }
   }
 
   #backToList(): void {
     this.#view = 'list';
+    this.#detailRequest++;
+    this.#transcriptVideoKey=null;
+    this.#transcriptPage=0;
+    this.#transcriptExpanded=false;
     this.#detailKey = null;
     this.#stream = null;
     this.#segNotes = new Map();
@@ -615,14 +662,28 @@ export class PanelController {
    * 未配置 → onNeedAsrConfig（onboarding ASR 补配模式，配置后回卡片可继续）；
    * busy（同视频任务在途）→ toast。
    */
-  async #onAsrConfirm(videoKey: string): Promise<void> {
+  async #onAsrConfirm(videoKey: string, recoveryAction?: 'continue' | 'recognize'): Promise<void> {
     try {
       const r = await this.deps.bridge.request<{ ok: boolean; started?: boolean; reason?: string; error?: string }>({
         type: 'ASR_CONFIRM',
         videoKey,
+        ...(recoveryAction ? { recovery: true, recoveryAction } : {}),
       });
       if (r?.reason === 'NEED_ASR_CONFIG') {
         this.deps.onNeedAsrConfig();
+        return;
+      }
+      if (r?.reason === 'ASR_PERMISSION_DENIED') {
+        toast(this.deps.ui, '语音服务未获授权，请到设置中测试连接并允许访问', 6000);
+        return;
+      }
+      if (r?.reason === 'ASR_RECOVERY_UNSUPPORTED') {
+        toast(this.deps.ui, '恢复该转写需要选择豆包 Agent Plan 语音服务', 6000);
+        return;
+      }
+      if (r?.reason === 'ASR_RECOVERY_CHANGED') {
+        toast(this.deps.ui, '转写缓存状态已变化，请重新确认', 6000);
+        await this.#openDetail(videoKey);
         return;
       }
       if (!r?.ok || !r.started) {
@@ -638,7 +699,12 @@ export class PanelController {
       }
       this.#segNotes = new Map();
       this.#segOpen = new Set();
-      this.#stream = { videoKey, acc: '' };
+      if (recoveryAction) {
+        this.#stream = null;
+        await this.#openDetail(videoKey);
+        return;
+      }
+      this.#stream = { videoKey, acc: '', hideDraft: true };
       this.#paintStream(); // 立即切「下载音频中…」等待态；增量经 SUMMARY_PROGRESS 进 #stream
     } catch {
       toast(this.deps.ui, 'ASR 解析发起失败，稍后再试');
@@ -648,14 +714,15 @@ export class PanelController {
   /** P2.3 F6-⑥：【暂不】→ 保持橙色标注（无状态迁移），回列表。 */
   async #onAsrDecline(videoKey: string): Promise<void> {
     try {
-      await this.deps.bridge.request({ type: 'ASR_DECLINE', videoKey });
+      const result = await this.deps.bridge.request<{ok:boolean;reason?:string}>({ type: 'ASR_DECLINE', videoKey });
+      if (result?.reason === 'ASR_ALREADY_STARTED') { toast(this.deps.ui, '语音识别已开始，无法在此处取消', 6000); return; }
     } catch {
       /* SW 未就绪：decline 无状态迁移，忽略 */
     }
     this.#backToList();
   }
 
-  #renderDetail(item: ListQueryItem, transcript?: TranscriptExcerpt): void {
+  #renderDetail(item: ListQueryItem, transcript?: TranscriptExcerpt, asrCached = false, recovery?: SummaryOpenResponse['recovery']): void {
     const root = this.deps.ui.root;
     const box = root.getElementById('view-list');
     if (!box) return;
@@ -670,7 +737,7 @@ export class PanelController {
     // 摘要区：流式（阶段文案 + 已抽取文本 + 光标）/ 成品 / 失败 / 待确认
     let summaryHtml: string;
     if (streaming) {
-      const partial = extractStreamingSummary(this.#stream?.acc ?? '');
+      const partial = this.#stream?.hideDraft ? '' : extractStreamingSummary(this.#stream?.acc ?? '');
       const stage = STAGE_LABEL[this.#stream?.stage ?? ''] ?? '豆包正在记笔记…';
       summaryHtml = partial
         ? `${esc(partial)}<span class="caret"></span>`
@@ -679,6 +746,14 @@ export class PanelController {
       summaryHtml = isCorruptStoredSummary(s)
         ? '<div class="d-summary-empty">摘要生成不完整，请点击重新生成</div>'
         : esc(s.summary) + (!s.outline?.length ? '<div class="d-summary-empty">未生成要点大纲，可点击重新生成</div>' : '');
+    } else if (s?.status === 'need_asr' && s.error?.code === 'ASR_EXISTING_SUBTITLE') {
+      summaryHtml = '<div class="d-summary-empty">旧字幕已保留，当前无法安全启动语音识别。</div>';
+    } else if (s?.status === 'need_asr' && s.error?.code === 'AUTO_ASR_PENDING') {
+      summaryHtml = '<div class="d-summary-empty"><span class="spinner"></span>没有可用中文字幕，准备自动进行语音识别。</div>';
+    } else if ((s?.status === 'need_asr' || s?.status === 'failed') && s.error?.code === 'ASR_TOO_SHORT') {
+      summaryHtml = '<div class="d-summary-empty">识别到了少量语音，但内容不足以生成可靠摘要。转写已保留，可在下方查看。</div>';
+    } else if ((s?.status === 'need_asr' || s?.status === 'failed') && ['ASR_NO_SPEECH','LOW_CONTENT'].includes(s.error?.code ?? '')) {
+      summaryHtml = '<div class="d-summary-empty">未识别到可用语音，无法生成摘要。</div>';
     } else if (s?.status === 'need_asr') {
       // P2.3 F6-①：卡片文案逐字（总纲口径）；【调用 ASR 解析】【暂不】+ 超长预告（音频估算 >25MB）
       const estMB = Math.round(estimateAudioBytes(v?.duration ?? 0) / 1048576);
@@ -686,11 +761,13 @@ export class PanelController {
       // 审查 P1-1：上次 ASR 尝试失败原因（音频链失败保留 need_asr 行、错误在 job 行）——不显示则
       // 用户「点确认→闪一下→回原卡」零反馈，反复点＝反复下载整段音频（F6-⑦ 明确提示不成立）
       const lastErr = !isJobActive(item.job) && item.lastJob?.status === 'failed' ? item.lastJob?.error : undefined;
-      summaryHtml =
-        '<div class="d-summary-empty">该视频文字信息较少，请确认是否调用 ASR 做进一步解析？</div>' +
-        (lastErr ? `<div class="d-summary-empty" style="color:#dc2626">上次尝试失败：${esc(lastErr.msg)}</div>` : '') +
+      const setupError = s.error?.code === 'NEED_ASR_CONFIG' || s.error?.code === 'ASR_PERMISSION_DENIED';
+      summaryHtml = setupError
+        ? `<div class="d-summary-empty">该视频没有可用中文字幕。配置并授权语音服务后可自动识别；${s.error?.code === 'ASR_PERMISSION_DENIED' ? '请在设置中测试连接或重新保存，并允许访问。' : '请先配置语音服务。'}完成设置后自动继续；若未开始，可点击继续处理。</div><div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-primary" id="asr-setup" style="flex:1">${s.error?.code === 'NEED_ASR_CONFIG' ? '配置 ASR' : '去设置授权'}</button><button class="btn btn-ghost" id="btn-asr-ok" style="flex:1">继续处理</button></div>`
+        : (asrCached ? '<div class="d-summary-empty">已保存完整语音转写，缓存可以复用时将使用已有文字并调用摘要模型。</div>' : '<div class="d-summary-empty">语音识别尚未完成，可选择继续处理。</div>') +
+        (lastErr ? `<div class="d-summary-empty" style="color:#dc2626">上次尝试失败：${esc(lastErr.msg)}；重新识别可能再次消耗额度。</div>` : '') +
         (tooBig ? `<div class="d-summary-empty" style="color:#f59e0b">视频较长：音频约 ${estMB}MB，可能超出 25MB 上限</div>` : '') +
-        '<div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-primary" id="btn-asr-ok" style="flex:1">调用 ASR 解析</button><button class="btn btn-ghost" id="btn-asr-no" style="flex:1">暂不</button></div>';
+        `<div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-primary" id="btn-asr-ok" style="flex:1">${asrCached ? '继续处理' : '调用 ASR 解析'}</button><button class="btn btn-ghost" id="btn-asr-no" style="flex:1">暂不</button></div>`;
     } else if (s?.status === 'failed') {
       // P2.6 F9：Key 无效给【去设置】直达入口（错误码分流；其余失败仅文案）
       summaryHtml =
@@ -707,7 +784,7 @@ export class PanelController {
     }
 
     // P1.11 F13：大纲条目 = seek 行（.ol-row）+ 独立【AI 解读】入口 + 内联注记容器（流式/缓存/失败重试）
-    const outlineHtml = (s?.outline ?? [])
+    const outlineHtml = (s?.status === 'done' && !(s.source === 'asr' && (transcript?.unconfirmedText || s.asrOutdated)) ? s.outline ?? [] : [])
       .map(
         (o, i) =>
           `<li data-sec="${Math.max(0, Math.floor(o.time))}"><div class="ol-row"><span class="ot">${fmtSec(o.time)}</span><span>${esc(o.text)}</span><button class="seg-btn" data-seg="${i}" title="解读该时间段">AI 解读</button></div><div class="seg-note hidden" data-segnote="${i}"></div></li>`,
@@ -720,30 +797,53 @@ export class PanelController {
             <div class="mascot-say-body"><div class="mascot-stars">${starsHtml(s.rating)}</div><div class="mascot-say-text">${esc(s.evaluation)}</div></div>
           </div></div>`
         : '';
-    const trHtml = transcript
-      ? `<details class="d-sec d-transcript"><summary>📄 转写节选（共 ${transcript.total} 条${transcript.total > transcript.cues.length ? `，前 ${transcript.cues.length} 条` : ''}）</summary>${transcript.total > transcript.cues.length ? '<p>此处仅展示前 200 条，摘要和分段解读使用完整转写。</p>' : ''}${transcript.cues
+    const pages=transcript?.page!==undefined?Math.ceil(transcript.total/200):0;
+    const historicalAsr = !!transcript?.unconfirmedText && transcript.source === 'asr' && !!s && s.source !== 'asr';
+    const insufficientSpeech = (s?.status === 'need_asr' || s?.status === 'failed') && ['ASR_TOO_SHORT','ASR_NO_SPEECH','LOW_CONTENT'].includes(s.error?.code ?? '');
+    const trHtml = transcript && !(insufficientSpeech && transcript.total === 0)
+      ? `<details class="d-sec d-transcript"${transcript.page!==undefined && this.#transcriptExpanded?' open':''}><summary>${historicalAsr ? '📄 历史 ASR 原文（未确认）' : `📄 转写${transcript.page!==undefined?'': '节选'}（共 ${transcript.total} 条${!transcript.unconfirmedText && transcript.page===undefined && transcript.total > transcript.cues.length ? `，前 ${transcript.cues.length} 条` : ''}）`}</summary>${transcript.unconfirmedText?`<div class="asr-unconfirmed"><b>未确认原文，时间不可用于跳转</b><p>${esc(transcript.unconfirmedText)}</p></div>`:transcript.page===undefined && transcript.total > transcript.cues.length ? '<p>此处仅展示前 200 条，摘要和分段解读使用完整转写。</p>' : ''}${transcript.cues
           .map((c) => `<div class="tr-line" data-sec="${Math.max(0, Math.floor(c.from))}"><span class="tt">[${fmtSec(c.from)}]</span><span>${esc(c.text)}</span></div>`)
-          .join('')}</details>`
+          .join('')}${pages>1?`<div class="d-foot"><button class="btn btn-ghost" id="tr-prev" ${transcript.page===0?'disabled':''}>上一页</button><span>第 ${transcript.page!+1} / ${pages} 页</span><button class="btn btn-ghost" id="tr-next" ${transcript.page===pages-1?'disabled':''}>下一页</button></div>`:''}</details>`
       : '';
+    const localProgress = recovery?.progress ? asrProgressView(recovery.progress) : !insufficientSpeech && s?.asrProgress && (s.status !== 'done' || s.asrProgress.unconfirmed?.length) ? asrProgressView(s.asrProgress) : undefined;
+    const localHtml = localProgress ? `<div class="d-sec asr-local-progress"><h3>局部要点（非全片结论）</h3><div>${esc(localProgress.label)}</div>${localProgress.warning ? `<div class="d-summary-empty">${esc(localProgress.warning)}</div>` : ''}${localProgress.parts.map(p => `<div class="asr-local-part"><span class="tt">${esc(p.range)}</span><span>${esc(p.text)}</span></div>`).join('')}${localProgress.unconfirmed.length ? `<div class="asr-unconfirmed"><b>未确认原文，时间不可用于跳转</b>${localProgress.unconfirmed.map(text => `<p>${esc(text)}</p>`).join('')}</div>` : ''}</div>` : '';
+    const recoveryHtml = recovery ? `<div class="d-sec asr-recovery"><h3>转写内容或时间未确认</h3><p>旧摘要和原文已保留，仅供参考。</p>${recovery.status === 'running' ? '<p>恢复处理中，旧摘要和原文仍会保留。</p>' : recovery.status === 'candidate' ? '<p>已保存新转写，确认后将使用已有文字继续调用摘要模型；如果缓存失效，需要重新确认才会下载完整音轨并发送给豆包语音服务，可能消耗额度并提前剧透。</p>' : `<p>${recovery.status === 'pending' ? '上次请求的计费状态不明，重新识别可能重复消耗额度。' : ''}确认重新识别将下载完整音轨并发送给豆包语音服务，可能消耗额度并提前剧透。</p>`}${recovery.warning ? `<p>${esc(recovery.warning)}</p>` : ''}${recovery.status === 'running' ? '' : `<div class="d-foot"><button class="btn btn-primary" id="asr-recovery-confirm">${recovery.status === 'candidate' ? '确认继续汇总' : '确认重新识别'}</button><button class="btn btn-ghost" id="asr-recovery-cancel">暂不</button></div>`}</div>` : '';
 
     box.innerHTML =
       `<div class="d-head"><button class="d-back" id="d-back" title="返回列表">←</button><b>视频摘要</b></div>` +
+      '<div class="d-meta" id="d-video-context" role="status"></div>' +
       `<div class="d-cover"><img src="${esc(v?.cover ?? '')}" referrerpolicy="no-referrer" alt=""><span class="dur">${fmtSec(v?.duration ?? 0)}</span></div>` +
       `<div class="d-title">${esc(title)}</div>` +
       `<div class="d-meta"><span>${esc(v?.owner ?? '')}</span><span>·</span><span>看到 ${pctLabel}</span>${srcBadge}</div>` +
       `<div class="d-sec"><h3>📝 摘要</h3><div class="d-summary" id="d-summary">${summaryHtml}</div></div>` +
+      (s?.status === 'done' && s.source === 'asr' && s.asrOutdated ? '<div class="d-sec d-summary-empty">该摘要基于旧转写，内容及时间仅供参考；可重新生成以使用新转写。</div>' : '') +
+      (s?.status === 'done' && s.source === 'asr' && transcript?.unconfirmedText ? '<div class="d-sec d-summary-empty">转写内容或时间未确认，暂不显示大纲及分段解读。</div>' : '') +
+      recoveryHtml +
+      (s?.status === 'done' && s.asrProgress?.warning ? `<div class="d-sec d-summary-empty">${esc(s.asrProgress.warning)}</div>` : '') +
+      localHtml +
       (outlineHtml ? `<div class="d-sec"><h3>🧭 要点大纲</h3><ul class="d-outline">${outlineHtml}</ul></div>` : '') +
       sayHtml +
       trHtml +
-      (s && s.status !== 'need_asr'
+      (s && s.status !== 'need_asr' && !insufficientSpeech
         ? `<div class="d-foot"><button class="btn btn-ghost" id="d-regen">↻ 重新生成</button><button class="btn btn-primary" id="d-copy">⧉ 复制摘要</button></div>`
         : '');
+
+    this.#detailVideo = {bvid: v?.bvid ?? item.visit.videoKey.split(':')[0]!,page:v?.page ?? 1};
+    this.#updateVideoContext();
 
     root.getElementById('d-back')?.addEventListener('click', () => this.#backToList());
     root.getElementById('d-regen')?.addEventListener('click', () => void this.#onRegenerate());
     root.getElementById('d-gosettings')?.addEventListener('click', () => void this.#showSettings());
+    root.getElementById('asr-setup')?.addEventListener('click', () => {
+      if (s?.error?.code === 'NEED_ASR_CONFIG') this.deps.onNeedAsrConfig();
+      else void this.#showSettings();
+    });
     root.getElementById('btn-asr-ok')?.addEventListener('click', () => void this.#onAsrConfirm(item.visit.videoKey));
     root.getElementById('btn-asr-no')?.addEventListener('click', () => void this.#onAsrDecline(item.visit.videoKey));
+    root.getElementById('asr-recovery-confirm')?.addEventListener('click', () => void this.#onAsrConfirm(item.visit.videoKey, recovery?.status === 'candidate' ? 'continue' : 'recognize'));
+    root.getElementById('asr-recovery-cancel')?.addEventListener('click', () => this.#backToList());
+    root.getElementById('tr-prev')?.addEventListener('click', () => void this.#openDetail(item.visit.videoKey,{transcriptPage:(transcript?.page??0)-1}));
+    root.getElementById('tr-next')?.addEventListener('click', () => void this.#openDetail(item.visit.videoKey,{transcriptPage:(transcript?.page??0)+1}));
     // P1.8：大纲条目与转写行点击 → seek（F5「点大纲项播放器跳到对应时间」/F7「点击某条可 seek」）；
     // P1.11：【AI 解读】按钮与注记卡内的点击不触发 seek（两动作互不干扰，PRD F13）
     const seekKey = item.visit.videoKey;
@@ -850,7 +950,7 @@ export class PanelController {
     if (!this.#stream) return;
     const el = this.deps.ui.root.getElementById('d-summary');
     if (!el) return;
-    const partial = extractStreamingSummary(this.#stream.acc);
+    const partial = this.#stream.hideDraft ? '' : extractStreamingSummary(this.#stream.acc);
     const stage = STAGE_LABEL[this.#stream.stage ?? ''] ?? '豆包正在记笔记…';
     el.innerHTML = partial
       ? `${esc(partial)}<span class="caret"></span>`

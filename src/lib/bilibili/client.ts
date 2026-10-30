@@ -292,7 +292,8 @@ export class BiliClient {
   ): Promise<{ subtitles: SubtitleTrack[]; need_login_subtitle?: boolean }> {
     const j = await this.#getJson<PlayerV2Resp>('/x/player/wbi/v2', { bvid, cid }, true);
     const sub = j.data?.subtitle;
-    return { subtitles: sub?.subtitles ?? [], need_login_subtitle: sub?.need_login_subtitle };
+    if (!Array.isArray(sub?.subtitles) || sub.subtitles.some(track => !track || typeof track !== 'object' || typeof track.lan !== 'string' || !track.lan.trim())) throw new Error('字幕轨信息不完整，无法确认是否存在字幕');
+    return { subtitles: sub.subtitles, need_login_subtitle: sub.need_login_subtitle };
   }
 
   // ---- P2.3 · ASR 音频流（playurl，仅确认流使用；架构 §3.3/§3.8） ----------------
@@ -349,6 +350,8 @@ export class BiliClient {
     } catch {
       throw new Error('字幕内容不是有效 JSON（结构变化），稍后重试或改用 ASR');
     }
-    return normalizeCues((j as { body?: unknown }).body);
+    const body = (j as { body?: unknown } | null)?.body;
+    if (!Array.isArray(body) || body.some(item => !item || typeof item !== 'object' || (typeof item.content !== 'string' && typeof item.text !== 'string'))) throw new Error('字幕内容结构异常，无法确认字幕是否为空');
+    return normalizeCues(body);
   }
 }

@@ -31,7 +31,7 @@ const visit = (over: Partial<VisitRow> = {}): VisitRow => ({
   ...over,
 });
 
-describe('五态徽章映射（F4）', () => {
+describe('徽章映射（F4）', () => {
   it('无摘要无任务 → 未生成（灰）', () => {
     expect(badgeFor({})).toBe('ungenerated');
   });
@@ -60,11 +60,20 @@ describe('五态徽章映射（F4）', () => {
     expect(badgeFor({ summary: { status: 'need_asr' } as never })).toBe('nosub');
     expect(badgeFor({ job: { status: 'need_confirm' } })).toBe('nosub');
   });
+  it('极短语音提示内容不足，且仍让活动任务优先显示生成中', () => {
+    const summary = {status:'need_asr',error:{code:'ASR_TOO_SHORT'}} as never;
+    expect(badgeFor({summary})).toBe('insufficient');
+    expect(badgeFor({summary,job:{status:'running'}})).toBe('generating');
+    expect(BADGE_HTML.insufficient).toContain('内容不足');
+  });
+  it('已处理但未识别到语音时也显示内容不足', () => {
+    expect(badgeFor({summary:{status:'need_asr',error:{code:'ASR_NO_SPEECH'}} as never})).toBe('insufficient');
+  });
   it('摘要 failed 且无活动任务 → 解析失败（红）', () => {
     expect(badgeFor({ summary: { status: 'failed' } as never })).toBe('failed');
   });
-  it('五种徽章文案齐全', () => {
-    expect(Object.keys(BADGE_HTML).sort()).toEqual(['failed', 'generating', 'nosub', 'summarized', 'ungenerated']);
+  it('徽章文案齐全', () => {
+    expect(Object.keys(BADGE_HTML).sort()).toEqual(['failed', 'generating', 'insufficient', 'nosub', 'summarized', 'ungenerated']);
   });
 });
 
@@ -166,6 +175,11 @@ describe('转写节选（F7）', () => {
   it('无转写 → undefined', () => {
     expect(excerptOf(undefined)).toBeUndefined();
   });
+  it('旧 ASR 占位时间原文保留但不作为可跳转 cue',()=>{
+    const t={...mk(1),source:'asr' as const,cues:[{from:0,to:600,text:'旧原文'}]};
+    expect(excerptOf(t,200,0,600)).toMatchObject({cues:[],unconfirmedText:'旧原文'});
+    expect(excerptOf({...t,source:'ai_sub'},200,0,600)?.cues).toHaveLength(1);
+  });
   it('超限时截断并保留总条数（标注「共 N 条，前 M 条」的据）', () => {
     const e = excerptOf(mk(205), 200)!;
     expect(e.cues).toHaveLength(200);
@@ -173,6 +187,43 @@ describe('转写节选（F7）', () => {
   });
   it('未超限全量', () => {
     expect(excerptOf(mk(5))!.cues).toHaveLength(5);
+  });
+  it('整段已确认 ASR 以句为单位分页，可查看第 201 句至结尾', () => {
+    const utterances=Array.from({length:273},(_,i)=>({text:`句${i}`,startMs:i*2800,endMs:i*2800+2000,definite:true,words:[]}));
+    const t={...mk(2),source:'asr' as const,asrComplete:true,asrDuration:765,cues:utterances.map(u=>({from:u.startMs/1000,to:u.endMs/1000,text:u.text})),asrParts:[{start:0,end:765,whole:true,serviceDurationMs:765000,result:{text:utterances.map(u=>u.text).join(''),utterances},cues:[]}]};
+    const first=excerptOf(t,200,0)!;const second=excerptOf(t,200,1)!;
+    expect(first.total).toBe(273);expect(first.cues).toHaveLength(200);
+    expect(second.total).toBe(273);expect(second.cues).toHaveLength(73);
+    expect(second.cues[0]).toEqual({from:560,to:562,text:'句200'});
+    expect(second.cues.at(-1)?.text).toBe('句272');
+    expect(second.page).toBe(1);
+  });
+  it('旧转写与不完整或未确认的 ASR 不从原始句子暴露可跳转内容', () => {
+    const t={...mk(2),source:'asr' as const,asrComplete:false,asrDuration:3,asrParts:[{start:0,end:3,whole:true,result:{text:'未经确认',utterances:[{text:'未经确认',startMs:0,endMs:1000,definite:false,words:[]}]},cues:[]}]};
+    expect(excerptOf(t,200,1)?.cues).toEqual(t.cues);
+    expect(excerptOf(mk(205),200,1)?.cues[0]?.text).toBe('t0');
+  });
+  it('句子边界从已验证的词时间推导，原始句时间不作为跳转依据',()=>{
+    const words=[{text:'你好',startMs:1200,endMs:1800},{text:'朋友',startMs:1800,endMs:2400}];
+    const t={...mk(2),source:'asr' as const,asrComplete:true,asrDuration:20,cues:[{from:1.2,to:1.8,text:'你好'},{from:1.8,to:2.4,text:'朋友'}],asrParts:[{start:0,end:20,whole:true,result:{text:'你好朋友',utterances:[{text:'你好朋友',startMs:10000,endMs:11000,definite:true,words}]},cues:[]}]};
+    expect(excerptOf(t)?.cues).toEqual([{from:1.2,to:2.4,text:'你好朋友'}]);
+    expect(excerptOf({...t,cues:[{from:5,to:6,text:'错误'}]})?.page).toBeUndefined();
+    const modified={...t,asrParts:[{...t.asrParts[0]!,result:{text:'伪造的句子',utterances:[{...t.asrParts[0]!.result.utterances[0]!,text:'伪造的句子'}]}}]};
+    expect(excerptOf(modified)?.page).toBeUndefined();
+  });
+  it('已完成的旧豆包转写若存在语义符号丢失，显示原文但禁止时间跳转',()=>{
+    const words=[{text:'温度5度',startMs:1000,endMs:2000}];const cues=[{from:1,to:2,text:'温度5度'}];
+    const t={...mk(1),source:'asr' as const,asrComplete:true,cues,asrParts:[{start:0,end:10,whole:true,result:{text:'温度+5度',utterances:[{text:'温度+5度',startMs:1000,endMs:2000,definite:true,words}]},cues}]};
+    expect(excerptOf(t)).toMatchObject({cues:[],unconfirmedText:'温度+5度'});
+    const generic={...t,asrParts:undefined};expect(excerptOf(generic)?.cues).toEqual(cues);
+  });
+  it('豆包全片顶层文字为空而句子非空时展示句子原文且禁止跳转',()=>{
+    const cues=[{from:1,to:2,text:'有效句子'}];const t={...mk(1),source:'asr' as const,asrComplete:true,cues,asrParts:[{start:0,end:10,whole:true,result:{text:'',utterances:[{text:'有效句子',startMs:1000,endMs:2000,definite:true,words:[]}]},cues}]};
+    expect(excerptOf(t)).toMatchObject({cues:[],unconfirmedText:'有效句子'});
+  });
+  it('豆包全片缺少句子但顶层文字与持久内容冲突时展示原文且禁止跳转',()=>{
+    const cues=[{from:1,to:2,text:'温度5度'}];const t={...mk(1),source:'asr' as const,asrComplete:true,cues,asrParts:[{start:0,end:10,whole:true,result:{text:'温度+5度',utterances:[]},cues}]};
+    expect(excerptOf(t)).toMatchObject({cues:[],unconfirmedText:'温度+5度'});
   });
 });
 
@@ -197,4 +248,32 @@ describe('P2.1 保留期倒计时格式化（F10）', () => {
     expect(clockOf(d.getTime())).toBe('09:05');
     expect(clockOf(new Date(2026, 9, 24, 23, 59).getTime())).toBe('23:59');
   });
+});
+
+it('ASR 确认文案说明接收方、处理范围、费用与未观看内容', async () => {
+  const {asrConsentText} = await import('../src/content/panel/view-models');
+  const text = asrConsentText(132);
+  expect(text).toContain('语音服务');
+  expect(text).toContain('02:12');
+  expect(text).toContain('额度');
+  expect(text).toContain('未观看');
+  expect(text).toContain('确认后可能下载');
+  expect(text).toContain('可以复用');
+  expect(text).toContain('否则');
+});
+
+it('分段进度保留局部范围和失败提示，不把局部内容标为全片', async () => {
+  const {asrProgressView} = await import('../src/content/panel/view-models');
+  const view = asrProgressView({processedUntil:29,targetDuration:90,status:'partial',parts:[{from:0,to:29,text:'片段要点'}],warning:'边界未确认'});
+  expect(view.label).toContain('00:29');
+  expect(view.label).toContain('未完成');
+  expect(view.parts).toEqual([{range:'00:00–00:29',text:'片段要点'}]);
+  expect(view.warning).toContain('边界未确认');
+});
+
+it('未确认识别原文单独展示，不伪造可跳转的时间', async () => {
+  const {asrProgressView} = await import('../src/content/panel/view-models');
+  const view = asrProgressView({processedUntil:10,targetDuration:30,status:'partial',parts:[{from:0,to:10,text:'已确认要点'}],unconfirmed:[{from:10,to:30,text:'尚未对齐的原文'}]});
+  expect(view.parts).toEqual([{range:'00:00–00:10',text:'已确认要点'}]);
+  expect(view.unconfirmed).toEqual(['尚未对齐的原文']);
 });

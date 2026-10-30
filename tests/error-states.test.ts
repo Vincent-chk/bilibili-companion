@@ -114,6 +114,16 @@ describe('P2.6 · mapLlmError：-412 → RISK_CONTROL（可读文案，不再落
 });
 
 describe('P2.6 · 字幕结构变化降级（normalizeCues，F11）', () => {
+  it('空白字幕不作为有效文字，备用文本有效时仍应保留', () => {
+    expect(normalizeCues([
+      { from: 0, to: 1, content: ' \n\t' },
+      { from: 1, to: 2, content: '　', text: '备用文字' },
+      { from: 2, to: 3, content: ' 正文 ' },
+    ])).toEqual([
+      { from: 1, to: 2, content: '备用文字' },
+      { from: 2, to: 3, content: ' 正文 ' },
+    ]);
+  });
   it('规范形状 {from,to,content} 原样通过', () => {
     expect(normalizeCues([{ from: 0, to: 2, content: '你好' }])).toEqual([{ from: 0, to: 2, content: '你好' }]);
   });

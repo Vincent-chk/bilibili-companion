@@ -2,9 +2,9 @@
 // 状态机：pending → running → done | need_confirm | failed（失败 retries≤1 自动重排队）。
 // 每实例并发=1（B 站侧串行）；lane 参数使多实例分通道并行（主链摘要 + 交互链分段解读，F13 提速：
 // 用户点击不再排在数分钟的摘要任务之后）。取任务按 (prio ?? 0, createdAt)——同通道内用户任务压过后台预取。
-// SW 重启恢复：recover() 把 stale running 重排 pending。
+// SW 重启恢复：普通任务重排 pending；ASR 在途计费不明，需用户确认重试。
 // 任务语义（选轨/字幕/LLM）由注入的 executor 承担——任务 1.4 提供 SUMMARIZE 实现。
-import type { CompanionDB, JobRow, JobStage, JobType } from '../storage';
+import type { AsrRecovery, CompanionDB, JobRow, JobStage, JobType } from '../storage';
 
 export interface JobError {
   code: string;
@@ -36,7 +36,9 @@ export interface PipelineOptions {
   /** 通道过滤：本实例只 drain 这些类型（缺省=全部）。多实例分 lane 并行（每 lane 并发仍=1）。 */
   lane?: JobType[];
   /** 每个任务前重新检查暂停等运行门槛，保留 pending 等待恢复。 */
-  canRun?: (job: JobRow) => Promise<boolean>;
+  canRun?: (job: JobRow) => Promise<boolean | {allowInGrace:boolean}>;
+  /** 在领取事务内再次检查会话状态，防止结束陪看与领取并发。 */
+  enforceSession?: boolean;
 }
 
 const ACTIVE_STATUSES: JobRow['status'][] = ['pending', 'running', 'need_confirm'];
@@ -49,7 +51,8 @@ export class Pipeline {
   readonly #now: () => number;
   readonly #onTransition?: (job: JobRow) => void;
   readonly #lane?: JobType[];
-  readonly #canRun?: (job: JobRow) => Promise<boolean>;
+  readonly #canRun?: (job: JobRow) => Promise<boolean | {allowInGrace:boolean}>;
+  readonly #enforceSession: boolean;
   #busy = false;
   #drainRequested = false;
   #workAddedWhileBusy = false;
@@ -62,10 +65,11 @@ export class Pipeline {
     this.#onTransition = opts.onTransition;
     this.#lane = opts.lane;
     this.#canRun = opts.canRun;
+    this.#enforceSession = opts.enforceSession === true;
   }
 
   /**
-   * 入队。幂等：同 videoKey+type(+segIndex) 已有活动任务（pending/running/need_confirm）时返回现有行，
+   * 入队。幂等：同 sessionId+videoKey+type(+segIndex) 已有活动任务时返回现有行，
    * 不重复建（20s 触发与按需打开并发、双标签页并发触发均在此收口；F13 同视频不同段互不去重）。
    * 'rw' 事务封查后写竞态。
    */
@@ -75,6 +79,7 @@ export class Pipeline {
     sessionId: string;
     segIndex?: number;
     prio?: number; // 缺省 0；-1=主动摘要，1=后台预取
+    recovery?: AsrRecovery;
   }): Promise<JobRow> {
     return this.#db.transaction('rw', this.#db.jobs, async () => {
       const active = await this.#db.jobs
@@ -83,6 +88,7 @@ export class Pipeline {
         .filter(
           (j) =>
             j.type === input.type &&
+            j.sessionId === input.sessionId &&
             (j.segIndex ?? null) === (input.segIndex ?? null) &&
             ACTIVE_STATUSES.includes(j.status),
         )
@@ -96,6 +102,7 @@ export class Pipeline {
         sessionId: input.sessionId,
         ...(input.segIndex !== undefined ? { segIndex: input.segIndex } : {}),
         ...(input.prio !== undefined && input.prio !== 0 ? { prio: input.prio } : {}),
+        ...(input.recovery ? { recovery: input.recovery } : {}),
         status: 'pending',
         progress: 0,
         retries: 0,
@@ -109,15 +116,30 @@ export class Pipeline {
     });
   }
 
-  /** SW 启动时调用：stale running（上次 SW 中途死亡）重排 pending。返回重排数。 */
-  async recover(): Promise<number> {
-    const stale = await this.#db.jobs.where('status').equals('running').toArray();
-    for (const j of stale) {
-      const row: JobRow = { ...j, status: 'pending', updatedAt: this.#now() };
-      await this.#db.jobs.put(row);
-      this.#emit(row);
-    }
-    return stale.length;
+  /** SW 启动时调用：在途 ASR 费用不明，必须由用户确认重试；其他任务可恢复。 */
+  async recover(liveRuns: {id:string;runId:string}[] = []): Promise<number> {
+    return this.#db.transaction('rw', this.#db.jobs, this.#db.summaries, async () => {
+      const stale = await this.#db.jobs.where('status').equals('running').toArray();
+      let recovered=0;
+      for (const j of stale) {
+        if (j.type === 'ASR_SUMMARIZE' && j.runId && liveRuns.some(run=>run.id===j.id && run.runId===j.runId)) continue;
+        recovered++;
+        const row: JobRow = j.type === 'ASR_SUMMARIZE'
+          ? { ...j, runId: undefined, status: 'failed', error: { code: 'ASR_INTERRUPTED', msg: '语音识别中断，已发送部分可能产生费用，请确认后再重试' }, updatedAt: this.#now() }
+          : { ...j, runId: undefined, status: 'pending', updatedAt: this.#now() };
+        await this.#db.jobs.put(row);
+        if (j.type === 'ASR_SUMMARIZE') {
+          const summaries = await this.#db.summaries.where('videoKey').equals(j.videoKey).toArray();
+          for (const summary of summaries) {
+            if (summary.status !== 'done' && summary.asrProgress?.status === 'running' && summary.asrProgress.sessionId === j.sessionId) {
+              await this.#db.summaries.put({ ...summary, status:'need_asr', asrProgress: { ...summary.asrProgress, status:'partial', warning:'语音识别中断，在途片段计费状态不明，重新识别前请确认' } });
+            }
+          }
+        }
+        this.#emit(row);
+      }
+      return recovered;
+    });
   }
 
   /**
@@ -129,34 +151,54 @@ export class Pipeline {
     if (this.#lane) pending = pending.filter((j) => this.#lane!.includes(j.type));
     pending.sort((a, b) => (a.prio ?? 0) - (b.prio ?? 0) || a.createdAt - b.createdAt);
     let job: JobRow | undefined;
+    let allowInGrace = false;
     for (const candidate of pending) {
-      if (!this.#canRun || await this.#canRun(candidate)) { job = candidate; break; }
+      const allowed = this.#canRun ? await this.#canRun(candidate) : true;
+      if (allowed) { job = candidate; allowInGrace = typeof allowed === 'object' && allowed.allowInGrace; break; }
     }
     if (!job) return false;
-    await this.#set({ ...job, status: 'running', updatedAt: this.#now() });
+    const runId = crypto.randomUUID();
+    const claimed = await this.#db.transaction('rw', this.#db.jobs, this.#db.sessions, async () => {
+      const running = await this.#db.jobs.where('status').equals('running').toArray();
+      if (running.some(j => !this.#lane || this.#lane.includes(j.type))) return undefined;
+      const current = await this.#db.jobs.get(job!.id);
+      if (!current || current.status !== 'pending') return undefined;
+      if (this.#enforceSession) {
+        const session = await this.#db.sessions.get(current.sessionId);
+        if (session?.state !== 'ACTIVE' && !(session?.state === 'GRACE' && allowInGrace)) return undefined;
+      }
+      const row: JobRow = { ...current, runId, status: 'running', updatedAt: this.#now() };
+      await this.#set(row);
+      return row;
+    });
+    if (!claimed) return false;
     const ctx: JobContext = {
       update: async (patch) => {
-        const cur = await this.#db.jobs.get(job.id);
-        // 执行期间被清除（F10 wipe）不写回；终态后迟到的进度消息（如 done 落库后的 90 回包）不覆盖
-        if (!cur || cur.status !== 'running') return;
-        await this.#set({ ...cur, ...patch, updatedAt: this.#now() });
+        await this.#db.transaction('rw', this.#db.jobs, async () => {
+          const cur = await this.#db.jobs.get(job.id);
+          if (!cur || cur.status !== 'running' || cur.runId !== runId) return;
+          await this.#set({ ...cur, ...patch, updatedAt: this.#now() });
+        });
       },
     };
     let outcome: JobOutcome;
     try {
-      outcome = await this.#handlers.execute({ ...job, status: 'running' }, ctx);
+      outcome = await this.#handlers.execute(claimed, ctx);
     } catch (e) {
       outcome = {
         result: 'failed',
         error: { code: 'EXEC_ERROR', msg: String(e).slice(0, 200) },
       };
     }
+    return this.#db.transaction('rw', this.#db.jobs, async () => {
     const fresh = await this.#db.jobs.get(job.id);
-    if (!fresh) return true; // 同上：不复活已清除的任务
+    if (!fresh || fresh.status !== 'running' || fresh.runId !== runId) return true;
     if (outcome.result === 'done') {
       await this.#set({ ...fresh, status: 'done', progress: 100, updatedAt: this.#now() });
     } else if (outcome.result === 'need_confirm') {
       await this.#set({ ...fresh, status: 'need_confirm', updatedAt: this.#now() });
+    } else if (outcome.result === 'wait' && fresh.type === 'ASR_SUMMARIZE') {
+      await this.#set({ ...fresh, status: 'failed', error: { code: 'ASR_INTERRUPTED', msg: '语音识别中断，已发送部分可能产生费用，请确认后再重试' }, updatedAt: this.#now() });
     } else if (outcome.result === 'wait') {
       // P2.6 F11：网络级失败挂起——回 pending 不烧重试（徽章保持「生成中」，不 failed 轰炸）；
       // 续跑时机由调用方触发（SW online 事件/面板 LIST_QUERY/alarms 兜底）。
@@ -174,6 +216,7 @@ export class Pipeline {
       await this.#set({ ...fresh, status: 'failed', error: outcome.error, updatedAt: this.#now() });
     }
     return true;
+    });
   }
 
   /** 串行清空 pending。只有显式恢复信号才在忙时请求补跑，普通刷新不破坏 wait 停轮。 */

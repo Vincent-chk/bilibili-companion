@@ -30,6 +30,7 @@ export interface StreamOptions {
   onDelta?: (ev: StreamEvent) => void;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
   /** 输出 token 上限（成本护栏：F13 分段解读 / F14 对话用；缺省=不限制）。 */
   maxTokens?: number;
   /** 思考模型关闭思维链（F13 分段解读提速：首字 TTFT 从 40–90s 压到秒级）。
@@ -60,6 +61,9 @@ export async function streamChatCompletion(
   const url = `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const thinkingOff = opts.disableThinking === true && isArkBaseUrl(cfg.baseUrl);
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  opts.signal?.addEventListener('abort', abort, { once: true });
+  if (opts.signal?.aborted) abort();
   const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
   const t0 = Date.now();
   let text = '';
@@ -67,6 +71,7 @@ export async function streamChatCompletion(
   let ttftMs: number | null = null;
 
   try {
+    if (controller.signal.aborted) throw new LlmNetworkError('LLM 请求已取消');
     const res = await fetchImpl(url, {
       method: 'POST',
       headers: {
@@ -125,8 +130,10 @@ export async function streamChatCompletion(
     };
 
     for (;;) {
+      if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
       if (finished) break; // [DONE] 后不再等下一次 read（服务器可能不立即关流）
       const { done, value } = await reader.read();
+      if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       let nl = buf.indexOf('\n');
@@ -134,16 +141,20 @@ export async function streamChatCompletion(
         const line = buf.slice(0, nl).replace(/\r$/, '');
         buf = buf.slice(nl + 1);
         onLine(line);
+        if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
         if (finished) break;
         nl = buf.indexOf('\n');
       }
     }
     buf += decoder.decode();
     if (!finished && buf.trim()) onLine(buf.replace(/\r$/, '')); // 无尾换行的最后一行
+    if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
 
     onDelta?.({ type: 'done', usage });
+    if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
     return { text, usage, ttftMs };
   } catch (e) {
+    if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
     if (e instanceof LlmHttpError) throw e;
     if (e instanceof LlmNetworkError) throw e;
     const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -152,5 +163,6 @@ export async function streamChatCompletion(
     );
   } finally {
     clearTimeout(timer);
+    opts.signal?.removeEventListener('abort', abort);
   }
 }

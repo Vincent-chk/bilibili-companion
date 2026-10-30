@@ -8,8 +8,10 @@ import { BiliApiError, BiliClient } from '../../src/lib/bilibili/client';
 import { runSummarizeJob } from '../../src/lib/summarize/chain';
 import { runAsrJob } from '../../src/lib/summarize/asr';
 import { runSegmentJob } from '../../src/lib/summarize/segment';
-import { CompanionDB } from '../../src/lib/storage';
+import { CompanionDB, type AsrRecovery } from '../../src/lib/storage';
 import type { LlmConfig } from '../../src/lib/llm/types';
+import { runDoubaoSession } from '../../src/lib/asr/doubao';
+import type { AsrConfig } from '../../src/lib/asr';
 
 const db = new CompanionDB();
 const bili = new BiliClient({
@@ -22,13 +24,13 @@ const bili = new BiliClient({
 
 interface RunJobMsg {
   type?: 'OFFSCREEN_RUN_JOB';
-  job?: { id: string; videoKey: string; type?: string; segIndex?: number };
+  job?: { id: string; videoKey: string; type?: string; segIndex?: number; sessionId?: string; runId?: string; recovery?: AsrRecovery };
   llm?: LlmConfig;
   persona?: string;
   /** 整流超时（SW resolveConfig 解析，思考型真实模型 > 默认 60s）。 */
   timeoutMs?: number;
   /** P2.3：ASR 配置随 job 下发（offscreen 读不了 storage，SW 解析后传入）。 */
-  asr?: { baseUrl: string; modelId: string; apiKey: string };
+  asr?: AsrConfig;
   asrMaxMB?: number;
 }
 
@@ -68,23 +70,76 @@ function makeCtx(jobId: string, segIndex?: number) {
   };
 }
 
-browser.runtime.onMessage.addListener((msg: unknown) => {
+const activeAsrRuns = new Map<string, {id:string;runId:string;outcome?: unknown}>();
+const asrControllers = new Map<string, {sessionId:string; controller:AbortController}>();
+browser.runtime.onMessage.addListener((msg: unknown, sender) => {
   const m = msg as RunJobMsg;
+  if ((msg as {type?:string})?.type === 'OFFSCREEN_CANCEL_ASR') {
+    if (sender.url !== browser.runtime.getURL('/background.js')) return Promise.resolve({ok:false});
+    const sessionId=(msg as {sessionId?:unknown}).sessionId;
+    if(typeof sessionId!=='string')return Promise.resolve({ok:false});
+    for(const active of asrControllers.values())if(active.sessionId===sessionId)active.controller.abort();
+    return Promise.resolve({ok:true});
+  }
+  if ((msg as {type?:string})?.type === 'OFFSCREEN_ACTIVE_JOBS') {
+    if (sender.url !== browser.runtime.getURL('/background.js')) return Promise.resolve([]);
+    return Promise.resolve([...activeAsrRuns.values()]);
+  }
   if (m?.type !== 'OFFSCREEN_RUN_JOB' || !m.job?.videoKey || !m.llm) return undefined; // 非本品消息交给其它 listener
-  return handleRun(m.job, m.llm, m.persona, m.timeoutMs, m.asr, m.asrMaxMB).catch((e: unknown) => ({
+  if (sender.url !== browser.runtime.getURL('/background.js')) return Promise.resolve({result:'failed' as const,error:{code:'ASR_UNAUTHORIZED',msg:'任务来源无效'}});
+  const job = m.job;
+  const active = job.type === 'ASR_SUMMARIZE' && job.runId ? {id:job.id,runId:job.runId} : undefined;
+  const controller=active && job.sessionId ? new AbortController() : undefined;
+  if(controller)asrControllers.set(job.id,{sessionId:job.sessionId!,controller});
+  if (active) activeAsrRuns.set(job.id, active);
+  return handleRun(job, m.llm, m.persona, m.timeoutMs, m.asr, m.asrMaxMB,controller?.signal).catch((e: unknown) => ({
     result: 'failed' as const,
     error: { code: 'CHAIN_ERROR', msg: String(e).slice(0, 200) },
-  }));
+  })).then(async outcome => {
+    if(controller && asrControllers.get(job.id)?.controller===controller)asrControllers.delete(job.id);
+    if (active) {
+      activeAsrRuns.set(job.id, {...active,outcome});
+      try {
+        const ack = await browser.runtime.sendMessage({type:'OFFSCREEN_ASR_DONE',jobId:job.id,runId:active.runId,outcome}) as {ok?:boolean};
+        if (ack?.ok !== undefined) activeAsrRuns.delete(job.id);
+      } catch { /* 后台重启后可查询已完成结果并收口 */ }
+    }
+    return outcome;
+  });
+});
+
+// 语音连接运行在扩展离屏页面：Chrome 的 DNR 发起者限定在此上下文才匹配。
+function doubaoSession(apiKey: string, pcm?: Uint8Array, signal?:AbortSignal) {
+  return runDoubaoSession(apiKey, pcm, {
+    runtimeId: browser.runtime.id,
+    createSocket: url => new WebSocket(url),
+    signal,
+    updateRules: async rule => {
+      const headers = rule?.action.requestHeaders;
+      const result = await browser.runtime.sendMessage({type:'DOUBAO_AUTH_RULE', authRule: rule ? {key:headers![0]!.value, requestId:headers![2]!.value} : null}) as {ok?:boolean};
+      if (!result?.ok) throw new Error('ASR_RULE_FAILED');
+    },
+  });
+}
+browser.runtime.onMessage.addListener((msg: unknown, sender) => {
+  const m = msg as { type?: string; apiKey?: string; pcm?: number[] };
+  if (m.type !== 'OFFSCREEN_DOUBAO_SESSION') return undefined;
+  if (sender.url !== browser.runtime.getURL('/background.js') || typeof m.apiKey !== 'string') return Promise.resolve({ok:false, error:'ASR_UNAUTHORIZED'});
+  return doubaoSession(m.apiKey, m.pcm ? Uint8Array.from(m.pcm) : undefined).then(frame => ({ok:true, frame})).catch((e: unknown) => ({ok:false, error:e instanceof Error && /^ASR_[A-Z_0-9]+$/.test(e.message) ? e.message : 'ASR_CONNECTION_FAILED'}));
 });
 
 async function handleRun(
-  job: { id: string; videoKey: string; type?: string; segIndex?: number },
+  job: { id: string; videoKey: string; type?: string; segIndex?: number; sessionId?: string; runId?: string; recovery?: AsrRecovery },
   llm: LlmConfig,
   persona?: string,
   timeoutMs?: number,
-  asr?: { baseUrl: string; modelId: string; apiKey: string },
+  asr?: AsrConfig,
   asrMaxMB?: number,
+  signal?:AbortSignal,
 ) {
+  // 继续已完成的候选只用摘要模型；ASR 配置或权限撤销后仍可继续，且此路径禁止发送音频。
+  const resumeCandidate=job.type==='ASR_SUMMARIZE' && job.recovery?.candidate?.asrComplete===true;
+  const effectiveAsr=resumeCandidate ? {provider:'doubao-agent-plan' as const,baseUrl:'https://openspeech.bytedance.com',modelId:'doubao-seed-asr-2.0',apiKey:''} : asr;
   console.log(
     `[doubao] offscreen run job=${job.id} videoKey=${job.videoKey}${job.type === 'SEGMENT_ANALYZE' ? ` seg=${job.segIndex}` : ''}`,
   );
@@ -102,7 +157,7 @@ async function handleRun(
             ctx,
           )
       : job.type === 'ASR_SUMMARIZE'
-        ? asr
+        ? effectiveAsr
           ? await runAsrJob(
               {
                 db,
@@ -110,8 +165,13 @@ async function handleRun(
                 llm,
                 persona,
                 timeoutMs,
-                asr,
+                asr:effectiveAsr,
+                signal,
                 asrMaxMB: asrMaxMB ?? 25,
+                ...(effectiveAsr.provider === 'doubao-agent-plan' ? {
+                  transcribePcm: (pcm: Uint8Array) => resumeCandidate ? Promise.reject(new Error('ASR_RECOVERY_CHANGED')) : doubaoSession(effectiveAsr.apiKey, pcm,signal),
+                  onAsrPartial: async () => { await browser.runtime.sendMessage({type:'ASR_PARTIAL_UPDATED',jobId:job.id,runId:job.runId}); },
+                } : {}),
                 onDelta: (t) => ctx.pushDelta(t),
               },
               job,

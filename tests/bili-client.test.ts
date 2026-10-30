@@ -30,6 +30,23 @@ function makeClient(
 }
 
 describe('BiliClient（fake fetch）', () => {
+  it.each([{code:0},{code:0,data:{}},{code:0,data:{subtitle:{}}},{code:0,data:{subtitle:{subtitles:'invalid'}}},{code:0,data:{subtitle:{subtitles:[{lan:''}]}}},{code:0,data:{subtitle:{subtitles:[{lan:'  '}]}}}])('字幕轨字段缺失或异常时不判定无轨 %#',async(player)=>{
+    const {client}=makeClient(url=>url.includes('/nav')?jsonResponse({code:0,data:{wbi_img:{img_url:`https://x/${IMG_KEY}.png`,sub_url:`https://x/${SUB_KEY}.png`}}}):jsonResponse(player));
+    await client.fetchWbiKeys();
+    await expect(client.getPlayerSubtitles('BV1x',123)).rejects.toThrow('字幕');
+  });
+
+  it.each([{}, {body:null}, {body:'invalid'}, {body:[{unexpected:'x'}]}])('字幕内容结构异常时不判定空轨 %#',async(body)=>{
+    const {client}=makeClient(()=>jsonResponse(body));
+    await expect(client.fetchTranscript('https://example.test/subtitle')).rejects.toThrow('字幕');
+  });
+
+  it('显式空字幕轨与空字幕内容仍可识别为空',async()=>{
+    const {client}=makeClient(url=>url.includes('/nav')?jsonResponse({code:0,data:{wbi_img:{img_url:`https://x/${IMG_KEY}.png`,sub_url:`https://x/${SUB_KEY}.png`}}}):url.includes('/player/')?jsonResponse({code:0,data:{subtitle:{subtitles:[]}}}):jsonResponse({body:[]}));
+    await client.fetchWbiKeys();
+    expect((await client.getPlayerSubtitles('BV1x',123)).subtitles).toEqual([]);
+    expect(await client.fetchTranscript('https://example.test/subtitle')).toEqual([]);
+  });
   it('nav → 派生 WBI mixin key（文档示例 key 对）', async () => {
     const { client, calls } = makeClient((url) => {
       if (url.includes('/x/web-interface/nav')) {

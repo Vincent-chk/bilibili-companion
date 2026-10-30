@@ -38,12 +38,12 @@ export function normalizeCues(body: unknown): { from: number; to: number; conten
     const c = raw as Record<string, unknown>;
     const cText = typeof c.content === 'string' ? c.content : '';
     const tText = typeof c.text === 'string' ? c.text : '';
-    const text = cText || tText; // content 空串也回退 text（审查 P2-3）
+    const text = cText.trim() ? cText : tText; // content 空白时仍回退有效的 text
     const fromRaw = Number(c.from ?? c.start);
     const from = Number.isFinite(fromRaw) ? fromRaw : 0;
     const toRaw = Number(c.to ?? c.end);
     const to = Number.isFinite(toRaw) ? toRaw : from;
-    if (!text) continue; // 无文本的行（结构噪声）不进库
+    if (!text.trim()) continue; // 空白行没有可供摘要的文字
     out.push({ from, to, content: text });
   }
   return out;

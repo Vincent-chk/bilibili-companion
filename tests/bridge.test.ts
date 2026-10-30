@@ -67,3 +67,17 @@ it('页面恢复重连后，旧连接迟到的消息不能覆盖新会话状态'
   listeners[0]!({ type: 'SESSION_STATE', state: 'ACTIVE' });
   expect(events.filter((event: any) => event.type === 'SESSION_STATE')).toEqual([{ type: 'SESSION_STATE', state: 'GRACE' }]);
 });
+
+it('Port 断开时同步读取 lastError 并保留可恢复断线的重连', () => {
+ let disconnect!:()=>void;const scheduled=vi.fn();let reads=0;
+ Object.defineProperty(runtime,'lastError',{configurable:true,get(){reads++;return {message:'channel closed'};}});
+ const bridge=new Bridge(()=>{},{connectPort:()=>({onMessage:{addListener:()=>{}},onDisconnect:{addListener:fn=>{disconnect=fn;}},postMessage:()=>{}}),setTimeout:scheduled as unknown as typeof setTimeout});
+ bridge.connect();disconnect();expect(reads).toBe(1);expect(scheduled).toHaveBeenCalledOnce();
+ delete (runtime as {lastError?:unknown}).lastError;
+});
+
+it('扩展上下文失效时停止重连并通知用户刷新', () => {
+ const scheduled=vi.fn();const events:unknown[]=[];
+ const bridge=new Bridge(event=>events.push(event),{connectPort:()=>{throw new Error('Extension context invalidated.');},setTimeout:scheduled as unknown as typeof setTimeout});
+ bridge.connect();bridge.syncState();expect(scheduled).not.toHaveBeenCalled();expect(events).toEqual([{type:'EXTENSION_RELOAD_REQUIRED'}]);
+});

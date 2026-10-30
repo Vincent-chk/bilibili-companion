@@ -35,7 +35,7 @@ export default defineConfig({
       '*://*.volces.com/*',
     ],
     // P1.7：用户 LLM/ASR 端点按 origin 动态授权（onboarding 保存时申请，绝不静默通配）
-    optional_host_permissions: ['*://*/*'],
+    optional_host_permissions: ['*://*/*', 'wss://openspeech.bytedance.com/*'],
     // P1.5：mascot 立绘/头像在 content script 的 Shadow DOM <img> 中加载，须 web 可访问
     web_accessible_resources: [{ resources: ['mascot/*'], matches: ['*://www.bilibili.com/*'] }],
     // content_scripts 不在此声明：WXT 由 entrypoints/content.ts 的 defineContentScript 生成注册。

@@ -2,6 +2,7 @@
 // LLM 必填三件套校验、端点 URL 安全校验（拒绝非 loopback 明文 http，风险合规红线）、
 // ASR 可选三元组（全空跳过/部分填写报错）、optional_host_permissions 的 origin 模式。
 export interface ModelConfigInput {
+  provider?: 'openai-compatible' | 'doubao-agent-plan';
   baseUrl: string;
   modelId: string;
   apiKey: string;
@@ -51,6 +52,7 @@ export function validateLlm(cfg: ModelConfigInput): LlmValidation {
 
 /** ASR 可选：全空=跳过；全填=有效；部分填=错误（静默忽略会让用户误以为已配置）。 */
 export function validateAsr(cfg: ModelConfigInput): { kind: 'skip' | 'ok' | 'error'; error?: string } {
+  if (cfg.provider === 'doubao-agent-plan') return cfg.apiKey.trim() ? { kind: 'ok' } : { kind: 'error', error: '请填写 Agent Plan Key' };
   const filled = [cfg.baseUrl.trim(), cfg.modelId.trim(), cfg.apiKey.trim()].filter(Boolean).length;
   if (filled === 0) return { kind: 'skip' };
   if (filled < 3) return { kind: 'error', error: 'ASR 三项需同时填写（或全部留空稍后再配）' };

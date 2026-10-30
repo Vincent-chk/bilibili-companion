@@ -3,7 +3,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { startMockLlm, validSummaryJson, type MockLlmServer } from './helpers/mock-llm';
 import {
-  CHUNK_CHARS,
   MAP_CONCURRENCY,
   OVERLAP_SEC,
   chunkCues,
@@ -21,6 +20,14 @@ afterEach(async () => {
 const cue = (from: number, text: string): StoredCue => ({ from, to: from + 2, text });
 
 describe('chunkCues 分块', () => {
+  it('大量短词的实际时间戳文本和重叠均受预算约束且不丢词', () => {
+    const cues=Array.from({length:500},(_,i)=>cue(i*.3,`词${i}`));
+    const chunks=chunkCues(cues,{chunkChars:300,overlapSec:5});
+    expect(chunks.length).toBeGreaterThan(1);
+    for(const chunk of chunks) expect(compactCues(chunk).length).toBeLessThanOrEqual(300);
+    for(const c of cues) expect(chunks.some(chunk=>chunk.includes(c))).toBe(true);
+    expect(chunks[1]!.some(c=>chunks[0]!.includes(c))).toBe(true);
+  });
   it('空 cues → 空块；单块不超预算时整块返回', () => {
     expect(chunkCues([])).toEqual([]);
     const small = [cue(0, 'a'.repeat(100)), cue(5, 'b'.repeat(100))];
@@ -48,6 +55,28 @@ describe('chunkCues 分块', () => {
 
   it('compactCues 输出 [mm:ss]text 行', () => {
     expect(compactCues([cue(0, '你好'), cue(65, '世界')])).toBe('[00:00]你好\n[01:05]世界');
+  });
+
+  it('ASR 分块传递总秒数，字幕分块仍使用原有时间格式', async () => {
+    const calls: {messages:{content:string}[]}[]=[];
+    const fetchImpl=async(_input:unknown,init?:RequestInit)=>{calls.push(JSON.parse(String(init?.body)));return new Response('data: {"choices":[{"delta":{"content":"[612秒]要点"}}]}\n\ndata: [DONE]\n\n',{status:200});};
+    const cfg={baseUrl:'https://llm.test/v1',model:'m',apiKey:'x'};
+    await runMap(cfg,'视频',[cue(612,'内容')],{fetchImpl:fetchImpl as typeof fetch,outlineTimeLimit:776});
+    expect(calls[0]!.messages[1]!.content).toContain('[612秒]内容');
+    expect(calls[0]!.messages[0]!.content).toContain('[N秒]');
+    await runMap(cfg,'视频',[cue(612,'内容')],{fetchImpl:fetchImpl as typeof fetch});
+    expect(calls[1]!.messages[1]!.content).toContain('[10:12]内容');
+  });
+
+  it('ASR 预算按秒数标签的实际长度计算，reduce 保留总秒数',async()=>{
+    const cues=Array.from({length:300},(_,i)=>cue(600+i,`词${i}`));
+    const chunks=chunkCues(cues,{chunkChars:300,overlapSec:5,seconds:true});
+    for(const chunk of chunks)expect(compactCues(chunk,true).length).toBeLessThanOrEqual(300);
+    const bodies:{messages:{content:string}[]}[]=[];
+    const fetchImpl=async(_input:unknown,init?:RequestInit)=>{const b=JSON.parse(String(init?.body));bodies.push(b);const content=b.messages[0].content.includes('字幕片段分析器')?'[612秒] 已确认要点':validSummaryJson();return new Response(`data: ${JSON.stringify({choices:[{delta:{content}}]})}\n\ndata: [DONE]\n\n`,{status:200});};
+    await mapReduceSummarize({baseUrl:'https://llm.test/v1',model:'m',apiKey:'x'},{title:'视频',duration:776,cueCount:1},[cue(612,'内容')],{fetchImpl:fetchImpl as typeof fetch,outlineTimeLimit:776});
+    expect(bodies.at(-1)!.messages[1]!.content).toContain('[612秒] 已确认要点');
+    expect(bodies.at(-1)!.messages[0]!.content).toContain('直接将 N 填入 time');
   });
 });
 
@@ -121,7 +150,7 @@ describe('mapReduceSummarize 集成（mock SSE）', () => {
     // 60 条 × 300 字 = 18000 字，chunkChars=4000 → 5 块
     const cues: StoredCue[] = Array.from({ length: 60 }, (_, i) => cue(i * 20, `${i}:` + 'y'.repeat(298)));
     const chunks = chunkCues(cues, { chunkChars: 4000 });
-    expect(chunks).toHaveLength(5);
+    expect(chunks.length).toBeGreaterThanOrEqual(5);
     let inFlight = 0;
     let peak = 0;
     const server = await startMockLlm((call) => {

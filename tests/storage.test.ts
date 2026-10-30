@@ -175,3 +175,32 @@ describe('wipeAllData（F10 清除事务）', () => {
     await db.delete();
   });
 });
+
+it('未完成的 ASR 片段不能作为完整转写缓存，旧记录仍可使用', async () => {
+  const db=freshDb();const row={key:'BV:1',source:'asr' as const,lan:'asr',cues:[{from:0,to:1,text:'内容'}],charCount:2,cachedAt:100};
+  await db.transcripts.put({...row,asrComplete:false});
+  expect(await getFreshTranscript(db,row.key,100)).toBeUndefined();
+  await db.transcripts.put(row);expect(await getFreshTranscript(db,row.key,100)).toBeDefined();
+  await db.transcripts.put({...row,asrComplete:true});expect(await getFreshTranscript(db,row.key,100)).toBeDefined();
+  await db.delete();
+});
+
+it('结束会话安全中断其语音任务并保留局部结果，不影响其他会话同视频任务', async () => {
+ const db=freshDb();const job=(id:string,sessionId:string,status:'running'|'pending')=>({id,sessionId,videoKey:'v',type:'ASR_SUMMARIZE' as const,status,runId:id+'-lease',progress:20,retries:0,createdAt:1,updatedAt:1});
+ await db.jobs.bulkPut([job('old','old','running'),job('old-pending','old','pending'),job('new','new','running')]);
+ const summary=(key:string,sessionId:string)=>({key,videoKey:'v',source:'asr' as const,summary:'',outline:[],evaluation:'',rating:0,modelId:key,persona:'spicy',status:'streaming' as const,createdAt:1,asrProgress:{sessionId,processedUntil:29,targetDuration:120,status:'running' as const,parts:[{from:0,to:29,text:'先前内容'}]}});
+ await db.summaries.bulkPut([summary('v:old','old'),summary('v:new','new')]);
+ const {interruptSessionAsr}=await import('../src/lib/storage');expect(await interruptSessionAsr(db,'old',99)).toBe(2);
+ expect(await db.jobs.get('old')).toMatchObject({status:'failed',error:{code:'ASR_INTERRUPTED'},updatedAt:99});expect((await db.jobs.get('old'))?.runId).toBeUndefined();
+ expect(await db.jobs.get('old-pending')).toMatchObject({status:'failed'});expect(await db.jobs.get('new')).toMatchObject({status:'running',runId:'new-lease'});
+ expect(await db.summaries.get('v:old')).toMatchObject({status:'need_asr',asrProgress:{sessionId:'old',status:'partial',processedUntil:29,parts:[{text:'先前内容'}]}});
+ expect((await db.summaries.get('v:old'))?.asrProgress?.warning).toContain('费用');expect(await db.summaries.get('v:new')).toMatchObject({status:'streaming',asrProgress:{sessionId:'new',status:'running'}});await db.delete();
+});
+
+it('结束会话状态和语音中断可以在同一数据库事务中回滚', async () => {
+ const db=freshDb();await db.sessions.put({id:'s',state:'ACTIVE',startedAt:1,lastActiveAt:1});
+ await db.jobs.put({id:'j',sessionId:'s',videoKey:'v',type:'ASR_SUMMARIZE',status:'running',runId:'r',progress:0,retries:0,createdAt:1,updatedAt:1});
+ const {interruptSessionAsr}=await import('../src/lib/storage');
+ await expect(db.transaction('rw',db.sessions,db.jobs,db.summaries,async()=>{await db.sessions.update('s',{state:'GRACE'});await interruptSessionAsr(db,'s',99);throw new Error('rollback');})).rejects.toThrow('rollback');
+ expect((await db.sessions.get('s'))?.state).toBe('ACTIVE');expect(await db.jobs.get('j')).toMatchObject({status:'running',runId:'r'});await db.delete();
+});

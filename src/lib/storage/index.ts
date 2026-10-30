@@ -47,7 +47,7 @@ export async function getFreshTranscript(
   now = Date.now(),
 ): Promise<TranscriptRow | undefined> {
   const row = await db.transcripts.get(key);
-  return row && isCacheFresh(row.cachedAt, now) ? row : undefined;
+  return row && row.asrComplete !== false && isCacheFresh(row.cachedAt, now) ? row : undefined;
 }
 
 // ---- visits（列表数据源；WATCH_TICK 高频写，节流由 watcher 侧负责） ----------
@@ -105,6 +105,30 @@ export async function updateVisitProgress(
 }
 
 export const summaryKey = (videoKey: string, modelId: string): string => `${videoKey}:${modelId}`;
+
+/** 结束陪看时撤销该会话的语音任务租约；可嵌套在包含 jobs/summaries 的会话事务中。 */
+export async function interruptSessionAsr(db: CompanionDB, sessionId: string, now = Date.now()): Promise<number> {
+  return db.transaction('rw', db.jobs, db.summaries, async () => {
+    const jobs = (await db.jobs.where('status').anyOf('pending', 'running').toArray())
+      .filter(job => job.type === 'ASR_SUMMARIZE' && job.sessionId === sessionId);
+    const videoKeys = new Set<string>();
+    for (const job of jobs) {
+      videoKeys.add(job.videoKey);
+      const { runId: _runId, ...rest } = job;
+      await db.jobs.put({ ...rest, status:'failed', error:{code:'ASR_INTERRUPTED',msg:'陪看已结束，在途语音可能产生费用，重新识别前请确认'}, updatedAt:now });
+    }
+    for (const videoKey of videoKeys) {
+      const summaries = await db.summaries.where('videoKey').equals(videoKey).toArray();
+      for (const summary of summaries) {
+        const progress = summary.asrProgress;
+        // 没有所属会话时无法证明是旧会话，不能修改另一个会话的结果。
+        if (!progress || progress.sessionId !== sessionId || progress.status !== 'running' || summary.status === 'done') continue;
+        await db.summaries.put({ ...summary, status:'need_asr', asrProgress:{...progress,status:'partial',warning:'陪看已结束，在途语音费用状态不明，重新识别前请确认'} });
+      }
+    }
+    return jobs.length;
+  });
+}
 
 // ---- 清除事务（F10 · 02-数据模型 §5） ----------------------------------------
 // broadcast(SESSION_STATE) 属会话层（任务 2.1），由调用方在 wipe 后自行触发。

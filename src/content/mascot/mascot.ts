@@ -39,8 +39,13 @@ export interface MascotDeps {
 }
 
 const STATES: MascotState[] = ['idle', 'happy', 'thinking', 'note', 'sleep'];
+const isInvalidated = (error: unknown): boolean => error instanceof Error && error.message.includes('Extension context invalidated');
+const reportStorageError = (error: unknown): void => {
+  if (!isInvalidated(error)) console.error('[doubao] mascot storage failed', error);
+};
 
 export class MascotController {
+  readonly #assetUrls = new Map<MascotState, string>();
   #state: MascotState = 'idle';
   #session: UiSessionState = 'INACTIVE';
   /** P2.5：隐藏豆包（本次会话）——content 内存态，不落盘。 */
@@ -80,13 +85,15 @@ export class MascotController {
     // 预加载五态图（切换不闪白，原型同款）
     for (const s of STATES) {
       const pre = root.ownerDocument.createElement('img');
-      pre.src = deps.assetUrl(`/mascot/mascot-${s}.png`);
+      const url = deps.assetUrl(`/mascot/mascot-${s}.png`);
+      this.#assetUrls.set(s, url);
+      pre.src = url;
     }
     wrap.classList.remove('hidden');
-    img.src = deps.assetUrl(`/mascot/mascot-idle.png`);
+    img.src = this.#assetUrls.get('idle')!;
     // 同步先落默认位，异步 storage 覆盖（避免 fixed 静态位闪一帧再跳位——审查 P2）
     this.#applyPos(defaultMascotPos(this.#viewport().vw, this.#viewport().vh));
-    void this.#restorePos();
+    void this.#restorePos().catch(reportStorageError);
     this.#bindDrag();
     // P1.9 准则#1：hover/按压即恢复全透明并重计闲时
     wrap.addEventListener('pointerenter', () => this.#wake());
@@ -143,7 +150,7 @@ export class MascotController {
   setState(st: MascotState): void {
     this.#state = st;
     this.#el.mascot.className = `st-${st}`;
-    this.#el.img.src = this.deps.assetUrl(`/mascot/mascot-${st}.png`);
+    this.#el.img.src = this.#assetUrls.get(st)!;
   }
 
   get state(): MascotState {
@@ -205,7 +212,12 @@ export class MascotController {
    */
   async say(text: string, ms = BUBBLE_MS, kind?: string): Promise<void> {
     if (this.#hidden) return; // P2.5：隐藏豆包期间气泡静默（计时/生成不受影响）
-    if (!(await this.deps.bubblesEnabled())) return;
+    try {
+      if (!(await this.deps.bubblesEnabled())) return;
+    } catch (error) {
+      if (isInvalidated(error)) return;
+      throw error;
+    }
     if (isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
     if (kind) {
       const now = Date.now();
@@ -351,7 +363,11 @@ export class MascotController {
           this.#snapTimer = null;
           this.#el.wrap.classList.remove('snapping');
         }, 250);
-        void this.deps.storage.set('mascotPos', toRelative(snapped.x, snapped.y, vw, vh));
+        try {
+          void this.deps.storage.set('mascotPos', toRelative(snapped.x, snapped.y, vw, vh)).catch(reportStorageError);
+        } catch (error) {
+          reportStorageError(error);
+        }
         this.#wake();
       } else {
         this.#onClick();

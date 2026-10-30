@@ -28,7 +28,7 @@ export interface OnboardingDeps {
 
 const field = (dataF: string, label: string, placeholder: string, type = 'text'): string =>
   `<div class="field" data-f="${dataF}"><label>${label}</label>` +
-  `<input type="${type}" data-k="${dataF}" placeholder="${esc(placeholder)}">` +
+  `<input type="${type}" data-k="${dataF}" aria-label="${label}" placeholder="${esc(placeholder)}">` +
   `<div class="field-err">请填写 ${label}</div></div>`;
 
 export function openOnboarding(deps: OnboardingDeps): void {
@@ -40,16 +40,16 @@ export function openOnboarding(deps: OnboardingDeps): void {
 
   const asrOnly = deps.asrOnly === true;
   const m = root.ownerDocument.createElement('div');
-  m.className = 'modal';
+  m.className = 'modal modal-onboarding';
   m.innerHTML =
     `<div class="modal-head">` +
     `<div class="m-emoji"><img src="${deps.assetUrl('/mascot/mascot-happy.png')}" alt="豆包" style="width:52px;height:52px;border-radius:12px;display:block"></div>` +
-    `<div><h2>${asrOnly ? '补配 ASR 语音转写' : '欢迎使用豆包！'}</h2><p>${asrOnly ? 'LLM 已配置（沿用当前配置）。配置 ASR 后即可解析无字幕视频，回到卡片点【调用 ASR 解析】继续。' : '开始陪看前，请先配置一个大模型（必填）。所有数据只保存在你的浏览器本机，摘要调用直连你自己的 API。'}</p></div>` +
+    `<div><h2>${asrOnly ? '配置 ASR 语音转写' : '欢迎使用豆包！'}</h2><p>${asrOnly ? '通用 LLM 配置会保留。' : '开始陪看前请配置大模型。数据保存在本机，摘要请求直连你选择的服务。'}</p></div>` +
     `</div>` +
     `<div class="modal-body"><div>` +
     (asrOnly
-      ? `<div class="m-step"><h4><span class="step-num">1</span> 通用 LLM <span class="set-tag tag-optional">已配置 · 沿用</span></h4><div class="set-desc">无需改动，本次仅保存 ASR 配置。</div></div>`
-      : `<div class="m-step" id="ob-llm"><h4><span class="step-num">1</span> 通用 LLM（必填）<span class="set-tag tag-required">用于摘要与点评</span></h4>` +
+      ? ''
+      : `<div class="m-step" id="ob-llm"><h4>通用 LLM <span class="set-tag tag-required">必填</span></h4>` +
         `<div class="set-desc">兼容 OpenAI 协议的服务均可，例如 DeepSeek / 火山方舟。</div>` +
         field('baseUrl', 'Base URL', 'https://api.deepseek.com/v1') +
         field('modelId', 'Model ID', 'deepseek-chat') +
@@ -57,16 +57,16 @@ export function openOnboarding(deps: OnboardingDeps): void {
         `<div class="set-row-btns"><button class="btn btn-ghost" id="ob-test">测试连接</button></div>` +
         `<div class="test-status hidden" id="ob-test-status"></div>` +
         `</div>`) +
-    `<div class="m-step" id="ob-asr"><h4><span class="step-num">2</span> ASR 语音转写${asrOnly ? '（必填）' : '（可选）'}<span class="set-tag ${asrOnly ? 'tag-required' : 'tag-optional'}">用于无字幕视频</span></h4>` +
-    `<div class="set-desc">${asrOnly ? '用于「无字幕」视频的语音转写。' : '可稍后在「设置」中配置，不影响有字幕视频的摘要。'}</div>` +
-    (asrOnly ? `<div class="set-row-btns"><button class="btn btn-ghost" id="ob-test-asr">测试连接</button></div><div class="test-status hidden" id="ob-test-status"></div>` : '') +
+    `<div class="m-step" id="ob-asr"><h4>ASR 语音转写 <span class="set-tag ${asrOnly ? 'tag-required' : 'tag-optional'}">${asrOnly ? '必填' : '可选'}</span></h4>` +
+    `<div class="set-desc">配置并授权后，无可用中文字幕的视频会自动下载完整音频并发送至所选语音服务，可能消耗额度或提前剧透。识别中断、费用状态不明或结果冲突时需确认后处理。</div>` +
+    `<label class="model-provider">服务类型 <select id="ob-asr-provider"><option value="openai-compatible">OpenAI 兼容</option><option value="doubao-agent-plan">豆包 Agent Plan</option></select></label>` +
     field('baseUrl', 'Base URL', 'https://api.siliconflow.cn/v1') +
     field('modelId', 'Model ID', 'FunAudioLLM/SenseVoiceSmall') +
-    field('apiKey', 'API Key', asrOnly ? 'sk-...（仅保存在本机）' : '选填', 'password') +
+    field('apiKey', 'API Key', 'sk-...', 'password') +
+    (asrOnly ? `<div class="set-row-btns"><button class="btn btn-ghost" id="ob-test-asr">测试连接</button></div><div class="test-status hidden" id="ob-test-status"></div>` : '') +
     `<div class="field-err" id="ob-asr-err" style="display:none;color:#ef4444;font-size:11px"></div>` +
     `</div>` +
-    `<div class="m-step step-disabled"><h4><span class="step-num gray">3</span> TTS 语音合成 <span class="set-tag tag-reserved">当前版本暂不启用</span></h4>` +
-    `<div class="set-desc">预留位：未来版本豆包可以用你自己的 TTS 模型开口说话。</div></div>` +
+    (asrOnly ? '' : `<div class="m-step step-disabled"><h4>TTS 语音合成 <span class="set-tag tag-reserved">暂不可用</span></h4></div>`) +
     `</div></div>` +
     `<div class="modal-foot">` +
     `<button class="btn btn-ghost" id="ob-cancel">${asrOnly ? '取消' : '稍后再说'}</button>` +
@@ -80,10 +80,18 @@ export function openOnboarding(deps: OnboardingDeps): void {
     const sec = m.querySelector(`#${id}`);
     const out: ModelConfigInput = { baseUrl: '', modelId: '', apiKey: '' };
     sec?.querySelectorAll<HTMLInputElement>('input[data-k]').forEach((inp) => {
-      out[inp.getAttribute('data-k') as keyof ModelConfigInput] = inp.value.trim();
+      const key = inp.getAttribute('data-k');
+      if (key === 'baseUrl' || key === 'modelId' || key === 'apiKey') out[key] = inp.value.trim();
     });
+    if (id === 'ob-asr') out.provider = m.querySelector<HTMLSelectElement>('#ob-asr-provider')?.value === 'doubao-agent-plan' ? 'doubao-agent-plan' : 'openai-compatible';
     return out;
   };
+  m.querySelector<HTMLSelectElement>('#ob-asr-provider')?.addEventListener('change', (event) => {
+    const doubao = (event.currentTarget as HTMLSelectElement).value === 'doubao-agent-plan';
+    m.querySelectorAll<HTMLElement>('#ob-asr [data-f="baseUrl"], #ob-asr [data-f="modelId"]').forEach(el => { el.style.display = doubao ? 'none' : ''; });
+    const key = m.querySelector<HTMLInputElement>('#ob-asr input[data-k="apiKey"]');
+    if (key) key.value = '';
+  });
   const markErrors = (id: string, missing: string[]): void => {
     m.querySelectorAll(`#${id} .field`).forEach((f) => {
       const k = f.getAttribute('data-f') ?? '';

@@ -74,7 +74,7 @@ export function normalizeTranscription(
         text: (s.text ?? '').trim(),
       }))
       .filter((c) => c.text);
-    return { cues, text: text || cues.map((c) => c.text).join('') };
+    return { cues, text: text || cues.map((c) => c.text).join(' ') };
   }
   if (!text) return { cues: [], text: '' };
   return { cues: [{ from: 0, to: Math.max(1, fallbackDurationSec), text }], text };
@@ -83,6 +83,7 @@ export function normalizeTranscription(
 // ---- 上传（OpenAI-compatible /audio/transcriptions，multipart） --------------------
 
 export interface AsrConfig {
+  provider?: 'openai-compatible' | 'doubao-agent-plan';
   baseUrl: string;
   modelId: string;
   apiKey: string;
@@ -101,24 +102,29 @@ export class AsrHttpError extends Error {
 export interface TranscribeDeps {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 /** multipart 上传（offscreen DOM 环境有 FormData/Blob）；响应归一化为 cues。
- *  错误：401/403→Key 无效；413/超时→视频过长口径；5xx/网络→通用失败。 */
+ *  错误：401/403→Key 无效；413→音频超限；超时和网络错误分别提示。 */
 export async function transcribeAudio(
   cfg: AsrConfig,
   audio: { bytes: ArrayBuffer; filename: string },
   durationSec: number,
   deps: TranscribeDeps = {},
-): Promise<{ cues: StoredCue[]; text: string }> {
+): Promise<{ cues: StoredCue[]; text: string; timestampsValid: boolean }> {
+  if (cfg.provider === 'doubao-agent-plan') throw new Error('ASR_DOUBAO_REQUIRES_PCM');
   const fetchImpl = deps.fetchImpl ?? fetch.bind(globalThis);
   const form = new FormData();
   form.append('file', new Blob([audio.bytes]), audio.filename);
   form.append('model', cfg.modelId);
   form.append('response_format', 'verbose_json');
   const controller = new AbortController();
+  const cancel = () => controller.abort('cancelled');
+  deps.signal?.addEventListener('abort', cancel, {once:true});
   const timer = setTimeout(() => controller.abort('timeout'), deps.timeoutMs ?? 120_000);
   try {
+    if (deps.signal?.aborted) throw new Error('ASR_CANCELLED');
     const res = await fetchImpl(`${cfg.baseUrl.replace(/\/+$/, '')}/audio/transcriptions`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${cfg.apiKey}` },
@@ -130,13 +136,24 @@ export async function transcribeAudio(
       // Key 剔除 + 截断，与 llm/client 同口径
       throw new AsrHttpError(res.status, bodyText.split(cfg.apiKey).join('***').slice(0, 120));
     }
-    return normalizeTranscription(await res.json(), durationSec);
+    const body = await res.json();
+    const result = normalizeTranscription(body, durationSec);
+    const segments = Array.isArray(body?.segments) ? body.segments.filter((s: VerboseSegment) => typeof s?.text === 'string' && s.text.trim()) : [];
+    let previousStart = -1;
+    const timestampsValid = segments.length > 0 && Number.isFinite(durationSec) && durationSec > 0 && segments.every((s: VerboseSegment) => {
+      if (typeof s.start !== 'number' || typeof s.end !== 'number' || !Number.isFinite(s.start) || !Number.isFinite(s.end) || s.start < 0 || s.end <= s.start || s.end > durationSec || s.start < previousStart) return false;
+      previousStart = s.start;
+      return true;
+    });
+    return { ...result, timestampsValid };
   } catch (e) {
+    if (deps.signal?.aborted) throw new Error('ASR_CANCELLED');
     if (e instanceof AsrHttpError) throw e;
     const aborted = controller.signal.aborted;
     throw new Error(aborted ? 'ASR_TIMEOUT' : `ASR_NETWORK:${String(e).slice(0, 100)}`);
   } finally {
     clearTimeout(timer);
+    deps.signal?.removeEventListener('abort', cancel);
   }
 }
 
@@ -148,7 +165,8 @@ export function mapAsrError(e: unknown): { code: string; msg: string } {
     return { code: 'ASR_HTTP', msg: `ASR HTTP ${e.status}: ${e.body.slice(0, 80)}` };
   }
   const s = String(e);
-  if (s.includes('ASR_TIMEOUT')) return { code: 'AUDIO_TOO_LARGE', msg: '视频过长暂不支持（转写超时）' };
+  if (s.includes('ASR_DOUBAO_REQUIRES_PCM')) return { code: 'ASR_NOT_READY', msg: '豆包视频语音处理尚未接入，请等待后续版本' };
+  if (s.includes('ASR_TIMEOUT')) return { code: 'ASR_TIMEOUT', msg: '语音识别请求超时，可能已产生费用，请确认后重试' };
   if (s.includes('ASR_NETWORK')) return { code: 'ASR_NETWORK', msg: 'ASR 端点无法连接，请检查配置' };
   return { code: 'UNKNOWN', msg: s.slice(0, 150) };
 }

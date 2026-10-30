@@ -56,6 +56,10 @@ export interface TranscriptRow {
   cues: StoredCue[];
   charCount: number;
   cachedAt: number; // 缓存 24h
+  asrComplete?: boolean; // 缺省为旧版完整转写，false 表示仅有已完成片段。
+  asrParts?: { start: number; end: number; result: import('../asr/doubao').DoubaoResult; cues: StoredCue[]; whole?: boolean; serviceDurationMs?: number }[];
+  asrDuration?: number; // 本次实际音轨处理范围，可能与视频整数时长略有差异。
+  asrPending?: { start: number; end: number }; // 发送中或中断后计费状态不明的片段
 }
 
 export type SummaryStatus = 'streaming' | 'done' | 'failed' | 'need_asr';
@@ -84,9 +88,21 @@ export interface SummaryRow {
   modelId: string;
   persona: string;
   segmentNotes?: { [segIndex: number]: SegmentNote }; // F13（任务 1.11）
+  asrProgress?: { sessionId?: string; processedUntil: number; targetDuration: number; status: 'running' | 'partial' | 'done'; parts: { from: number; to: number; text: string }[]; unconfirmed?: { from: number; to: number; text: string }[]; warning?: string };
   status: SummaryStatus;
   error?: SummaryError;
   createdAt: number;
+  /** 另一模型的摘要仍基于恢复前的旧语音转写。 */
+  asrOutdated?: boolean;
+}
+
+export interface AsrRecovery {
+  /** 期望的原始数据快照：仅在其未被修改时提交候选。 */
+  original: TranscriptRow;
+  candidate?: TranscriptRow;
+  progress?: SummaryRow['asrProgress'];
+  pending?: boolean;
+  committed?: boolean;
 }
 
 export type JobType = 'SUMMARIZE' | 'ASR_SUMMARIZE' | 'REGENERATE' | 'SEGMENT_ANALYZE';
@@ -101,12 +117,14 @@ export interface JobRow {
   segIndex?: number; // SEGMENT_ANALYZE 的段下标（幂等键一部分，F13）
   prio?: number; // -1=用户主动摘要；缺省/0=常规；1=分段预取。数字越小越优先。
   status: JobStatus;
+  runId?: string; // 每次实际执行的租约；恢复或重试后，旧执行体不得再写任务状态。
   stage?: JobStage;
   progress: number; // 0–100
   retries: number; // ≤1 自动重试
   error?: { code: string; msg: string }; // 失败原因（failed 终态写入；摘要以 summaries.error 为权威，分段早退等执行体未写注记的路径由终态广播读此兜底）
   createdAt: number;
   updatedAt: number;
+  recovery?: AsrRecovery;
 }
 
 // ---- Dexie schema ----------------------------------------------------------

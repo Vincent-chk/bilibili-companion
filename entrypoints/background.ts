@@ -9,6 +9,7 @@ import { Pipeline, type JobContext, type JobOutcome } from '../src/lib/pipeline'
 import {
   CompanionDB,
   getSessionPointer,
+  interruptSessionAsr,
   isCacheFresh,
   setSessionPointer,
   updateVisitProgress,
@@ -23,17 +24,21 @@ import { browserKv } from '../src/lib/storage/browserKv';
 import { applyRetention, retainUntilOf, sessionStartBlockedReason, type RetentionResult } from '../src/lib/session';
 import type { SessionPointer } from '../src/lib/storage';
 import { excerptOf } from '../src/content/panel/view-models';
-import { validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
+import { originPattern, validateAsr, validateEndpointUrl, validateLlm } from '../src/content/onboarding/onboarding-logic';
 import { clampThreshold, maskApiKey, resolveApiKey, sanitizePersona } from '../src/content/panel/settings-logic';
 import { buildVideoUrl, pickSeekTab, type SeekTabCandidate } from '../src/content/seek';
 import { parseVideoKey } from '../src/lib/summarize/chain';
 import { segmentsToPrefetch } from '../src/lib/summarize/segment';
 import { buildRefererRules, DNR_RULE_IDS } from '../src/lib/dnr';
+import { DOUBAO_ASR_ENDPOINT, DOUBAO_ASR_MODEL, DOUBAO_ASR_ORIGIN, DOUBAO_ASR_RESOURCE, DOUBAO_RULE_ID, hasAsrSemanticMismatch, isRecoveryCandidate } from '../src/lib/asr/doubao';
 import { checkForUpdate, isNewerVersion, type UpdateRecord } from '../src/lib/update';
 
 const db = new CompanionDB();
 let settingsSaveTail: Promise<void> = Promise.resolve();
 let browserSessionReady: Promise<void> = Promise.resolve();
+let recoveryReady: Promise<number> = Promise.resolve(0);
+let doubaoRuleTail: Promise<void> = Promise.resolve();
+let wipesInProgress = 0;
 
 // 所有 B 站 API 请求（含 offscreen）在 SW 排队，跨实例共享限速与 60 秒风控冷却。
 let biliRiskUntil = 0;
@@ -157,8 +162,8 @@ async function ensureOffscreen(): Promise<void> {
     }
     await browser.offscreen.createDocument({
       url: 'offscreen.html', // WXT 构建产物路径（entrypoints/offscreen/index.html → 根 offscreen.html）
-      reasons: ['DOM_PARSER' as never],
-      justification: 'LLM SSE 长任务执行体：规避 service worker 30s 空闲休眠',
+      reasons: ['DOM_PARSER' as never, 'BLOBS' as never, 'WORKERS' as never],
+      justification: '执行摘要与用户确认的音频分段处理',
     });
     offscreenReady = true;
   } catch (e) {
@@ -192,8 +197,36 @@ async function sendToOffscreen(payload: Record<string, unknown>): Promise<unknow
   throw lastErr;
 }
 
-async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOutcome> {
+export async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOutcome> {
   if (await isPaused()) return { result: 'wait', error: { code: 'PAUSED', msg: '陪看已暂停' } };
+  const asrSnapshot = job.type === 'ASR_SUMMARIZE' ? (await readSettings()).asr : undefined;
+  if (job.type === 'ASR_SUMMARIZE' && !job.recovery?.candidate?.asrComplete) {
+    const cfg = asrSnapshot;
+    const blocked = async (code:'NEED_ASR_CONFIG'|'ASR_PERMISSION_DENIED'):Promise<JobOutcome> => {
+      const msg = code === 'NEED_ASR_CONFIG' ? '请先配置语音识别服务' : '语音服务未获授权，请到设置中授权后重试';
+      await db.transaction('rw',db.jobs,db.summaries,async()=>{
+        const current=await db.jobs.get(job.id);
+        if(current?.status!=='running'||current.runId!==job.runId)return;
+        const rows=await db.summaries.where('videoKey').equals(job.videoKey).toArray();
+        const summary=rows.sort((a,b)=>b.createdAt-a.createdAt)[0];
+        if(summary?.status==='need_asr')await db.summaries.put({...summary,error:{code,msg}});
+      });
+      return {result:'failed',error:{code:code==='NEED_ASR_CONFIG'?'ASR_NOT_SENT_CONFIG':'ASR_NOT_SENT_PERMISSION',msg}};
+    };
+    if (!cfg || validateAsr(cfg).kind !== 'ok') return blocked('NEED_ASR_CONFIG');
+    const origin = cfg.provider === 'doubao-agent-plan' ? DOUBAO_ASR_ORIGIN : originPattern(cfg.baseUrl);
+    if (!origin || !(await browser.permissions.contains({origins:[origin]}))) return blocked('ASR_PERMISSION_DENIED');
+  }
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let watchdogReject: ((error: Error) => void) | undefined;
+  const watchdogError = new Error('offscreen 执行超时');
+  let timedOut = false;
+  const refreshWatchdog = () => {
+    if (!watchdogReject || timedOut) return;
+    if (watchdog !== undefined) clearTimeout(watchdog);
+    // 语音协议自身最多 600 秒，留出 60 秒供任务状态收口；后续摘要进度同样重置。
+    watchdog = setTimeout(() => { timedOut = true; watchdogReject?.(watchdogError); }, job.type === 'ASR_SUMMARIZE' ? 660_000 : 600_000);
+  };
   const onProgress = (msg: unknown) => {
     const m = msg as {
       type?: string;
@@ -202,7 +235,8 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
       progress?: number;
       deltaText?: string;
     };
-    if (m?.type === 'SUMMARY_PROGRESS' && m.jobId === job.id) {
+    if (!timedOut && m?.type === 'SUMMARY_PROGRESS' && m.jobId === job.id) {
+      if (job.type === 'ASR_SUMMARIZE') refreshWatchdog();
       const patch: { stage?: JobStage; progress?: number } = {};
       if (m.stage !== undefined) patch.stage = m.stage;
       if (m.progress !== undefined) patch.progress = m.progress;
@@ -221,7 +255,6 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
     }
   };
   browser.runtime.onMessage.addListener(onProgress);
-  let watchdog: ReturnType<typeof setTimeout> | undefined;
   try {
     await ensureOffscreen();
     // offscreen 文档读不了 storage（API 受限）：LLM/ASR 配置与 persona 在 SW 解析后随 job 传入
@@ -232,17 +265,18 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
     const reply = (await Promise.race([
       sendToOffscreen({
         type: 'OFFSCREEN_RUN_JOB',
-        job: { id: job.id, videoKey: job.videoKey, type: job.type, segIndex: job.segIndex },
+        job: { id: job.id, videoKey: job.videoKey, type: job.type, segIndex: job.segIndex, sessionId: job.sessionId, runId: job.runId, ...(job.recovery ? {recovery:job.recovery} : {}) },
         llm: config,
         persona: settings.persona,
         // P2.3：ASR 配置仅 ASR_SUMMARIZE 需要（Key 只进 SW/offscreen 内存，消息为扩展内部通道）
-        ...(job.type === 'ASR_SUMMARIZE' && settings.asr
-          ? { asr: settings.asr, asrMaxMB: clamp(settings.asrMaxMB ?? 25, 1, 100) }
+        ...(job.type === 'ASR_SUMMARIZE' && asrSnapshot
+          ? { asr: asrSnapshot, asrMaxMB: clamp(settings.asrMaxMB ?? 25, 1, 100) }
           : {}),
         timeoutMs,
       }),
       new Promise<never>((_, rej) => {
-        watchdog = setTimeout(() => rej(new Error('offscreen 执行超时(600s)')), 600_000);
+        watchdogReject = rej;
+        refreshWatchdog();
       }),
     ])) as JobOutcome | undefined;
     if (reply && reply.result === 'failed') {
@@ -258,6 +292,33 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
     }
     return reply;
   } catch (e) {
+    if (e === watchdogError && job.type === 'ASR_SUMMARIZE') {
+      const row = await db.transaction('rw', db.jobs, db.summaries, async () => {
+        const current = await db.jobs.get(job.id);
+        if (!current || current.status !== 'running' || current.runId !== job.runId) return undefined;
+        const { runId: _runId, ...rest } = current;
+        const failed: JobRow = { ...rest, status:'failed', error:{code:'ASR_INTERRUPTED',msg:'语音处理超时，已发送部分可能产生费用，请确认后再重试'}, updatedAt:Date.now() };
+        await db.jobs.put(failed);
+        const summaries = await db.summaries.where('videoKey').equals(job.videoKey).toArray();
+        for (const summary of summaries) {
+          const progress = summary.asrProgress;
+          if (summary.status !== 'done' && progress?.sessionId === job.sessionId && progress.status === 'running') {
+            await db.summaries.put({...summary,status:'need_asr',asrProgress:{...progress,status:'partial',warning:'语音处理超时，在途语音费用状态不明，重新识别前请确认'}});
+          }
+        }
+        return failed;
+      }).catch(error => {
+        // 即使数据库出错，也要尽力停止可能仍在计费的离屏任务。
+        void browser.runtime.sendMessage({type:'OFFSCREEN_CANCEL_ASR',sessionId:job.sessionId}).catch(() => {});
+        throw error;
+      });
+      if (row) {
+        // 仅通知已存在的离屏文档，不能为了取消创建新文档或等待不响应的通道。
+        void browser.runtime.sendMessage({type:'OFFSCREEN_CANCEL_ASR',sessionId:job.sessionId}).catch(() => {});
+        onJobTransition(row);
+      }
+      return {result:'failed',error:{code:'ASR_INTERRUPTED',msg:'语音处理超时，已发送部分可能产生费用，请确认后再重试'}};
+    }
     if (await isPaused()) return { result: 'wait', error: { code: 'PAUSED', msg: '陪看已暂停' } };
     console.log(`[doubao] offscreen executor error: ${String(e).slice(0, 200)}`);
     offscreenReady = false; // offscreen 文档可能已被系统回收：下次执行重建
@@ -269,7 +330,7 @@ async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise<JobOut
 }
 
 const lastLoggedStatus = new Map<string, string>();
-const onJobTransition = (j: JobRow): void => {
+export const onJobTransition = (j: JobRow): void => {
   if (j.status === 'done' || j.status === 'failed' || j.status === 'need_confirm') {
     void browser.storage.session.remove(`manualJob:${j.id}`).catch(() => {});
   }
@@ -300,20 +361,24 @@ const onJobTransition = (j: JobRow): void => {
     // F13 预取提速：摘要落库（大纲+转写已就绪）→ 静默入队未解读段（交互链 prio=1 后台消化，
     // 用户点【AI 解读】时大概率缓存命中秒开）
     if (j.status === 'done') void prefetchSegments(j);
+    if (j.status === 'need_confirm' && j.type === 'SUMMARIZE') {
+      // 迁移回调发生在 IndexedDB 事务内；提交后再判定，避免并发确认和事务失效。
+      setTimeout(() => { void tryAutoAsr(j.id,true).catch(() => {}); }, 0);
+    }
   }
 };
 // 用户在保留期内主动发起的任务仅在本次浏览器运行期间可执行；SW 休眠不会丢失标记。
 async function allowManualJob(job: JobRow): Promise<void> {
   await browser.storage.session.set({ [`manualJob:${job.id}`]: true });
 }
-async function canRunJob(job: JobRow): Promise<boolean> {
+async function canRunJob(job: JobRow): Promise<boolean | {allowInGrace:boolean}> {
   if (await isPaused()) return false;
   const pointer = await getSessionPointer(browserKv);
   if (!pointer || pointer.sessionId !== job.sessionId) return false;
-  if (pointer.state === 'ACTIVE') return true;
-  if (pointer.state !== 'GRACE') return false;
+  if (pointer.state !== 'ACTIVE' && pointer.state !== 'GRACE') return false;
   const key = `manualJob:${job.id}`;
-  return (await browser.storage.session.get(key))[key] === true;
+  const manual = (await browser.storage.session.get(key))[key] === true;
+  return pointer.state === 'ACTIVE' || manual ? {allowInGrace:manual} : false;
 }
 // F13 提速：双通道并行——主链（摘要/重生成/ASR，B 站侧串行）+ 交互链（分段解读）。
 // 用户点击分段解读不再排在数分钟的摘要任务之后；每链并发=1（总 LLM 并发≤2）。
@@ -321,12 +386,66 @@ const pipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   lane: ['SUMMARIZE', 'ASR_SUMMARIZE', 'REGENERATE'],
   onTransition: onJobTransition,
   canRun: canRunJob,
+  enforceSession: true,
 });
 const segPipeline = new Pipeline(db, { execute: executeViaOffscreen }, {
   lane: ['SEGMENT_ANALYZE'],
   onTransition: onJobTransition,
   canRun: canRunJob,
+  enforceSession: true,
 });
+
+async function finishOffscreenAsr(id?:string, runId?:string, outcome?:JobOutcome):Promise<{ok:boolean}> {
+  if (!id || !runId || !outcome || !['done','failed','wait','need_confirm'].includes(outcome.result)) return {ok:false};
+  // 离屏返回内容不可直接回显：仅允许已知错误码对应的固定、脱敏提示。
+  const messages:Record<string,string> = {
+    ASR_DURATION_LIMIT:'当前豆包语音最多支持 15 分钟的视频，暂不能处理更长的音轨。',
+    ASR_AUDIO_TOO_LONG:'当前豆包语音最多支持 15 分钟的音轨。',
+    ASR_AUDIO_CHANNEL_UNSUPPORTED:'该音轨声道格式暂不支持。',
+    ASR_AUDIO_INCOMPLETE:'音频解码不完整，暂不能识别，请稍后重试。',
+    ASR_TIMEOUT:'语音识别请求超时，可能已产生费用，请确认后重试。',
+    ASR_SEND_TIMEOUT:'音频发送超时，请检查网络后重新确认。',
+    ASR_SERVICE_45000081:'语音服务等待音频包超时，识别未完成。',
+    ASR_SERVICE_DURATION_UNKNOWN:'语音服务未返回已处理时长，无法确认全片结果。',
+    ASR_SERVICE_DURATION_MISMATCH:'语音服务处理时长与音轨不一致，无法确认全片结果。',
+    ASR_AUDIO_TOO_LARGE:'音频超过当前 25 MiB 大小上限，暂不支持处理。',
+    AUDIO_TOO_LARGE:'音频超过设置的大小上限（默认 25 MiB），暂不支持处理。',
+    ASR_AUDIO_MISSING:'无法获取该视频的音频。', NO_AUDIO:'无法获取该视频的音频。',
+    ASR_AUDIO_HTTP:'音频下载失败，请检查网络或登录状态。', AUDIO_HTTP:'音频下载失败，请检查网络或登录状态。',
+    ASR_AUDIO_FAILED:'音频获取失败，请稍后重试。',
+    ASR_DURATION_MISMATCH:'音轨和视频时长不一致，暂不能确认处理范围。',
+    ASR_TIMESTAMP_MISSING:'部分语音缺少可靠时间信息，已保留内容，无法确认完整结果。',
+    ASR_CONTENT_UNCONFIRMED:'已有转写内容或时间不一致，原文和旧摘要已保留。',
+    ASR_RECOVERY_CHANGED:'已保存的新转写不可用，请重新确认处理方式。',
+    ASR_UNCONFIRMED:'部分识别结果尚未确认，已保留内容，不能标记完整。',
+    ASR_ALIGNMENT_UNCERTAIN:'片段衔接无法可靠确认，已保留内容，请勿将其视为完整结果。',
+    ASR_NO_SPEECH:'该音频未识别到可用语音。', LOW_CONTENT:'该视频几乎没有可解析的语音内容。',
+    ASR_TOO_SHORT:'识别到了少量语音，但内容不足以生成可靠摘要。',
+    ASR_SUMMARY_FAILED:'摘要生成未完成，可重试并复用已识别的文字。',
+    NEED_LOGIN:'需要登录 B 站才能获取视频，请先在本浏览器登录。',
+    RISK_CONTROL:'B 站风控拦截，请稍后重试。',
+    KEY_INVALID:'模型 Key 无效或无权限，请到设置检查。',
+    NO_BALANCE:'模型余额不足，请检查账户。',
+    ASR_NETWORK:'语音服务无法连接，请检查网络和配置。',
+    ASR_CONNECTION_FAILED:'语音服务无法连接，请检查网络和配置。',
+    ASR_AUDIO_DECODE_FAILED:'音频无法解码，暂不支持处理。',
+  };
+  const code = outcome.result === 'failed' && typeof outcome.error?.code === 'string' && Object.hasOwn(messages,outcome.error.code) ? outcome.error.code : 'ASR_FAILED';
+  const row = await db.transaction('rw',db.jobs,async () => {
+    const current = await db.jobs.get(id);
+    if (!current || current.type !== 'ASR_SUMMARIZE' || current.status !== 'running' || current.runId !== runId) return undefined;
+    const next:JobRow = outcome.result === 'done'
+      ? {...current,status:'done',progress:100,error:undefined,updatedAt:Date.now()}
+      : outcome.result === 'need_confirm'
+        ? {...current,status:'need_confirm',error:undefined,updatedAt:Date.now()}
+        : {...current,status:'failed',error:outcome.result === 'failed'
+          ? {code,msg:messages[code] ?? '语音处理未完成，请检查设置后重新确认。'}
+          : {code:'ASR_INTERRUPTED',msg:'语音识别中断，已发送部分可能产生费用，请确认后再重试'},updatedAt:Date.now()};
+    await db.jobs.put(next);return next;
+  });
+  if (!row) return {ok:false};
+  onJobTransition(row);drainUnlessPaused(true);return {ok:true};
+}
 
 /**
  * F13 分段预取（静默提前解读）：当前视频摘要 done 后，把未解读段以 prio=1 入交互链。
@@ -339,7 +458,9 @@ async function prefetchSegments(j: JobRow): Promise<void> {
     const pointer = await getSessionPointer(browserKv);
     if (pointer?.state !== 'ACTIVE' || pointer.sessionId !== j.sessionId) return;
     const row = await latestSummary(j.videoKey);
-    if (!row || row.status !== 'done' || !row.outline?.length) return;
+    if (!row || row.status !== 'done' || row.asrOutdated || !row.outline?.length) return;
+    const transcript=await db.transcripts.get(j.videoKey);
+    if (row.source==='asr' && transcript && hasAsrSemanticMismatch(transcript)) return;
     const todo = segmentsToPrefetch(row.outline, row.segmentNotes);
     for (const i of todo) {
       await segPipeline.enqueue({
@@ -389,9 +510,17 @@ interface InMsg {
   segIndex?: number; // SEGMENT_NOTE_OPEN 段下标（P1.11）
   force?: number; // LOGIN_CHECK 强制绕过 30s 缓存（P1.10：面板打开时机）
   retry?: number; // SUMMARY_OPEN 用户显式重试标记（1=点击进入，可对 failed 摘要重新入队）
+  transcriptPage?: number;
+  recovery?: boolean;
+  recoveryAction?: 'continue' | 'recognize';
   llm?: ModelConfigMsg;
   asr?: ModelConfigMsg;
   kind?: 'llm' | 'asr'; // TEST_CONNECTION：探活对象（P2.3 起 asr 走 /models 探活）
+  pcm?: number[];
+  authRule?: { key: string; requestId: string } | null;
+  jobId?: string;
+  runId?: string;
+  outcome?: JobOutcome;
   // P2.5 设置页：偏好部分保存 + LLM 配置显式清除（F9「清空 Key 保存→回到未激活态」）
   triggerSeconds?: number;
   persona?: string;
@@ -423,6 +552,7 @@ export default defineBackground(() => {
   console.log('[doubao-poc] background ready');
   // storage.session 在 SW 休眠时保留，浏览器资料重启时清空；扩展重载和更新也会清空。
   browserSessionReady = (async () => {
+    await browser.declarativeNetRequest.updateSessionRules({ removeRuleIds: [DOUBAO_RULE_ID] });
     const marker = await browser.storage.session.get('browserSessionReady');
     if (!marker.browserSessionReady) {
       const pointer = await getSessionPointer(browserKv);
@@ -450,8 +580,21 @@ export default defineBackground(() => {
     }
   })();
   // SW 启动：恢复 stale running → 清空 pending（断网挂起/重启后续跑，F11；P2.5 暂停中则挂起）
-  void browserSessionReady.then(() => pipeline.recover()).then(async (n) => {
+  recoveryReady = browserSessionReady.then(async () => {
+    let live: {id:string;runId:string;outcome?:JobOutcome}[] = [];
+    try {
+      const contexts = await browser.runtime.getContexts({contextTypes:['OFFSCREEN_DOCUMENT' as never]});
+      if (contexts.length) {
+        const reply = await sendToOffscreen({type:'OFFSCREEN_ACTIVE_JOBS'});
+        if (Array.isArray(reply)) live = reply.filter(x => typeof x?.id === 'string' && typeof x?.runId === 'string');
+      }
+    } catch { /* 离屏文档不存在时按中断处理 */ }
+    for (const run of live) if (run.outcome) await finishOffscreenAsr(run.id,run.runId,run.outcome);
+    return pipeline.recover(live);
+  });
+  void recoveryReady.then(async (n) => {
     if (n) console.log(`[doubao] recovered ${n} stale job(s)`);
+    await resumeAutoAsrWaiting();
     drainUnlessPaused(n > 0); // 恢复了任务时，忙碌中的两条队列都须在当前轮后补查
   });
   // P1.10 时机①：扩展启动即探登录态（架构 §3.9）
@@ -495,9 +638,10 @@ export default defineBackground(() => {
     const p = port as unknown as UiPort;
     p.tabId = (port as unknown as { sender?: { tab?: { id?: number } } }).sender?.tab?.id;
     uiPorts.add(p);
-    (port as unknown as { onDisconnect: { addListener: (cb: () => void) => void } }).onDisconnect.addListener(() =>
-      uiPorts.delete(p),
-    );
+    (port as unknown as { onDisconnect: { addListener: (cb: () => void) => void } }).onDisconnect.addListener(() => {
+      try { void browser.runtime.lastError; } catch { /* 扩展上下文可能已失效 */ }
+      uiPorts.delete(p);
+    });
     const replayRevision = sessionBroadcastRevision;
     const settingsRevision = settingsBroadcastRevision;
     void runRetention()
@@ -528,7 +672,7 @@ export default defineBackground(() => {
       .catch(() => {}); // 标签页无 content（非匹配页/未注入）静默
   });
 
-  browser.runtime.onMessage.addListener((msg: unknown) => {
+  browser.runtime.onMessage.addListener((msg: unknown, sender) => {
     const m = msg as InMsg;
     switch (m?.type) {
       case 'BILI_REQUEST_GATE':
@@ -553,6 +697,24 @@ export default defineBackground(() => {
         return browserSessionReady.then(() => handleAsrConfirm(m)); // P2.3 F6：用户确认调用 ASR
       case 'ASR_DECLINE':
         return browserSessionReady.then(() => handleAsrDecline(m)); // P2.3 F6：暂不（保持橙色标注，无状态迁移）
+      case 'DOUBAO_TRANSCRIBE_PCM':
+        if (sender?.url !== browser.runtime.getURL('/offscreen.html')) return Promise.resolve({ ok: false, error: 'ASR_UNAUTHORIZED' });
+        return browserSessionReady.then(() => handleDoubaoPcm(m));
+      case 'DOUBAO_AUTH_RULE':
+        if (sender?.url !== browser.runtime.getURL('/offscreen.html')) return Promise.resolve({ ok: false, error: 'ASR_UNAUTHORIZED' });
+        if (m.authRule && wipesInProgress) return Promise.resolve({ ok: false, error: 'ASR_CANCELLED' });
+        return browserSessionReady.then(() => scheduleDoubaoRule(m.authRule));
+      case 'ASR_PARTIAL_UPDATED':
+        if (sender?.url !== browser.runtime.getURL('/offscreen.html')) return Promise.resolve({ok:false});
+        return browserSessionReady.then(async () => {
+          const job = m.jobId ? await db.jobs.get(m.jobId) : undefined;
+          if (!job || job.type !== 'ASR_SUMMARIZE' || job.status !== 'running' || job.runId !== m.runId) return {ok:false};
+          broadcastToUi({type:'SUMMARY_UPDATED',videoKey:job.videoKey});
+          return {ok:true};
+        });
+      case 'OFFSCREEN_ASR_DONE':
+        if (sender?.url !== browser.runtime.getURL('/offscreen.html')) return Promise.resolve({ok:false});
+        return browserSessionReady.then(() => finishOffscreenAsr(m.jobId,m.runId,m.outcome));
       case 'SEEK_TO':
         return browserSessionReady.then(() => handleSeekTo(m));
       case 'SEGMENT_NOTE_OPEN':
@@ -569,11 +731,17 @@ export default defineBackground(() => {
       case 'TEST_CONNECTION': {
         const endpoint = validateEndpointUrl(m.llm?.baseUrl ?? '');
         // 必须在消息同步阶段调用，不能先 await 存储或进入 Promise 队列，否则手势丢失。
-        const access = ensureOriginPermission(m.llm?.modelId?.trim() && endpoint.ok && endpoint.origin ? [`${endpoint.origin}/*`] : []);
-        return Promise.all([access, browserSessionReady]).then(() => handleTestConnection(m));
+        const origins = m.kind === 'asr' && m.llm?.provider === 'doubao-agent-plan' ? [DOUBAO_ASR_ORIGIN] : m.llm?.modelId?.trim() && endpoint.ok && endpoint.origin ? [`${endpoint.origin}/*`] : [];
+        const access = ensureOriginPermission(origins);
+        return Promise.all([access, browserSessionReady]).then(async ([granted]) => {
+          const result = m.llm?.provider === 'doubao-agent-plan' && !granted ? { ok: false, msg: '未授权豆包语音服务，请重新授权后测试' } : await handleTestConnection(m);
+          if (m.kind === 'asr' && result.ok === true) void resumeAutoAsrWaiting();
+          return result;
+        });
       }
       case 'SETTINGS_SAVE': {
         const origins = [m.llm, m.asr].flatMap(cfg => {
+          if (cfg === m.asr && cfg?.provider === 'doubao-agent-plan') return [DOUBAO_ASR_ORIGIN];
           const endpoint = validateEndpointUrl(cfg?.baseUrl ?? '');
           return cfg?.modelId?.trim() && endpoint.ok && endpoint.origin ? [`${endpoint.origin}/*`] : [];
         });
@@ -586,6 +754,7 @@ export default defineBackground(() => {
           const granted: string[] = [];
           const denied: string[] = [];
           for (const origin of origins) (await browser.permissions.contains({ origins: [origin] }) ? granted : denied).push(origin);
+          if (m.asr && denied.length === 0) void resumeAutoAsrWaiting();
           return { ...result, granted, denied };
         });
       }
@@ -653,7 +822,12 @@ async function handleSessionEnd(closedAt = Date.now()): Promise<Record<string, u
   if (!pointer || pointer.state !== 'ACTIVE') return { ok: false, reason: 'inactive' };
   const now = closedAt;
   const next: SessionPointer = { ...pointer, state: 'GRACE', closedAt: now, lastActiveAt: now };
-  await db.sessions.update(pointer.sessionId, { state: 'GRACE', closedAt: now, lastActiveAt: now });
+  await db.transaction('rw', db.sessions, db.jobs, db.summaries, async () => {
+    await db.sessions.update(pointer.sessionId, { state: 'GRACE', closedAt: now, lastActiveAt: now });
+    await interruptSessionAsr(db, pointer.sessionId, now);
+  });
+  // 消息只发往现有离屏文档；不创建新文档。任务租约已先失效。
+  try { await browser.runtime.sendMessage({type:'OFFSCREEN_CANCEL_ASR',sessionId:pointer.sessionId}); } catch { /* 文档可能不存在 */ }
   await setSessionPointer(browserKv, next);
   console.log(`[doubao] session ended (GRACE): ${pointer.sessionId}`);
   lastBroadcastSession = { sessionId: pointer.sessionId, state: 'GRACE' };
@@ -671,18 +845,25 @@ async function handleSessionEnd(closedAt = Date.now()): Promise<Record<string, u
  * 残余窗口：掐死前最后 ms 级已提交的 put——极窄，记账接受。
  */
 async function handleWipe(): Promise<Record<string, unknown>> {
+  wipesInProgress++;
   try {
-    await browser.offscreen.closeDocument();
+    try {
+      await browser.offscreen.closeDocument();
+      console.log('[doubao] wipe: offscreen executor killed (in-flight job aborted)');
+    } catch {
+      /* offscreen 未开或关闭失败时仍清理规则并清除数据。 */
+    }
     offscreenReady = false;
-    console.log('[doubao] wipe: offscreen executor killed (in-flight job aborted)');
-  } catch {
-    /* offscreen 未开（无可掐）——继续清除 */
+    let ruleCleanupFailed = false;
+    try { await scheduleDoubaoRule(null); } catch { ruleCleanupFailed = true; }
+    await wipeAllData(db, browserKv);
+    lastBroadcastSession = null;
+    broadcastToUi(sessionStateMsg(undefined)); // {type:'SESSION_STATE', state:'INACTIVE'}
+    console.log('[doubao] wipe all data done (six tables + pointer cleared; settings kept)');
+    return ruleCleanupFailed ? { ok: false, error: '数据已清除，但语音认证规则清理失败；请重启扩展后重试' } : { ok: true, sessionState: 'INACTIVE' };
+  } finally {
+    wipesInProgress--;
   }
-  await wipeAllData(db, browserKv);
-  lastBroadcastSession = null;
-  broadcastToUi(sessionStateMsg(undefined)); // {type:'SESSION_STATE', state:'INACTIVE'}
-  console.log('[doubao] wipe all data done (six tables + pointer cleared; settings kept)');
-  return { ok: true, sessionState: 'INACTIVE' };
 }
 
 // ---- P1.2 · watcher 服务端 ---------------------------------------------------
@@ -729,10 +910,11 @@ async function handleVideoEnter(m: InMsg): Promise<Record<string, unknown>> {
     }
     const pointer = await getSessionPointer(browserKv);
     if (pointer?.state !== 'ACTIVE' || pointer.sessionId !== initialPointer.sessionId || await isPaused()) return { ok: false, reason: 'inactive' };
-    await upsertVisit(db, { sessionId: pointer.sessionId, videoKey: row.key, now });
+    const visit = await upsertVisit(db, { sessionId: pointer.sessionId, videoKey: row.key, now });
     const settings = (await browser.storage.local.get('settings'))['settings'] as
       | { triggerSeconds?: number }
       | undefined;
+    if (visit.triggered && visit.watchedSeconds >= clamp(settings?.triggerSeconds ?? 10,5,300)) await resumeLegacyVideo(row.key,pointer.sessionId);
     return {
       ok: true,
       videoKey: row.key,
@@ -830,9 +1012,9 @@ async function latestSummary(videoKey: string): Promise<SummaryRow | undefined> 
 
 /** 摘要类活动任务（驱动列表「生成中」徽章与详情流式态判定）。
  *  F13：排除 SEGMENT_ANALYZE——分段预取在后台跑，不得污染列表徽章/详情流式态（分段态另有 activeSegmentJob）。 */
-async function activeJob(videoKey: string): Promise<JobRow | undefined> {
+async function activeJob(videoKey: string, sessionId: string): Promise<JobRow | undefined> {
   const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
-  return rows.find((j) => j.type !== 'SEGMENT_ANALYZE' && ACTIVE_JOB_STATUSES.includes(j.status));
+  return rows.find((j) => j.sessionId === sessionId && j.type !== 'SEGMENT_ANALYZE' && ACTIVE_JOB_STATUSES.includes(j.status));
 }
 
 interface StoredSettings {
@@ -842,11 +1024,81 @@ interface StoredSettings {
   bubbles?: boolean;
   paused?: boolean; // P2.5：「暂停陪看」总开关（F12：开启后不再有任何采集与请求）
   llm?: { baseUrl: string; modelId: string; apiKey: string };
-  asr?: { baseUrl: string; modelId: string; apiKey: string };
+  asr?: { baseUrl: string; modelId: string; apiKey: string; provider?: 'openai-compatible' | 'doubao-agent-plan' };
 }
 
 async function readSettings(): Promise<StoredSettings> {
   return ((await browser.storage.local.get('settings'))['settings'] as StoredSettings) ?? {};
+}
+
+/** 仅首次明确无字幕时自动排一个独立 ASR 任务；旧记录和计费不明均保留人工处理。 */
+export async function tryAutoAsr(jobId: string, requireWaitingMarker = false): Promise<void> {
+  const job = await db.jobs.get(jobId);
+  if (!job || job.type !== 'SUMMARIZE' || job.status !== 'need_confirm') return;
+  const settings = await readSettings();
+  const pointer = await getSessionPointer(browserKv);
+  if (settings.paused || !pointer || pointer.state !== 'ACTIVE' || pointer.sessionId !== job.sessionId) return;
+  const cfg = settings.asr;
+  const configured = !!cfg?.baseUrl?.trim() && !!cfg.modelId?.trim() && !!cfg.apiKey?.trim() && validateAsr(cfg).kind === 'ok';
+  const origin = configured && cfg ? (cfg.provider === 'doubao-agent-plan' ? DOUBAO_ASR_ORIGIN : originPattern(cfg.baseUrl)) : null;
+  const authorized = !!origin && await browser.permissions.contains({origins:[origin]});
+  const reason = !configured ? 'NEED_ASR_CONFIG' : !authorized ? 'ASR_PERMISSION_DENIED' : undefined;
+  let queued = false;
+  let statusChanged = false;
+  await db.transaction('rw', db.jobs, db.transcripts, db.summaries, async () => {
+    const current = await db.jobs.get(jobId);
+    if (!current || current.status !== 'need_confirm' || current.type !== 'SUMMARIZE' || current.sessionId !== pointer.sessionId) return;
+    const jobs = await db.jobs.where('videoKey').equals(current.videoKey).toArray();
+    const summaries = await db.summaries.where('videoKey').equals(current.videoKey).toArray();
+    const summary = summaries.sort((a,b) => b.createdAt-a.createdAt)[0];
+    if (!summary || summary.status !== 'need_asr' || summary.source !== 'asr' || (requireWaitingMarker && summary.error?.code !== 'AUTO_ASR_PENDING' && summary.error?.code !== 'NEED_ASR_CONFIG' && summary.error?.code !== 'ASR_PERMISSION_DENIED') || summary.error?.code === 'ASR_DECLINED' || summaries.some(s=>s.status==='done'||s.asrProgress?.unconfirmed?.length) || jobs.some(j=>j.type==='ASR_SUMMARIZE')) return;
+    const transcript = await db.transcripts.get(current.videoKey);
+    if (transcript) {
+      if (transcript.source !== 'asr') { await db.summaries.put({...summary,error:{code:'ASR_EXISTING_SUBTITLE',msg:'旧字幕已保留，当前无法安全启动语音识别'}}); statusChanged = true; }
+      return;
+    }
+    if (reason) {
+      await db.summaries.put({...summary,error:{code:reason,msg:reason==='NEED_ASR_CONFIG'?'请先配置语音识别服务':'语音服务未获授权，请到设置中授权'}});
+      return;
+    }
+    await db.jobs.put({...current,status:'done',updatedAt:Date.now()});
+    await pipeline.enqueue({type:'ASR_SUMMARIZE',videoKey:current.videoKey,sessionId:current.sessionId});
+    queued = true;
+  });
+  if (queued) drainUnlessPaused();
+  else if (reason || statusChanged) broadcastToUi({type:'SUMMARY_UPDATED',videoKey:job.videoKey});
+}
+
+async function resumeAutoAsrWaiting(): Promise<void> {
+  const jobs = await db.jobs.where('status').equals('need_confirm').toArray();
+  for (const job of jobs) {
+    if (job.type !== 'SUMMARIZE') continue;
+    const summary = await latestSummary(job.videoKey);
+    if (summary?.status === 'need_asr' && (summary.error?.code === 'AUTO_ASR_PENDING' || summary.error?.code === 'NEED_ASR_CONFIG' || summary.error?.code === 'ASR_PERMISSION_DENIED')) await tryAutoAsr(job.id,true);
+  }
+  // 只有执行前明确未发送音频的失败可以在配置恢复后自动排回，其他失败绝不自动重发。
+  const settings = await readSettings();
+  const pointer = await getSessionPointer(browserKv);
+  const cfg = settings.asr;
+  if (settings.paused || pointer?.state !== 'ACTIVE' || !cfg || validateAsr(cfg).kind !== 'ok') return;
+  const origin = cfg.provider === 'doubao-agent-plan' ? DOUBAO_ASR_ORIGIN : originPattern(cfg.baseUrl);
+  if (!origin || !(await browser.permissions.contains({origins:[origin]}))) return;
+  const failed = await db.jobs.where('status').equals('failed').toArray();
+  let resumed = false;
+  for (const old of failed) {
+    if (old.type !== 'ASR_SUMMARIZE' || old.sessionId !== pointer.sessionId || !['ASR_NOT_SENT_CONFIG','ASR_NOT_SENT_PERMISSION'].includes(old.error?.code ?? '')) continue;
+    await db.transaction('rw',db.jobs,db.summaries,db.transcripts,async()=>{
+      const job=await db.jobs.get(old.id);
+      const jobs=await db.jobs.where('videoKey').equals(old.videoKey).toArray();
+      const summaries=await db.summaries.where('videoKey').equals(old.videoKey).toArray();
+      const summary=summaries.sort((a,b)=>b.createdAt-a.createdAt)[0];
+      if (!job || job.status!=='failed' || !['ASR_NOT_SENT_CONFIG','ASR_NOT_SENT_PERMISSION'].includes(job.error?.code??'') || jobs.filter(j=>j.type==='ASR_SUMMARIZE').length!==1 || !summary || summary.status!=='need_asr' || !['NEED_ASR_CONFIG','ASR_PERMISSION_DENIED'].includes(summary.error?.code??'') || summaries.some(s=>s.asrProgress?.unconfirmed?.length) || await db.transcripts.get(old.videoKey)) return;
+      await db.jobs.put({...job,status:'pending',error:undefined,retries:0,updatedAt:Date.now()});
+      await db.summaries.put({...summary,error:{code:'AUTO_ASR_PENDING',msg:'字幕不可用，等待语音识别'}});
+      resumed=true;
+    });
+  }
+  if (resumed) drainUnlessPaused(true);
 }
 
 /** P2.5：暂停中？（各采集/生成入口的门禁；F12「不再有任何采集与请求」）。 */
@@ -857,7 +1109,7 @@ async function isPaused(): Promise<boolean> {
 /** P2.5：暂停时不清空 pending 队列（挂起待恢复）；解除暂停的保存路径自行 drain。
  *  F13 提速：双链同 kick——交互链独立于主链，摘要挂起/长跑不拖分段解读。 */
 function drainUnlessPaused(resume = false): void {
-  void browserSessionReady.then(() => isPaused()).then((paused) => {
+  void recoveryReady.then(() => isPaused()).then((paused) => {
     if (paused) return;
     void pipeline.drain(resume);
     void segPipeline.drain(resume);
@@ -896,7 +1148,7 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
       visit,
       video: await db.videos.get(visit.videoKey),
       summary: await latestSummary(visit.videoKey),
-      job: await activeJob(visit.videoKey),
+      job: await activeJob(visit.videoKey, pointer.sessionId),
     })),
   );
   return { ...base, items };
@@ -912,6 +1164,21 @@ async function handleListQuery(): Promise<Record<string, unknown>> {
  * 重试必须由用户发起（F11）。
  * P2.5「暂停陪看」：缓存/详情照常可见（零网络），但**不入队**（F12 无任何生成请求）。
  */
+async function resumeLegacyVideo(videoKey:string, sessionId:string):Promise<void> {
+  const migrated = await db.transaction('rw',db.jobs,db.summaries,db.transcripts,async()=>{
+    const rows=await db.jobs.where('videoKey').equals(videoKey).toArray();
+    const summaries=await db.summaries.where('videoKey').equals(videoKey).toArray();
+    const latest=summaries.sort((a,b)=>b.createdAt-a.createdAt)[0];
+    const legacy=rows.find(j=>j.sessionId===sessionId&&j.type==='SUMMARIZE'&&j.status==='need_confirm');
+    if (!latest || latest.status!=='need_asr' || latest.source!=='asr' || (latest.error && latest.error.code!=='EMPTY_SUBTITLE') || summaries.some(s=>s.status==='done'||s.asrProgress?.unconfirmed?.length) || rows.some(j=>j.type==='ASR_SUMMARIZE'||j.status==='failed'||j.status==='running'||j.status==='pending') || await db.transcripts.get(videoKey)) return false;
+    if (legacy) await db.jobs.put({...legacy,status:'pending',retries:0,updatedAt:Date.now()});
+    else await pipeline.enqueue({type:'SUMMARIZE',videoKey,sessionId,prio:-1});
+    await db.summaries.put({...latest,error:{code:'AUTO_ASR_PENDING',msg:'正在重新检查字幕'}});
+    return true;
+  });
+  if (migrated) drainUnlessPaused(true);
+}
+
 async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
   if (!videoKey) return { ok: false, error: 'SUMMARY_OPEN 缺 videoKey' };
@@ -920,28 +1187,39 @@ async function handleSummaryOpen(m: InMsg): Promise<Record<string, unknown>> {
     ? await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first()
     : undefined;
   if (!visit || !pointer) return { ok: false, error: 'no-visit' };
+  // 旧版无确认记录的待处理项只在用户主动打开该视频时重新检查字幕；不批量启动其他旧视频。
+  if (m.retry === 1 && pointer.state === 'ACTIVE' && !(await isPaused()) && visit.triggered && visit.watchedSeconds >= clamp((await readSettings()).triggerSeconds??10,5,300)) await resumeLegacyVideo(videoKey,pointer.sessionId);
   const video = await db.videos.get(videoKey);
   const summary = await latestSummary(videoKey);
-  let job = await activeJob(videoKey);
-  const lastJobRow = (await db.jobs.where('videoKey').equals(videoKey).sortBy('updatedAt')).pop();
+  const storedTranscript = await db.transcripts.get(videoKey);
+  const conflict = !!storedTranscript && hasAsrSemanticMismatch(storedTranscript);
+  const showRecovery = conflict && (!summary || summary.source === 'asr');
+  let job = await activeJob(videoKey, pointer.sessionId);
+  const lastJobRow = (await db.jobs.where('videoKey').equals(videoKey).filter(j=>j.sessionId===pointer.sessionId).sortBy('updatedAt')).pop();
   const untouched = !summary && !lastJobRow; // 从未生成过也从未排过队
-  const failedBefore = summary?.status === 'failed' || lastJobRow?.status === 'failed';
-  if (!job && (untouched || (failedBefore && m.retry === 1)) && !(await isPaused())) {
+  // 少量或无语音是已处理的内容结果；打开详情不应重新排队并将它改回等待自动识别。
+  const insufficientSpeech = summary?.source === 'asr' && summary.status === 'failed' && ['LOW_CONTENT','ASR_NO_SPEECH','ASR_TOO_SHORT'].includes(summary.error?.code ?? '');
+  const failedBefore = !insufficientSpeech && summary?.status !== 'need_asr' && (summary?.status === 'failed' || lastJobRow?.status === 'failed');
+  if (!conflict && !job && (untouched || (failedBefore && m.retry === 1)) && !(await isPaused())) {
     await pipeline.enqueue({ type: 'SUMMARIZE', videoKey, sessionId: pointer.sessionId, ...(m.retry === 1 ? { prio: -1 } : {}) });
-    job = await activeJob(videoKey);
+    job = await activeJob(videoKey, pointer.sessionId);
     drainUnlessPaused();
   }
   // 用户主动点击时允许保留期内执行，包括提升已存在的自动摘要；广播刷新不能触发。
   if (m.retry === 1 && job && (job.type === 'SUMMARIZE' || job.type === 'REGENERATE') && job.status === 'pending' && !(await isPaused())) {
     if (job.type === 'SUMMARIZE') await db.jobs.update(job.id, { prio: -1, updatedAt: Date.now() });
-    await allowManualJob(job);
+    if (summary?.error?.code !== 'AUTO_ASR_PENDING') await allowManualJob(job);
     job = await db.jobs.get(job.id);
     drainUnlessPaused(true);
   }
-  const transcript = excerptOf(await db.transcripts.get(videoKey));
+  const transcript = excerptOf(storedTranscript, undefined, m.transcriptPage, video?.duration);
+  const asrCached = !conflict && storedTranscript?.source === 'asr' && storedTranscript.asrComplete === true && isCacheFresh(storedTranscript.cachedAt);
+  const recoveryJob = showRecovery ? (await db.jobs.where('videoKey').equals(videoKey).filter(j=>j.sessionId===pointer.sessionId && !!j.recovery && !j.recovery.committed).sortBy('updatedAt')).pop() : undefined;
+  const recoveryData=recoveryJob?.recovery;
+  const recovery = showRecovery ? { status: recoveryJob && ACTIVE_JOB_STATUSES.includes(recoveryJob.status) ? 'running' : recoveryData?.candidate && isRecoveryCandidate(recoveryData.candidate,videoKey,video?.duration) && isCacheFresh(recoveryData.candidate.cachedAt) ? 'candidate' : recoveryData?.pending ? 'pending' : 'available', ...(recoveryData?.pending?{warning:'上次请求的计费状态不明，重新识别可能再次消耗额度。'}:{}), ...(recoveryData?.progress?{progress:recoveryData.progress}:{}) } : undefined;
   // P2.3 审查 P1-1：need_asr 卡片要能显示上次 ASR 尝试的失败原因——音频链失败保留 need_asr 行、
   // 错误只在 job 行，activeJob（仅活动态）永远带不出；lastJobRow 上面已查，随详情下发
-  return { ok: true, item: { visit, video, summary, job, lastJob: lastJobRow }, transcript };
+  return { ok: true, item: { visit, video, summary, job, lastJob: lastJobRow }, transcript, asrCached, ...(recovery?{recovery}:{}) };
 }
 
 /**
@@ -956,7 +1234,7 @@ async function handleRegenerate(m: InMsg): Promise<Record<string, unknown>> {
   if (await isPaused()) return { ok: false, error: 'paused' }; // P2.5：暂停期间不烧 LLM
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, error: 'no-session' };
-  if (await activeJob(videoKey)) return { ok: false, error: 'busy' };
+  if (await activeJob(videoKey, pointer.sessionId)) return { ok: false, error: 'busy' };
   const job = await pipeline.enqueue({ type: 'REGENERATE', videoKey, sessionId: pointer.sessionId });
   await allowManualJob(job);
   drainUnlessPaused();
@@ -975,17 +1253,43 @@ async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
   const { videoKey } = m;
   if (!videoKey) return { ok: false, error: 'ASR_CONFIRM 缺 videoKey' };
   if (await isPaused()) return { ok: false, error: 'paused' }; // P2.5：暂停期间不下载音频不转写
+  const existingTranscript = await db.transcripts.get(videoKey);
+  if (existingTranscript && existingTranscript.source !== 'asr') return {ok:false,reason:'ASR_EXISTING_SUBTITLE'};
   const settings = await readSettings();
   const asr = settings.asr;
-  if (!asr?.baseUrl || !asr.modelId || !asr.apiKey) return { ok: false, reason: 'NEED_ASR_CONFIG' };
+  const continueRecovery=m.recovery===true && m.recoveryAction==='continue';
+  if (!continueRecovery && (!asr?.baseUrl || !asr.modelId || !asr.apiKey)) return { ok: false, reason: 'NEED_ASR_CONFIG' };
+  if (m.recovery && !continueRecovery && asr?.provider !== 'doubao-agent-plan') return {ok:false,reason:'ASR_RECOVERY_UNSUPPORTED'};
+  if (!continueRecovery && asr?.provider === 'doubao-agent-plan' && !(await browser.permissions.contains({origins:[DOUBAO_ASR_ORIGIN]}))) return {ok:false,reason:'ASR_PERMISSION_DENIED'};
   const pointer = await getSessionPointer(browserKv);
   if (!pointer) return { ok: false, error: 'no-session' };
+  if (m.recovery) {
+    const result=await db.transaction('rw',db.jobs,db.transcripts,db.videos,async()=>{
+      const original=await db.transcripts.get(videoKey);
+      if(!original || !hasAsrSemanticMismatch(original)) return {error:'ASR_RECOVERY_CHANGED'} as const;
+      const rows=await db.jobs.where('videoKey').equals(videoKey).toArray();
+      // 其他会话未运行的旧队列不会再被 canRunJob 执行，正在运行的仍须等待。
+      const active=rows.find(j=>j.status==='running'||(j.sessionId===pointer.sessionId&&j.status==='pending'));
+      if(active){if(active.type==='ASR_SUMMARIZE'&&active.sessionId===pointer.sessionId&&active.recovery)return {job:active} as const;return {error:'busy'} as const;}
+      const last=rows.filter(j=>j.sessionId===pointer.sessionId&&j.recovery&&!j.recovery.committed).sort((a,b)=>b.updatedAt-a.updatedAt)[0]?.recovery;
+      if(last && JSON.stringify(last.original)!==JSON.stringify(original))return {error:'ASR_RECOVERY_CHANGED'} as const;
+      const candidate=!!last?.candidate && isRecoveryCandidate(last.candidate,videoKey,(await db.videos.get(videoKey))?.duration) && isCacheFresh(last.candidate.cachedAt);
+      if((candidate && m.recoveryAction!=='continue') || (!candidate && m.recoveryAction!=='recognize'))return {error:'ASR_RECOVERY_CHANGED'} as const;
+      // 同会话旧确认卡按普通 ASR 确认流收口。
+      for(const row of rows)if(row.sessionId===pointer.sessionId&&row.status==='need_confirm')await db.jobs.put({...row,status:'done',updatedAt:Date.now()});
+      const recovery=candidate?last!:{original,...(last?.pending?{pending:true}:{})};
+      const job=await pipeline.enqueue({type:'ASR_SUMMARIZE',videoKey,sessionId:pointer.sessionId,recovery});
+      return {job} as const;
+    });
+    if('error' in result)return {ok:false,reason:result.error,error:result.error};
+    await allowManualJob(result.job);drainUnlessPaused();return {ok:true,started:true};
+  }
   const job = await db.transaction('rw', db.jobs, async () => {
     const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
     for (const j of rows) {
       // 审查 P2-3：need_confirm 语义唯一（等 ASR 确认），不按 type 过滤——REGENERATE 落
       // need_confirm（旧 failed 行重跑无轨）同样必须收口，否则 busy 守卫永久卡死
-      if (j.status === 'need_confirm') {
+      if (j.sessionId === pointer.sessionId && j.status === 'need_confirm') {
         await db.jobs.put({ ...j, status: 'done', updatedAt: Date.now() });
       }
     }
@@ -999,6 +1303,17 @@ async function handleAsrConfirm(m: InMsg): Promise<Record<string, unknown>> {
 
 /** ASR_DECLINE：暂不——保持 need_asr 橙色标注（F6-⑥ 不再自动追问，下次打开面板仍可见）。 */
 async function handleAsrDecline(m: InMsg): Promise<Record<string, unknown>> {
+  if (m.videoKey) {
+    const result = await db.transaction('rw',db.summaries,db.jobs,async()=>{
+      const jobs=await db.jobs.where('videoKey').equals(m.videoKey!).toArray();
+      if(jobs.some(j=>j.type==='ASR_SUMMARIZE' && j.status==='running'))return false;
+      for(const job of jobs)if(job.type==='ASR_SUMMARIZE' && job.status==='pending')await db.jobs.put({...job,status:'failed',error:{code:'ASR_DECLINED',msg:'已选择暂不处理'},updatedAt:Date.now()});
+      const summary = await latestSummary(m.videoKey!);
+      if (summary?.status === 'need_asr') await db.summaries.put({...summary,error:{code:'ASR_DECLINED',msg:'已选择暂不处理'}});
+      return true;
+    });
+    if (!result) return {ok:false,reason:'ASR_ALREADY_STARTED'};
+  }
   console.log(`[doubao] asr declined (keep need_asr): ${m.videoKey ?? ''}`);
   return { ok: true };
 }
@@ -1083,6 +1398,9 @@ async function handleSegmentNoteOpen(m: InMsg): Promise<Record<string, unknown>>
     return { ok: false, error: 'SEGMENT_NOTE_OPEN 缺 videoKey/segIndex' };
   }
   const summary = await latestSummary(videoKey);
+  if (summary?.asrOutdated) return {ok:false,error:'ASR_CONTENT_UNCONFIRMED'};
+  const segmentTranscript=await db.transcripts.get(videoKey);
+  if (summary?.source==='asr' && segmentTranscript && hasAsrSemanticMismatch(segmentTranscript)) return {ok:false,error:'ASR_CONTENT_UNCONFIRMED'};
   if (!summary || summary.status !== 'done' || !summary.outline?.length || segIndex >= summary.outline.length) {
     return { ok: false, error: 'NO_OUTLINE' }; // 无大纲（含无字幕未确认）→ 入口本不应出现
   }
@@ -1206,6 +1524,7 @@ async function handleLoginCheck(m: InMsg): Promise<Record<string, unknown>> {
 // ---- P1.7 · onboarding 服务（TEST_CONNECTION / SETTINGS_SAVE） ------------------
 
 interface ModelConfigMsg {
+  provider?: 'openai-compatible' | 'doubao-agent-plan';
   baseUrl?: string;
   modelId?: string;
   apiKey?: string;
@@ -1241,7 +1560,20 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   const model = (cfg.modelId ?? '').trim();
   // P2.5：设置页 Key 打码——空/打码哨兵沿用已存 Key（面板永不见明文，探活仍用真 Key）
   const prevCfg = (m.kind === 'asr' ? (await readSettings()).asr : (await readSettings()).llm) ?? undefined;
-  const apiKey = resolveApiKey(prevCfg?.apiKey, cfg.apiKey ?? '').trim();
+  const sameProvider = m.kind !== 'asr' || (cfg.provider ?? 'openai-compatible') === ((prevCfg as StoredSettings['asr'])?.provider ?? 'openai-compatible');
+  const apiKey = resolveApiKey(sameProvider ? prevCfg?.apiKey : undefined, cfg.apiKey ?? '').trim();
+  if (m.kind === 'asr' && cfg.provider === 'doubao-agent-plan') {
+    if (!apiKey) return { ok: false, msg: '请先填写 Agent Plan Key' };
+    try {
+      await ensureOffscreen();
+      const result = await sendToOffscreen({type:'OFFSCREEN_DOUBAO_SESSION', apiKey}) as {ok?:boolean};
+      if (!result?.ok) throw new Error('ASR_AUTH_FAILED');
+      return { ok: true, msg: '鉴权通过，尚未验证语音识别' };
+    } catch (error) {
+      console.log(`[doubao] asr authentication failed: ${error instanceof Error && /^ASR_[A-Z_0-9]+$/.test(error.message) ? error.message : 'ASR_CONNECTION_FAILED'}`);
+      return { ok: false, msg: '豆包语音鉴权未通过，请检查 Key、授权和网络' };
+    }
+  }
   if (!baseUrl || !model || !apiKey) return { ok: false, msg: '请先填写完整配置再测试' };
   const v = validateEndpointUrl(baseUrl);
   if (!v.ok) return { ok: false, msg: v.error ?? 'Base URL 不合法' };
@@ -1293,15 +1625,51 @@ async function handleTestConnection(m: InMsg): Promise<Record<string, unknown>> 
   }
 }
 
+function scheduleDoubaoRule(auth: InMsg['authRule']): Promise<Record<string, unknown>> {
+  const pending = doubaoRuleTail.then(() => auth && wipesInProgress ? {ok:false, error:'ASR_CANCELLED'} : updateDoubaoRule(auth));
+  doubaoRuleTail = pending.then(() => {}, () => {});
+  return pending;
+}
+
+async function updateDoubaoRule(auth: InMsg['authRule']): Promise<Record<string, unknown>> {
+  if (auth && (!auth.key || /[\r\n]/.test(auth.key) || !/^[a-f0-9-]{36}$/i.test(auth.requestId))) return {ok:false, error:'ASR_INVALID_AUTH'};
+  const rule = auth ? {
+    id: DOUBAO_RULE_ID, priority: 1,
+    action: {type:'modifyHeaders', requestHeaders:[
+      {header:'X-Api-Key',operation:'set',value:auth.key},
+      {header:'X-Api-Resource-Id',operation:'set',value:DOUBAO_ASR_RESOURCE},
+      {header:'X-Api-Request-Id',operation:'set',value:auth.requestId},
+    ]},
+    condition:{urlFilter:`|${DOUBAO_ASR_ENDPOINT}|`,initiatorDomains:[browser.runtime.id],resourceTypes:['websocket']},
+  } : null;
+  await browser.declarativeNetRequest.updateSessionRules({removeRuleIds:[DOUBAO_RULE_ID], ...(rule ? {addRules:[rule as never]} : {})});
+  return {ok:true};
+}
+
+async function handleDoubaoPcm(m: InMsg): Promise<Record<string, unknown>> {
+  const bytes = m.pcm;
+  if (!Array.isArray(bytes) || !bytes.length || bytes.length > 960000 || bytes.length % 2 || bytes.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return {ok:false, error:'ASR_PCM_INVALID'};
+  const cfg = (await readSettings()).asr;
+  if (cfg?.provider !== 'doubao-agent-plan' || !cfg.apiKey) return {ok:false, error:'NEED_ASR_CONFIG'};
+  if (!(await browser.permissions.contains({origins:[DOUBAO_ASR_ORIGIN]}))) return {ok:false, error:'ASR_PERMISSION_DENIED'};
+  try {
+    await ensureOffscreen();
+    return (await sendToOffscreen({type:'OFFSCREEN_DOUBAO_SESSION', apiKey:cfg.apiKey, pcm:bytes})) as Record<string, unknown>;
+  } catch (e) {
+    const message = e instanceof Error && /^ASR_[A-Z_0-9]+$/.test(e.message) ? e.message : 'ASR_CONNECTION_FAILED';
+    return {ok:false, error:message};
+  }
+}
+
 /**
  * P2.5 · SETTINGS_GET：设置页数据源。Key 打码（F9「仅尾 4 位」）——明文永不出 SW。
  * prefs 全量随发；llm/asr 未配置时不带键（面板按 undefined 渲染「未配置」）。
  */
 async function handleSettingsGet(): Promise<Record<string, unknown>> {
   const s = await readSettings();
-  const mask = (c?: { baseUrl: string; modelId: string; apiKey: string }) =>
+  const mask = (c?: { baseUrl: string; modelId: string; apiKey: string; provider?: 'openai-compatible' | 'doubao-agent-plan' }) =>
     c && c.baseUrl && c.modelId && c.apiKey
-      ? { baseUrl: c.baseUrl, modelId: c.modelId, apiKeyMasked: maskApiKey(c.apiKey) }
+      ? { baseUrl: c.baseUrl, modelId: c.modelId, apiKeyMasked: maskApiKey(c.apiKey), ...(c.provider ? { provider: c.provider } : {}) }
       : undefined;
   return {
     ok: true,
@@ -1371,14 +1739,19 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
     if (rawAllEmpty) {
       delete next.asr; // 显式带 asr 全空保存 = 清除旧 ASR 配置（含旧 Key）
     } else {
-      const prevAsr = prev['asr'] as { apiKey?: string } | undefined;
+      const prevAsr = prev['asr'] as { apiKey?: string; provider?: 'openai-compatible' | 'doubao-agent-plan' } | undefined;
+      const previousKey = (asr.provider ?? 'openai-compatible') === (prevAsr?.provider ?? 'openai-compatible') ? prevAsr?.apiKey : undefined;
+      const resolvedKey = resolveApiKey(previousKey, asr.apiKey ?? '');
       const a = validateAsr({
+        provider: asr.provider,
         baseUrl: asr.baseUrl ?? '',
         modelId: asr.modelId ?? '',
-        apiKey: resolveApiKey(prevAsr?.apiKey, asr.apiKey ?? ''),
+        apiKey: resolvedKey,
       });
       if (a.kind === 'error') return { ok: false, error: a.error };
-      next.asr = { baseUrl: asr.baseUrl!.trim(), modelId: asr.modelId!.trim(), apiKey: resolveApiKey(prevAsr?.apiKey, asr.apiKey ?? '') };
+      next.asr = asr.provider === 'doubao-agent-plan'
+        ? { provider: asr.provider, baseUrl: 'https://openspeech.bytedance.com', modelId: DOUBAO_ASR_MODEL, apiKey: resolvedKey }
+        : { baseUrl: asr.baseUrl!.trim(), modelId: asr.modelId!.trim(), apiKey: resolvedKey, ...(asr.provider ? { provider: asr.provider } : {}) };
     }
   } // asr 缺省 = 沿用（P2.5 起不再隐式删除）
 
@@ -1405,6 +1778,7 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
   }
   if (m.paused !== undefined) broadcastToUi({ type: 'WATCH_SETTINGS', paused: next['paused'] === true });
   if (m.paused === false) {
+    void resumeAutoAsrWaiting();
     drainUnlessPaused(true);
     const pending = updateCheckInFlight;
     if (pending) void pending.then(() => checkUpdate());

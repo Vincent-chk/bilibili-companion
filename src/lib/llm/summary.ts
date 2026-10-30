@@ -1,5 +1,5 @@
 import type { LlmConfig, LlmMessage, StreamEvent, SummaryResult } from './types';
-import { streamChatCompletion } from './client';
+import { LlmNetworkError, streamChatCompletion } from './client';
 
 // Key 保存在 chrome.storage.local；不写源码、构建产物、Dexie 或日志。
 
@@ -19,10 +19,12 @@ const BASE_SYSTEM_PROMPT = `你是「豆包」，一只陪用户看 B 站视频�
  "rating": 1到5的整数}
 
 约束：
-1. outline 6-12 条，按时间升序，time 必须是整数秒且来自所给内容的时间戳；
+1. outline 6-12 条，按时间升序，time 必须是整数总秒且来自所给内容的时间戳。若输入标签为 [N秒]，直接将 N 填入 time；若为 [mm:ss]，必须计算分钟乘 60 加秒，例如 [10:12] 填 612，[11:17] 填 677，禁止仅去掉冒号；
 2. summary 保持客观、不评价；人设口吻只允许出现在 evaluation；
 3. rating 为 1-5 的整数（1=最难以下咽，5=神作，理解成 1-5 颗 🫘）；
 4. 严禁输出 JSON 以外的任何字符。`;
+
+export const ASR_SCOPE_INSTRUCTION = '输入来自音轨识别文字及其整理要点，不包含视频画面。只依据文字概括语音里明确提到的内容；不能因为语音没有提到就断言画面未展示、视频没有发生或没有演示某事。信息少时简洁概括，不要添加没有依据的细节。';
 
 export function summarySystemPrompt(persona = 'spicy'): string {
   return BASE_SYSTEM_PROMPT.replace('{EVAL_STYLE}', PERSONA_EVALUATION_STYLE[persona] ?? PERSONA_EVALUATION_STYLE['spicy']!);
@@ -38,7 +40,10 @@ export interface SummaryMessagesOptions {
   persona?: string;
   /** user 正文里内容的标签（单趟=紧凑字幕；Map-Reduce Reduce=各段要点）。 */
   bodyLabel?: string;
-  outlineCoverage?: { from: number; to: number };
+  outlineCoverage?: { from: number; to: number; includeMiddle?: boolean; includeEnd?: boolean };
+  anchorAsrTopics?: boolean;
+  anchorAsrReduce?: boolean;
+  asrTranscript?: boolean;
 }
 
 /** 紧凑内容（[mm:ss]文本行）由调用方拼好传入，lib 层不碰 bilibili 数据源。 */
@@ -49,10 +54,15 @@ export function buildSummaryMessages(
 ): LlmMessage[] {
   const label = mo.bodyLabel ?? '紧凑字幕（[mm:ss]文本）';
   const coverage = mo.outlineCoverage;
-  const coverageHint = coverage ? `\n这是长视频。字幕实际范围为 ${Math.floor(coverage.from)}–${Math.floor(coverage.to)} 秒。先通读全部内容，再将全片章节合并为 6–12 条大纲；必须同时覆盖前段、中段和最后四分之一的内容，不能只用开头细节凑满条数。每条仍须使用该内容的真实时间戳，禁止为满足覆盖范围而虚构时间。` : '';
+  const coverageSections = coverage ? ['前段', ...(coverage.includeMiddle === false ? [] : ['中段']), ...(coverage.includeEnd === false ? [] : ['后段'])].join('、') : '';
+  const coverageHint = coverage ? `\n字幕实际范围为 ${Math.floor(coverage.from)}–${Math.floor(coverage.to)} 秒。先通读全部内容，再将章节合并为 6–12 条大纲；覆盖${coverageSections}已有的内容，不要只用开头细节凑满条数。每条仍须使用该内容的真实时间戳，不得虚构没有文字的时段。` : '';
+  const anchorHint = mo.anchorAsrTopics ? (mo.anchorAsrReduce
+    ? '\n输入是带句首标签的 Map 要点。每条大纲选择主题首次明确出现的相关要点，合并同一主题时采用对应的最早时间标签，不要以之后的演示、结果或总结时间代替。'
+    : '\n每条要点找到其主题首次明确出现的原文，time 使用对应句子开头的时间标签，不要以之后的演示、结果或总结时间代替。') : '';
+  const system = summarySystemPrompt(mo.persona) + anchorHint + (mo.asrTranscript ? `\n${ASR_SCOPE_INSTRUCTION}` : '');
   const user = `视频标题：${videoMeta.title}\n时长：${videoMeta.duration}秒\n字幕条数：${videoMeta.cueCount}${coverageHint}\n\n${label}：\n${transcriptText}`;
   return [
-    { role: 'system', content: summarySystemPrompt(mo.persona) },
+    { role: 'system', content: system },
     { role: 'user', content: user },
   ];
 }
@@ -131,9 +141,14 @@ export function validateSummary(v: unknown): string[] {
 export interface SummarizeOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
   onDelta?: (ev: StreamEvent) => void;
   /** 长视频按实际字幕范围检查大纲，拒绝只覆盖开头的结果。 */
-  outlineCoverage?: { from: number; to: number };
+  outlineCoverage?: { from: number; to: number; includeMiddle?: boolean; includeEnd?: boolean };
+  /** ASR 结果的大纲时间不可越过视频时长或倒序。 */
+  outlineTimeLimit?: number;
+  anchorAsrTopics?: boolean;
+  asrTranscript?: boolean;
 }
 
 export interface SummarizeOutcome {
@@ -162,21 +177,29 @@ export async function completeStructured(
       fetchImpl: opts.fetchImpl,
       timeoutMs: deadline === undefined ? undefined : Math.max(1_000, deadline - Date.now()),
       onDelta: opts.onDelta,
+      signal: opts.signal,
     });
 
   let messages = baseMessages;
   let usable: SummaryResult | null = null;
   for (let attempt = 1; ; attempt++) {
     const r = await run(messages);
+    if (opts.signal?.aborted) throw new LlmNetworkError('LLM 请求已取消');
     const { value, error } = parseSummary(r.text);
     const errs = error ? [error] : validateSummary(value);
+    if (value && opts.outlineTimeLimit !== undefined && Array.isArray(value.outline) && value.outline.every(o => typeof o?.time === 'number' && Number.isFinite(o.time))) {
+      const times=value.outline.map(o=>o.time);
+      if(times.some((time,i)=>time<0 || time>opts.outlineTimeLimit! || (i>0 && time<times[i-1]!))) errs.push(`outline 时间必须按顺序排列且位于 0–${opts.outlineTimeLimit} 秒内`);
+    }
     const range = opts.outlineCoverage;
     if (value && range && Array.isArray(value.outline) && value.outline.length && value.outline.every(o => typeof o?.time === 'number' && Number.isFinite(o.time))) {
       const times = value.outline.map(o => o.time);
       const span = range.to - range.from;
-      if (times.some((time, i) => time < Math.floor(range.from) || time > Math.ceil(range.to) || (i > 0 && time <= times[i - 1]!))) errs.push('outline 时间戳须位于字幕范围内并严格递增');
-      if (span > 0 && (times[0]! > range.from + span * .25 || times.at(-1)! < range.from + span * .75 || !times.some(t => t >= range.from + span * .25 && t <= range.from + span * .75))) {
-        errs.push(`outline 覆盖不足：需依据真实字幕同时概括前段、中段和最后四分之一（${Math.floor(range.from + span * .75)}秒以后），请合并开头细节并补充后半段章节`);
+      const middleStart = Math.floor(range.from + span * .25);
+      const endStart = Math.floor(range.from + span * .75);
+      if (times.some((time, i) => time < Math.floor(range.from) || time > Math.ceil(range.to) || (i > 0 && time < times[i - 1]!))) errs.push('outline 时间戳须位于字幕范围内并按时间升序');
+      if (span > 0 && (times[0]! > middleStart || (range.includeEnd !== false && times.at(-1)! < endStart) || (range.includeMiddle !== false && !times.some(t => t >= middleStart && t <= endStart)))) {
+        errs.push('outline 覆盖不足：请依据已有文字概括前、中、后段的相关内容，合并重复的开头细节；没有文字的时段不要虚构');
       }
     }
     if (value && errs.length === 0) {
@@ -220,7 +243,7 @@ export async function summarize(
   opts: SummarizeOptions & SummaryMessagesOptions = {},
 ): Promise<SummarizeOutcome> {
   const { persona, bodyLabel, ...streamOpts } = opts;
-  return completeStructured(cfg, buildSummaryMessages(videoMeta, transcriptText, { persona, bodyLabel, outlineCoverage: opts.outlineCoverage }), streamOpts);
+  return completeStructured(cfg, buildSummaryMessages(videoMeta, transcriptText, { persona, bodyLabel, outlineCoverage: opts.outlineCoverage, anchorAsrTopics: opts.anchorAsrTopics, asrTranscript: opts.asrTranscript }), streamOpts);
 }
 
 export interface StoredLlmConfig {

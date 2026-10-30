@@ -1,5 +1,5 @@
 // P1.11 · F13 分段解读单测：段区间/切片/截断/Prompt 边界/注记写回/执行体（缓存零请求、失败落注记）。
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { indexedDB, IDBKeyRange } from 'fake-indexeddb';
@@ -21,6 +21,12 @@ import { Pipeline } from '../src/lib/pipeline';
 const freshDb = (): CompanionDB => new CompanionDB(`seg-${Math.random()}`, { indexedDB, IDBKeyRange });
 const VIDEO_KEY = 'BV1seg:424242';
 const SKEY = summaryKey(VIDEO_KEY, 'mock-model');
+
+it('恢复后旧模型摘要的大纲不可用于新的分段解读',async()=>{
+ const db=freshDb();await seedDoneSummary(db);await db.summaries.update(SKEY,{source:'asr',asrOutdated:true});const fetchImpl=vi.fn(async()=>new Response(''));
+ expect(await runSegmentJob({db,bili:silentBili(),llm:{baseUrl:'https://llm.test',model:'mock-model',apiKey:'x'},fetchImpl},{videoKey:VIDEO_KEY,segIndex:0})).toMatchObject({result:'failed',error:{code:'ASR_CONTENT_UNCONFIRMED'}});
+ expect(fetchImpl).not.toHaveBeenCalled();await db.delete();
+});
 
 const outline: OutlineItem[] = [
   { time: 0, text: '开场' },
@@ -107,6 +113,22 @@ const silentBili = (): BiliApi => ({
   async fetchTranscript() {
     throw new Error('不应下载字幕（缓存命中）');
   },
+});
+
+it.each([false,true])('ASR 分段解读及必要分块遵守语音文字边界（长段：%s）', async (long) => {
+  const db = freshDb();
+  await seedDoneSummary(db);
+  await db.summaries.update(SKEY,{source:'asr'});
+  const transcriptCues = long
+    ? Array.from({length:100},(_,i)=>({from:i*.5,to:i*.5+.4,text:'实验旁白'.repeat(25)}))
+    : [{from:1,to:3,text:'提到实验'}];
+  await db.transcripts.put({key:VIDEO_KEY,source:'asr',lan:'asr',cues:transcriptCues,charCount:transcriptCues.reduce((n,c)=>n+c.text.length,0),cachedAt:Date.now()});
+  const systems:string[]=[];
+  const fetchImpl:typeof fetch=async(_url,init)=>{const body=JSON.parse(String(init?.body));const system=String(body.messages[0].content);systems.push(system);const text=system.includes('字幕片段分析器')?'[00:01] 实验旁白':'客观解读';return new Response(`data: ${JSON.stringify({choices:[{delta:{content:text}}]})}\n\ndata: [DONE]\n\n`,{status:200});};
+  expect((await runSegmentJob({db,bili:silentBili(),llm:{baseUrl:'https://llm.test/v1',model:'mock-model',apiKey:'x'},fetchImpl},{videoKey:VIDEO_KEY,segIndex:0})).result).toBe('done');
+  if(long)expect(systems.some(s=>s.includes('字幕片段分析器'))).toBe(true);
+  expect(systems.every(s=>s.includes('不包含视频画面')&&s.includes('不能因为语音没有提到'))).toBe(true);
+  await db.delete();
 });
 
 it('超长分段完整读取尾部字幕，再合并解读，不截掉 6000 字以后的内容', async () => {
@@ -386,7 +408,7 @@ describe('审查修复回归', () => {
   it('reasoning_content 增量不进正文/onDelta，仅 content 计入注记（F13 提速：思考链不污染 UI）', async () => {
     const db = freshDb();
     await seedDoneSummary(db);
-    const base = await start(async (req, res) => {
+    const base = await start(async (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
       // 思考模型：先吐 reasoning_content（不应出现在正文），再吐 content
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '思考中'.repeat(30) } }] })}\n\n`);

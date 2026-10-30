@@ -15,6 +15,7 @@ import {
   type AsrConfig,
 } from '../src/lib/asr';
 import { runAsrJob, type AsrBiliApi } from '../src/lib/summarize/asr';
+import { runSummarizeJob } from '../src/lib/summarize/chain';
 import { AsrHttpError } from '../src/lib/asr';
 import { CompanionDB, summaryKey } from '../src/lib/storage';
 import type { JobStage } from '../src/lib/storage';
@@ -76,6 +77,10 @@ describe('选源（urlHostClass / pickAudioStream，架构 §3.8）', () => {
 });
 
 describe('转写归一化（verbose_json / json 退化）', () => {
+  it('仅有英文分句时保留单词边界', () => {
+    const r=normalizeTranscription({segments:[{start:0,end:1,text:'hello'},{start:1,end:2,text:'world'}]},2);
+    expect(r.text).toBe('hello world');
+  });
   it('verbose_json.segments → cues（trim 空段滤除）；text 取响应 text 或拼接', () => {
     const r = normalizeTranscription(
       { text: '全文', segments: [{ start: 0, end: 2, text: ' 你好 ' }, { start: 2, end: 4, text: '' }, { start: 4, end: 6, text: '世界' }] },
@@ -101,16 +106,36 @@ describe('体量预估与错误映射', () => {
     expect(estimateAudioBytes(60 * 60)).toBeGreaterThan(29_000_000);
     expect(estimateAudioBytes(60 * 60)).toBeLessThan(30_000_000);
   });
-  it('mapAsrError：401→KEY_INVALID、413→AUDIO_TOO_LARGE、超时→AUDIO_TOO_LARGE、网络→ASR_NETWORK', () => {
+  it('mapAsrError：区分 Key、音频超限、识别超时和网络错误', () => {
     expect(mapAsrError(new AsrHttpError(401, 'x')).code).toBe('KEY_INVALID');
     expect(mapAsrError(new AsrHttpError(413, 'x')).code).toBe('AUDIO_TOO_LARGE');
-    expect(mapAsrError(new Error('ASR_TIMEOUT')).code).toBe('AUDIO_TOO_LARGE');
+    expect(mapAsrError(new Error('ASR_TIMEOUT'))).toMatchObject({code:'ASR_TIMEOUT',msg:expect.stringContaining('超时')});
     expect(mapAsrError(new Error('ASR_NETWORK:boom')).code).toBe('ASR_NETWORK');
   });
 });
 
 describe('transcribeAudio（multipart wire 级）', () => {
   const cfg: AsrConfig = { baseUrl: 'http://127.0.0.1:1/v1', modelId: 'sense-small', apiKey: 'sk-asr-test' };
+  it('开始前取消不会向兼容 ASR 发送音频', async () => {
+    const controller = new AbortController(); controller.abort();
+    let requests = 0;
+    const send:typeof fetch = async () => { requests++; return new Response('{}'); };
+    await expect(transcribeAudio(cfg,{bytes:new ArrayBuffer(2),filename:'audio.m4a'},2,{fetchImpl:send,signal:controller.signal}))
+      .rejects.toThrow('ASR_CANCELLED');
+    expect(requests).toBe(0);
+  });
+  it('识别中取消会中止兼容 ASR 请求', async () => {
+    const controller = new AbortController();
+    let notifyStarted!:()=>void;
+    const started = new Promise<void>(resolve=>{notifyStarted=resolve;});
+    const send:typeof fetch = async (_url,init) => new Promise<Response>((_resolve,reject)=>{
+      notifyStarted();
+      init?.signal?.addEventListener('abort',()=>reject(new Error('cancelled')),{once:true});
+    });
+    const work = transcribeAudio(cfg,{bytes:new ArrayBuffer(2),filename:'audio.m4a'},2,{fetchImpl:send,timeoutMs:50,signal:controller.signal});
+    await started; controller.abort();
+    await expect(work).rejects.toThrow('ASR_CANCELLED');
+  });
   it('请求形状：POST /audio/transcriptions + Bearer + multipart（file/model/response_format=verbose_json）', async () => {
     let seen = { url: '', auth: '', ct: '', body: '' };
     const srv = http.createServer((req, res) => {
@@ -183,6 +208,39 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
   const fetchAudioOk = async () =>
     new Response(new Uint8Array(1024).buffer, { status: 200 });
 
+  it.each(['asr', 'llm'] as const)('兼容 ASR 在 %s 阶段清除会话后，迟到结果不能复活数据', async (phase) => {
+    const db = freshDb();
+    const now = Date.now();
+    await db.sessions.put({id:'s',state:'ACTIVE',startedAt:now,lastActiveAt:now});
+    await db.jobs.put({id:'j',sessionId:'s',runId:'r',videoKey:VIDEO_KEY,type:'ASR_SUMMARIZE',status:'running',progress:0,retries:0,createdAt:now,updatedAt:now});
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:now});
+    let notifyStarted!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { notifyStarted = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const text = '这是一段需要保留的完整语音内容';
+    const valid = JSON.parse(validSummaryJson());
+    valid.outline = valid.outline.map((item:{time:number}, i:number) => ({...item,time:i * 15}));
+    const endpoint = async (url:string|URL|Request):Promise<Response> => {
+      if (String(url).includes('/audio/transcriptions')) {
+        if (phase === 'asr') { notifyStarted(); await gate; }
+        return new Response(JSON.stringify({text,segments:[{start:0,end:10,text}]}));
+      }
+      if (phase === 'llm') { notifyStarted(); await gate; }
+      return new Response(`data: ${JSON.stringify({choices:[{delta:{content:JSON.stringify(valid)}}]})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});
+    };
+    const work = runAsrJob({db,bili:mkBili([audio()]),llm:{baseUrl:'https://llm.test/v1',model:'m',apiKey:'k'},asr:{baseUrl:'https://asr.test/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchAudio:fetchAudioOk as typeof fetch,fetchImpl:endpoint as typeof fetch},
+      {videoKey:VIDEO_KEY,id:'j',sessionId:'s',runId:'r'},{update:async()=>{}});
+    await started;
+    await db.transaction('rw',db.sessions,db.jobs,db.videos,db.transcripts,db.summaries,async()=>{
+      await db.sessions.clear(); await db.jobs.clear(); await db.videos.clear(); await db.transcripts.clear(); await db.summaries.clear();
+    });
+    release();
+    expect(await work).toMatchObject({result:'failed',error:{code:'ASR_JOB_STALE'}});
+    expect(await db.transcripts.count()).toBe(0);
+    expect(await db.summaries.count()).toBe(0);
+    await db.delete();
+  });
+
   it('happy path：音频→转写→摘要 done（source=asr）+ transcripts 落库 + 阶段三段有序', async () => {
     const db = freshDb();
     await db.videos.put({
@@ -193,14 +251,16 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
       key: summaryKey(VIDEO_KEY, 'mock-model'), videoKey: VIDEO_KEY, source: 'asr', summary: '', outline: [],
       evaluation: '', rating: 0, modelId: 'mock-model', persona: 'spicy', status: 'need_asr', createdAt: 1,
     });
-    const llm = await startMockLlm(() => ({ chunks: [validSummaryJson()] }));
+    const summary = JSON.parse(validSummaryJson());
+    summary.outline = summary.outline.map((item:{time:number}, i:number) => ({...item,time:i * 15}));
+    const llm = await startMockLlm(() => ({ chunks: [JSON.stringify(summary)] }));
     servers.push(llm);
     const asrFetch = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const u = String(url);
       if (u.includes('/audio/transcriptions')) {
         const text = '这是一段足够长的语音转写内容，用于越过低内容判定阈值，确保进入摘要阶段。'.repeat(3);
         return new Response(
-          JSON.stringify({ text, segments: [{ start: 0, end: 10, text: '这是一段足够长的语音转写内容' }] }),
+          JSON.stringify({ text, segments: [{ start: 0, end: 10, text }] }),
           { status: 200 },
         );
       }
@@ -263,7 +323,7 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
     await db.delete();
   });
 
-  it('转写 <50 字 → LOW_CONTENT：摘要行 failed（F6-⑧ 文案）；不写 transcripts（审查 P2-5：<50 字缓存会让 SUMMARIZE 重试把「很短」喂 LLM 出幻觉摘要）', async () => {
+  it('兼容 ASR 短讲话保留转写，不当作无语音', async () => {
     const db = freshDb();
     await db.videos.put({
       key: VIDEO_KEY, bvid: 'BV1noSub', aid: 1, cid: 777, title: 't', cover: 'c', owner: 'up',
@@ -273,19 +333,24 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
       key: summaryKey(VIDEO_KEY, 'm'), videoKey: VIDEO_KEY, source: 'asr', summary: '', outline: [],
       evaluation: '', rating: 0, modelId: 'm', persona: 'spicy', status: 'need_asr', createdAt: 1,
     });
-    const f = async (url: string | URL | Request): Promise<Response> => {
+    const valid = JSON.parse(validSummaryJson());
+    valid.outline = valid.outline.map((item:{time:number}, i:number) => ({...item,time:i * 15}));
+    const llm = await startMockLlm(() => ({ chunks: [JSON.stringify(valid)] }));
+    servers.push(llm);
+    const f = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const u = String(url);
       if (u.includes('/audio/transcriptions')) {
-        return new Response(JSON.stringify({ text: '很短', segments: [{ start: 0, end: 1, text: '很短' }] }), { status: 200 });
+        return new Response(JSON.stringify({ text: '很短。', segments: [{ start: 0, end: 1, text: '很短' }] }), { status: 200 });
       }
-      return fetchAudioOk();
+      if (u.includes('bilivideo.com')) return fetchAudioOk();
+      return fetch(url, init);
     };
     const { ctx } = ctxLog();
     const out = await runAsrJob(
       {
         db,
         bili: mkBili([audio()]),
-        llm: { baseUrl: 'http://127.0.0.1:9', model: 'm', apiKey: 'k' },
+        llm: { baseUrl: llm.url, model: 'm', apiKey: 'k' },
         asr: { baseUrl: 'http://127.0.0.1:9/v1', modelId: 's', apiKey: 'k' },
         asrMaxMB: 25,
         fetchImpl: f as typeof fetch,
@@ -294,15 +359,129 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
       { videoKey: VIDEO_KEY },
       ctx,
     );
-    expect(out.result).toBe('failed');
-    if (out.result === 'failed') {
-      expect(out.error.code).toBe('LOW_CONTENT');
-      expect(out.error.msg).toContain('几乎没有可解析的语音内容');
-    }
-    const sum = await db.summaries.get(summaryKey(VIDEO_KEY, 'm'));
-    expect(sum?.status).toBe('failed');
-    expect(sum?.error?.code).toBe('LOW_CONTENT');
-    expect(await db.transcripts.get(VIDEO_KEY)).toBeUndefined(); // 审查 P2-5：LOW_CONTENT 不落转写缓存
+    expect(out).toMatchObject({result:'failed',error:{code:'ASR_TOO_SHORT'}});
+    expect((await db.transcripts.get(VIDEO_KEY))?.cues).toEqual([{from:0,to:1,text:'很短'}]);
+    expect((await db.summaries.get(summaryKey(VIDEO_KEY, 'm')))?.status).toBe('failed');expect(llm.calls).toHaveLength(0);
+    const again=await runSummarizeJob({db,bili:mkBili([audio()]),llm:{baseUrl:llm.url,model:'m',apiKey:'test-only'},fetchImpl:f as typeof fetch},{videoKey:VIDEO_KEY},ctx,{force:true});
+    expect(again).toMatchObject({result:'failed',error:{code:'ASR_TOO_SHORT'}});expect(llm.calls).toHaveLength(0);
+    await db.delete();
+  });
+
+  it.each([
+    ['无时间戳', {text:'这段语音有内容'}],
+    ['部分时间戳缺失', {text:'这段语音有内容',segments:[{start:1,end:2,text:'这段语音'},{start:3,text:'有内容'}]}],
+    ['倒序时间戳', {text:'这段语音有内容',segments:[{start:4,end:5,text:'这段语音'},{start:1,end:2,text:'有内容'}]}],
+    ['超出视频范围', {text:'这段语音有内容',segments:[{start:121,end:123,text:'这段语音有内容'}]}],
+  ])('兼容 ASR %s 时保留原文且不生成全片摘要', async (_name, response) => {
+    const db = freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const f = async (url: string | URL | Request): Promise<Response> => String(url).includes('/audio/transcriptions')
+      ? new Response(JSON.stringify(response),{status:200}) : fetchAudioOk();
+    const out = await runAsrJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}});
+    expect(out).toMatchObject({result:'failed',error:{code:'ASR_TIMESTAMP_MISSING'}});
+    const summary=await db.summaries.get(summaryKey(VIDEO_KEY,'m'));
+    expect(summary?.status).not.toBe('done');
+    expect(summary?.asrProgress?.unconfirmed?.[0]?.text).toBe('这段语音有内容');
+    expect(summary?.outline).toEqual([]);
+    await runSummarizeJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},fetchImpl:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}},{force:true});
+    await runSummarizeJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},fetchImpl:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}},{force:true});
+    expect((await db.summaries.get(summaryKey(VIDEO_KEY,'m')))?.asrProgress?.unconfirmed?.[0]?.text).toBe('这段语音有内容');
+    await db.delete();
+  });
+
+  it('兼容 ASR 无时间信息时保留已有转写和本次原文', async () => {
+    const db=freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const old={key:VIDEO_KEY,source:'asr' as const,lan:'asr',cues:[{from:2,to:4,text:'旧原文'}],charCount:3,cachedAt:1};
+    await db.transcripts.put(old);
+    const f=async (url:string|URL|Request)=>String(url).includes('/audio/transcriptions')?new Response(JSON.stringify({text:'本次原文'})):fetchAudioOk();
+    await runAsrJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}});
+    expect(await db.transcripts.get(VIDEO_KEY)).toEqual(old);
+    expect((await db.summaries.get(summaryKey(VIDEO_KEY,'m')))?.asrProgress?.unconfirmed?.[0]?.text).toBe('本次原文');
+    await db.delete();
+  });
+
+  it('新转写与旧转写不同时保留旧数据及新原文，不生成全片结果', async () => {
+    const db=freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const old={key:VIDEO_KEY,source:'asr' as const,lan:'asr',cues:[{from:2,to:4,text:'旧原文'}],charCount:3,cachedAt:1};
+    await db.transcripts.put(old);
+    const f=async (url:string|URL|Request)=>String(url).includes('/audio/transcriptions')?new Response(JSON.stringify({text:'新原文',segments:[{start:1,end:3,text:'新原文'}]})):fetchAudioOk();
+    const out=await runAsrJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}});
+    expect(out).toMatchObject({result:'failed',error:{code:'ASR_CONTENT_UNCONFIRMED'}});
+    expect(await db.transcripts.get(VIDEO_KEY)).toEqual(old);
+    expect((await db.summaries.get(summaryKey(VIDEO_KEY,'m')))?.asrProgress?.unconfirmed?.[0]?.text).toBe('新原文');
+    await db.delete();
+  });
+
+  it('兼容 ASR 空语音明确提示内容不足', async () => {
+    const db=freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const f=async (url:string|URL|Request)=>String(url).includes('/audio/transcriptions')?new Response(JSON.stringify({text:'  '})):fetchAudioOk();
+    const out=await runAsrJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}});
+    expect(out).toMatchObject({result:'failed',error:{code:'LOW_CONTENT'}});
+    expect((await db.summaries.get(summaryKey(VIDEO_KEY,'m')))?.error?.msg).toContain('未识别到可用语音');
+    await db.delete();
+  });
+
+  it.each([
+    ['温度+5度','温度5度'],
+    ['增长5%','增长5'],
+    ['a part','apart'],
+    ['数值1.5','数值15'],
+  ])('兼容 ASR 原文 %s 与分句 %s 含义冲突时不能生成完整结果',async(text,segment)=>{
+    const db=freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const f=async (url:string|URL|Request)=>String(url).includes('/audio/transcriptions')?new Response(JSON.stringify({text,segments:[{start:1,end:3,text:segment}]})):fetchAudioOk();
+    const out=await runAsrJob({db,bili:mkBili([audio()]),llm:{baseUrl:'http://127.0.0.1:9',model:'m',apiKey:'k'},asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}});
+    expect(out).toMatchObject({result:'failed',error:{code:'ASR_CONTENT_UNCONFIRMED'}});
+    const summary=await db.summaries.get(summaryKey(VIDEO_KEY,'m'));
+    expect(summary?.asrProgress?.unconfirmed?.[0]?.text).toBe(text);
+    expect(summary?.status).not.toBe('done');
+    await db.delete();
+  });
+
+  it.each(['空语音','仍冲突','成功'] as const)('连续两次兼容 ASR：第二次%s不丢第一次未确认原文',async(second)=>{
+    const db=freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const valid=JSON.parse(validSummaryJson());valid.outline=valid.outline.map((item:{time:number},i:number)=>({...item,time:i*15}));
+    const llm=await startMockLlm(()=>({chunks:[JSON.stringify(valid)]}));servers.push(llm);
+    let asrRequests=0;
+    const f=async (url:string|URL|Request,init?:RequestInit):Promise<Response>=>{
+      const u=String(url);
+      if(u.includes('/audio/transcriptions')){
+        asrRequests++;
+        const body=asrRequests===1?{text:'第一次未确认原文'}:second==='空语音'?{text:''}:second==='仍冲突'?{text:'第二次+5',segments:[{start:1,end:2,text:'第二次5'}]}:{text:'第二次成功结果',segments:[{start:1,end:2,text:'第二次成功结果'}]};
+        return new Response(JSON.stringify(body));
+      }
+      if(u.includes('bilivideo.com'))return fetchAudioOk();
+      return fetch(url,init);
+    };
+    const deps={db,bili:mkBili([audio()]),llm:{baseUrl:llm.url,model:'m',apiKey:'k'},asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch};
+    await runAsrJob(deps,{videoKey:VIDEO_KEY},{update:async()=>{}});
+    await runAsrJob(deps,{videoKey:VIDEO_KEY},{update:async()=>{}});
+    const summary=await db.summaries.get(summaryKey(VIDEO_KEY,'m'));
+    expect(summary?.asrProgress?.unconfirmed?.map(x=>x.text)).toContain('第一次未确认原文');
+    if(second==='仍冲突')expect(summary?.asrProgress?.unconfirmed?.map(x=>x.text)).toContain('第二次+5');
+    if(second==='成功')expect(summary?.status).toBe('done');
+    expect(asrRequests).toBe(2);
+    await db.delete();
+  });
+
+  it('有字幕后生成字幕摘要，仍保留先前未确认的语音原文',async()=>{
+    const db=freshDb();
+    await db.videos.put({key:VIDEO_KEY,bvid:'BV1noSub',aid:1,cid:777,title:'t',cover:'c',owner:'up',duration:120,page:1,fetchedAt:Date.now()});
+    const valid=JSON.parse(validSummaryJson());valid.outline=valid.outline.map((item:{time:number},i:number)=>({...item,time:i*15}));
+    const llm=await startMockLlm(()=>({chunks:[JSON.stringify(valid)]}));servers.push(llm);
+    const f=async (url:string|URL|Request)=>String(url).includes('/audio/transcriptions')?new Response(JSON.stringify({text:'第一次未确认原文'})):fetchAudioOk();
+    const base={db,llm:{baseUrl:llm.url,model:'m',apiKey:'k'}};
+    await runAsrJob({...base,bili:mkBili([audio()]),asr:{baseUrl:'http://127.0.0.1:9/v1',modelId:'s',apiKey:'k'},asrMaxMB:25,fetchImpl:f as typeof fetch,fetchAudio:f as typeof fetch},{videoKey:VIDEO_KEY},{update:async()=>{}});
+    const bili={...mkBili([]),getPlayerSubtitles:async()=>({subtitles:[{lan:'ai-zh',subtitle_url:'https://example.test/subtitle'}],needLoginSubtitle:null}),fetchTranscript:async()=>[{from:0,to:10,content:'字幕内容'}]};
+    const out=await runSummarizeJob({...base,bili},{videoKey:VIDEO_KEY},{update:async()=>{}},{force:true});
+    expect(out.result).toBe('done');
+    const summary=await db.summaries.get(summaryKey(VIDEO_KEY,'m'));
+    expect(summary?.source).toBe('ai_sub');
+    expect(summary?.asrProgress?.unconfirmed?.map(x=>x.text)).toContain('第一次未确认原文');
     await db.delete();
   });
 
@@ -345,9 +524,11 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
     });
     // 转写成功；LLM 401
     const text = '这是一段足够长的语音转写内容，用于越过低内容判定阈值，确保进入摘要阶段。'.repeat(3);
+    let asrRequests = 0;
     const f = async (url: string | URL | Request): Promise<Response> => {
       const u = String(url);
       if (u.includes('/audio/transcriptions')) {
+        asrRequests++;
         return new Response(JSON.stringify({ text, segments: [{ start: 0, end: 10, text }] }), { status: 200 });
       }
       if (u.includes('bilivideo.com')) return fetchAudioOk();
@@ -371,6 +552,13 @@ describe('runAsrJob 全链（fake-indexeddb + fake bili/asr + mock LLM SSE）', 
     const sum = await db.summaries.get(summaryKey(VIDEO_KEY, 'm'));
     expect(sum?.status).toBe('failed'); // 不保留 need_asr：重试只重跑 LLM（transcripts 已缓存）
     expect((await db.transcripts.get(VIDEO_KEY))?.source).toBe('asr');
+    const valid = JSON.parse(validSummaryJson());
+    valid.outline = valid.outline.map((item:{time:number}, i:number) => ({...item,time:i * 15}));
+    const llm = await startMockLlm(() => ({chunks:[JSON.stringify(valid)]}));
+    servers.push(llm);
+    const retry = await runSummarizeJob({db,bili:mkBili([audio()]),llm:{baseUrl:llm.url,model:'m',apiKey:'k'}},{videoKey:VIDEO_KEY},{update:async()=>{}},{force:true});
+    expect(retry.result).toBe('done');
+    expect(asrRequests).toBe(1);
     await db.delete();
   });
 

@@ -15,7 +15,7 @@ export type SummaryEventType =
   | 'SEGMENT_NOTE_FAILED';
 
 export interface UiEvent {
-  type: SummaryEventType | 'SESSION_STATE' | 'SEEK_TO' | 'LOGIN_STATE' | 'UPDATE_AVAILABLE' | 'WATCH_SETTINGS';
+  type: SummaryEventType | 'SESSION_STATE' | 'SEEK_TO' | 'LOGIN_STATE' | 'UPDATE_AVAILABLE' | 'WATCH_SETTINGS' | 'EXTENSION_RELOAD_REQUIRED';
   paused?: boolean;
   restartWatcher?: boolean;
   updateVersion?: string | null;
@@ -84,11 +84,17 @@ export class Bridge {
         if (e && typeof e.type === 'string') this.onEvent(e);
       });
       port.onDisconnect.addListener(() => {
+        try { void browser.runtime.lastError; } catch { /* 扩展上下文可能已失效 */ }
         if (this.#port !== port) return;
         this.#port = null;
         this.#reconnect();
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('Extension context invalidated')) {
+        this.#closed = true;
+        this.onEvent({type:'EXTENSION_RELOAD_REQUIRED'});
+        return;
+      }
       this.#reconnect();
     }
   }

@@ -129,7 +129,8 @@ describe('执行与终态', () => {
     expect((await db.jobs.get(second.id))?.status).toBe('pending');
     online = true;
     await p.drain(true);
-    expect(seen).toEqual(['first', 'first', 'second']);
+    expect(seen[0]).toBe('first');
+    expect(seen.slice(1).sort()).toEqual(['first', 'second']); // 同毫秒入队时次序未定义，恢复后两项均执行即可。
     await db.delete();
   });
 
@@ -190,7 +191,7 @@ describe('执行与终态', () => {
     await db.delete();
   });
   it('done：progress 落到 100；stage/progress 更新持久化', async () => {
-    const { db, p } = mkPipeline(async (job, ctx) => {
+    const { db, p } = mkPipeline(async (_job, ctx) => {
       await ctx.update({ stage: 'subtitle', progress: 30 });
       await ctx.update({ stage: 'llm_map', progress: 60 });
       return { result: 'done' };
@@ -245,7 +246,7 @@ describe('自动重试 ≤1', () => {
 
   it('executor 抛异常等同失败；首败重试后成功 → done', async () => {
     let calls = 0;
-    const { db, p } = mkPipeline(async (job, ctx) => {
+    const { db, p } = mkPipeline(async (_job, ctx) => {
       calls += 1;
       if (calls === 1) throw new Error('网络炸了');
       await ctx.update({ stage: 'llm_reduce', progress: 80 });
@@ -516,4 +517,121 @@ describe('F13 双通道 lane + prio 优先级', () => {
     expect((await db.jobs.get('r2'))?.status).toBe('pending');
     await db.delete();
   });
+});
+
+describe('ASR 中断后的计费安全', () => {
+  it('恢复在途 ASR 时标记需用户确认，其他任务仍可恢复', async () => {
+    const db=freshDb(); const calls:string[]=[];
+    const p=new Pipeline(db,{execute:async job=>{calls.push(job.id);return {result:'done'};}});
+    await db.jobs.put(mkJob({id:'asr-running',type:'ASR_SUMMARIZE',status:'running'}));
+    await db.jobs.put(mkJob({id:'other-running',type:'SUMMARIZE',status:'running',createdAt:2}));
+    await p.recover(); await p.drain();
+    expect(calls).toEqual(['other-running']);
+    expect(await db.jobs.get('asr-running')).toMatchObject({status:'failed',error:{code:'ASR_INTERRUPTED'}});
+    await db.delete();
+  });
+  it('ASR 返回网络等待时不自动排队发送', async () => {
+    const db=freshDb();let calls=0;
+    const p=new Pipeline(db,{execute:async()=>{calls++;return {result:'wait',error:{code:'OFFLINE',msg:'离线'}};}});
+    const j=await p.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'s'});
+    await p.drain();await p.drain(true);
+    expect(calls).toBe(1);expect(await db.jobs.get(j.id)).toMatchObject({status:'failed',error:{code:'ASR_INTERRUPTED'}});
+    await db.delete();
+  });
+  it('恢复后的旧任务即使迟到完成也不能覆盖中断状态', async () => {
+    const db=freshDb();let release!:()=>void,reached!:()=>void;
+    const gate=new Promise<void>(r=>{release=r}), started=new Promise<void>(r=>{reached=r});
+    const p=new Pipeline(db,{execute:async(_j,ctx)=>{reached();await gate;await ctx.update({progress:90});return {result:'done'};}});
+    const j=await p.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'s'});
+    const running=p.drain();await started;
+    const restarted=new Pipeline(db,{execute:async()=>({result:'done'})});
+    await restarted.recover();release();await running;
+    expect(await db.jobs.get(j.id)).toMatchObject({status:'failed',error:{code:'ASR_INTERRUPTED'}});
+    await db.delete();
+  });
+});
+
+it('任务启动门禁等待时数据被清除，不会重新创建并执行任务', async () => {
+  const db=freshDb();let release!:()=>void,reached!:()=>void,calls=0;
+  const gate=new Promise<void>(r=>{release=r}),started=new Promise<void>(r=>{reached=r});
+  const p=new Pipeline(db,{execute:async()=>{calls++;return {result:'done'};}},{canRun:async()=>{reached();await gate;return true;}});
+  await p.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'s'});
+  const running=p.drain();await started;await db.jobs.clear();release();await running;
+  expect(calls).toBe(0);expect(await db.jobs.count()).toBe(0);await db.delete();
+});
+
+it.each([false,true])('领取时会话已结束，GRACE 手动许可=%s 时执行资格正确',async(manual)=>{
+ const db=freshDb();let release!:()=>void,reached!:()=>void,calls=0;
+ const gate=new Promise<void>(r=>{release=r}),started=new Promise<void>(r=>{reached=r});
+ await db.sessions.put({id:'s',state:'ACTIVE',startedAt:1,lastActiveAt:1});
+ const p=new Pipeline(db,{execute:async()=>{calls++;return {result:'done'};}},{enforceSession:true,canRun:async()=>{reached();await gate;return {allowInGrace:manual};}} as any);
+ const j=await p.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'s'});
+ const run=p.tick();await started;await db.sessions.update('s',{state:'GRACE'});release();await run;
+ expect(calls).toBe(manual?1:0);expect((await db.jobs.get(j.id))?.status).toBe(manual?'done':'pending');await db.delete();
+});
+
+it('两个队列实例同时抢占同一任务时只执行一次', async () => {
+  const db=freshDb();let arrived=0,release!:()=>void,calls=0;const gate=new Promise<void>(r=>{release=r});
+  const options={canRun:async()=>{if(++arrived===2)release();await gate;return true;}};
+  const handlers={execute:async()=>{calls++;return {result:'done' as const};}};
+  const one=new Pipeline(db,handlers,options),two=new Pipeline(db,handlers,options);
+  await one.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'s'});
+  await Promise.all([one.drain(),two.drain()]);expect(calls).toBe(1);await db.delete();
+});
+
+it('中断后用户重试时旧执行体不能覆盖新租约的结果', async () => {
+  const db=freshDb();let releaseOld!:()=>void,reachedOld!:()=>void,releaseNew!:()=>void,reachedNew!:()=>void;
+  const oldGate=new Promise<void>(r=>{releaseOld=r}),oldStarted=new Promise<void>(r=>{reachedOld=r});
+  const newGate=new Promise<void>(r=>{releaseNew=r}),newStarted=new Promise<void>(r=>{reachedNew=r});
+  const old=new Pipeline(db,{execute:async(_job,ctx)=>{reachedOld();await oldGate;await ctx.update({progress:99});return {result:'done'};}});
+  const job=await old.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'s'});const oldRun=old.drain();await oldStarted;
+  const current=new Pipeline(db,{execute:async()=>{reachedNew();await newGate;return {result:'failed',error:{code:'NEW_ERROR',msg:'new'}};}});
+  await current.recover();await current.retry(job.id);const newRun=current.drain();await newStarted;
+  releaseOld();await oldRun;expect(await db.jobs.get(job.id)).toMatchObject({status:'running',progress:0});
+  releaseNew();await newRun;expect(await db.jobs.get(job.id)).toMatchObject({status:'failed',error:{code:'NEW_ERROR'}});await db.delete();
+});
+
+it('恢复中断的语音任务时保留已完成要点并标注未完成', async () => {
+  const db=freshDb();await db.jobs.put(mkJob({id:'interrupted',type:'ASR_SUMMARIZE',videoKey:'v',status:'running'}));
+  await db.summaries.put({key:'v:m',videoKey:'v',source:'asr',summary:'',outline:[],evaluation:'',rating:0,modelId:'m',persona:'spicy',status:'streaming',createdAt:1,asrProgress:{sessionId:'s',processedUntil:29,targetDuration:120,status:'running',parts:[{from:0,to:29,text:'局部要点'}]}});
+  const p=new Pipeline(db,{execute:async()=>({result:'done'})});await p.recover();
+  expect((await db.summaries.get('v:m'))?.status).toBe('need_asr');
+  expect((await db.summaries.get('v:m'))?.asrProgress).toMatchObject({processedUntil:29,status:'partial',parts:[{from:0,to:29,text:'局部要点'}]});
+  expect((await db.summaries.get('v:m'))?.asrProgress?.warning).toContain('中断');await db.delete();
+});
+
+it('不同陪看会话中的同视频任务互不复用，避免旧会话阻挡新会话', async () => {
+  const db=freshDb();const p=new Pipeline(db,{execute:async()=>({result:'done'})});
+  const old=await p.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'old'});
+  const current=await p.enqueue({type:'ASR_SUMMARIZE',videoKey:'v',sessionId:'new'});
+  expect(current.id).not.toBe(old.id);expect(current.sessionId).toBe('new');await db.delete();
+});
+
+it('后台重启时离屏语音任务仍持有租约，则不将它误判为中断',async()=>{
+ const db=freshDb();await db.jobs.put(mkJob({id:'live-asr',sessionId:'s',type:'ASR_SUMMARIZE',status:'running',runId:'active-run'}));
+ const p=new Pipeline(db,{execute:async()=>({result:'done'})});
+ expect(await p.recover([{id:'live-asr',runId:'active-run'}])).toBe(0);
+ expect(await db.jobs.get('live-asr')).toMatchObject({status:'running',runId:'active-run'});await db.delete();
+});
+
+it('重启中断恢复任务时保留候选和计费未明标记，不自动重发', async () => {
+  const db = freshDb();
+  const original = { key: 'v', source: 'asr' as const, lan: 'asr', cues: [], charCount: 0, cachedAt: 1, asrComplete: true };
+  const candidate = { ...original, asrComplete: false, asrPending: { start: 0, end: 10 } };
+  const recovery = { original, candidate, pending: true };
+  await db.jobs.put(mkJob({ id: 'recover-restart', videoKey: 'v', type: 'ASR_SUMMARIZE', status: 'running', runId: 'stale', recovery }));
+  const execute = vi.fn(async () => ({ result: 'done' as const }));
+  const pipeline = new Pipeline(db, { execute });
+  expect(await pipeline.recover()).toBe(1);
+  expect(await db.jobs.get('recover-restart')).toMatchObject({ status: 'failed', error: { code: 'ASR_INTERRUPTED' }, recovery });
+  await pipeline.drain();
+  expect(execute).not.toHaveBeenCalled();
+  await db.delete();
+});
+
+it('恢复存活的语音任务时，同一通道的新任务等待其完成',async()=>{
+ const db=freshDb();await db.jobs.put(mkJob({id:'live-asr',sessionId:'s',type:'ASR_SUMMARIZE',status:'running',runId:'active-run'}));
+ const execute=vi.fn(async()=>({result:'done' as const}));const p=new Pipeline(db,{execute},{lane:['ASR_SUMMARIZE','SUMMARIZE']});
+ await p.enqueue({type:'SUMMARIZE',videoKey:'other',sessionId:'s'});await p.drain();
+ expect(execute).not.toHaveBeenCalled();expect((await db.jobs.where('status').equals('pending').toArray())).toHaveLength(1);await db.delete();
 });
