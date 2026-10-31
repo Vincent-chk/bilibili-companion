@@ -88,6 +88,61 @@ it('后台收到 Port 断开时同步消费 lastError',()=>{
  disconnect();expect(reads).toBe(1);delete runtime.lastError;
 });
 
+it('读取当前视频状态不启动任务、泄露正文，且忽略后台分段任务', async () => {
+  await db.summaries.clear();
+  await db.summaries.put({
+    key: 'v:m', videoKey: 'v', source: 'asr', status: 'need_asr',
+    summary: '不应发送的摘要正文', outline: [], evaluation: '', rating: 0,
+    modelId: 'm', persona: '', createdAt: 1,
+    error: { code: 'AUTO_ASR_PENDING', msg: '不应发送的错误正文' },
+  });
+  await db.jobs.bulkPut([
+    { id: 'main', type: 'ASR_SUMMARIZE', videoKey: 'v', sessionId: 's', status: 'running', stage: 'asr', progress: 40, retries: 0, createdAt: 1, updatedAt: 2 },
+    { id: 'segment', type: 'SEGMENT_ANALYZE', videoKey: 'v', sessionId: 's', status: 'running', progress: 0, retries: 0, createdAt: 3, updatedAt: 3 },
+  ]);
+  const before = await db.jobs.toArray();
+  const drain = vi.mocked(Pipeline.prototype.drain);
+  drain.mockClear();
+
+  const result = await mock.listener!({ type: 'CURRENT_VIDEO_STATUS', videoKey: 'v' });
+
+  expect(result).toMatchObject({
+    ok: true, videoKey: 'v',
+    job: { id: 'main', type: 'ASR_SUMMARIZE', status: 'running', stage: 'asr' },
+    summary: { status: 'need_asr', source: 'asr', errorCode: 'AUTO_ASR_PENDING' },
+  });
+  expect(JSON.stringify(result)).not.toContain('不应发送');
+  expect(await db.jobs.toArray()).toEqual(before);
+  expect(drain).not.toHaveBeenCalled();
+  await db.summaries.clear();
+});
+
+it('暂停时可从已有记录只读定位视频分 P，不新增观看记录或任务', async () => {
+  mock.values.settings = { paused: true };
+  const base = { bvid: 'BV1234567890', aid: 1, title: '测试', cover: '', owner: '', duration: 60, fetchedAt: 1 };
+  await db.videos.bulkPut([
+    { ...base, key: 'BV1234567890:101', cid: 101, page: 1 },
+    { ...base, key: 'BV1234567890:102', cid: 102, page: 2 },
+  ]);
+  await upsertVisit(db, { sessionId: 's', videoKey: 'BV1234567890:102', now: 2 });
+  await db.jobs.put({ id: 'paused-page-2', type: 'SUMMARIZE', videoKey: 'BV1234567890:102', sessionId: 's', status: 'running', stage: 'subtitle', progress: 0, retries: 0, createdAt: 1, updatedAt: 1 });
+  const visits = await db.visits.toArray(), jobs = await db.jobs.toArray();
+  const drain = vi.mocked(Pipeline.prototype.drain); drain.mockClear();
+  expect(await mock.listener!({ type: 'CURRENT_VIDEO_STATUS', bvid: 'BV1234567890', page: 2 })).toMatchObject({ ok: true, videoKey: 'BV1234567890:102', job: { id: 'paused-page-2' } });
+  expect(await mock.listener!({ type: 'CURRENT_VIDEO_STATUS', bvid: 'BV1234567890', page: 1 })).toMatchObject({ ok: true, videoKey: undefined });
+  expect(await db.visits.toArray()).toEqual(visits);
+  expect(await db.jobs.toArray()).toEqual(jobs);
+  expect(drain).not.toHaveBeenCalled();
+});
+
+it('任务结束广播包含本次运行标识，避免旧进度覆盖重试状态', async () => {
+  const events: Array<{ type: string; jobId?: string; runId?: string }> = [];
+  mock.connect!({ name: 'doubao-port', onDisconnect: { addListener: vi.fn() }, postMessage: (event: typeof events[number]) => events.push(event) });
+  const { onJobTransition } = await import('../entrypoints/background');
+  onJobTransition({ id: 'job-old-progress', runId: 'run-1', type: 'SUMMARIZE', videoKey: 'v', sessionId: 's', status: 'done', progress: 100, retries: 0, createdAt: 1, updatedAt: 2 });
+  expect(events).toContainEqual(expect.objectContaining({ type: 'SUMMARY_DONE', jobId: 'job-old-progress', runId: 'run-1' }));
+});
+
 it('启动恢复任务后，向主链和分段链发送显式恢复信号', async () => {
   const drain = vi.mocked(Pipeline.prototype.drain);
   drain.mockClear();
@@ -150,6 +205,17 @@ it('连接回放迟到时不覆盖其他标签页已广播的暂停状态', asyn
   resume();
   await new Promise(resolve => setTimeout(resolve, 10));
   expect(states.at(-1)).toBe(true);
+});
+
+it('关闭气泡通知会同步所有标签页，且不会意外解除暂停', async () => {
+  mock.values.settings = { paused: true, bubbles: true };
+  const messages: Array<{ type: string; paused?: boolean; bubbles?: boolean }> = [];
+  mock.connect!({ name: 'doubao-port', onDisconnect: { addListener: vi.fn() }, postMessage: (m: typeof messages[number]) => messages.push(m) });
+  await vi.waitFor(() => expect(messages.some(m => m.type === 'WATCH_SETTINGS')).toBe(true));
+  messages.length = 0;
+  await mock.listener!({ type: 'SETTINGS_SAVE', bubbles: false });
+  expect(messages.at(-1)).toMatchObject({ type: 'WATCH_SETTINGS', paused: true, bubbles: false });
+  expect(mock.values.settings).toMatchObject({ paused: true, bubbles: false });
 });
 
 it('保留期主动打开未生成的摘要会建立可执行的用户任务', async () => {

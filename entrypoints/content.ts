@@ -9,7 +9,8 @@ import { browser } from 'wxt/browser';
 import type { PublicPath } from 'wxt/browser';
 import { Bridge, type UiEvent } from '../src/content/bridge';
 import { MascotController } from '../src/content/mascot/mascot';
-import type { UiSessionState } from '../src/content/mascot/logic';
+import { currentVideoStatusText, type CurrentVideoStatus, type UiSessionState } from '../src/content/mascot/logic';
+import type { JobRow } from '../src/lib/storage';
 import { openOnboarding } from '../src/content/onboarding/onboarding';
 import { PanelController } from '../src/content/panel/panel';
 import { clockOf, fmtSec } from '../src/content/panel/view-models';
@@ -35,6 +36,44 @@ export default defineContentScript({
     let mascotHidden = false;
     let uiSessionState: string | null = null;
     let watchPaused = true;
+    // 暂停时 watcher 会释放 currentVideoKey；仅保留只读身份，不继续采集观看信息。
+    let statusVideoKey: string | null = null;
+    let statusHref = location.href;
+    let statusHasVideo = !!detectBvid(location.href);
+    let statusSnapshot: CurrentVideoStatus | undefined;
+    let statusRevision = 0;
+    let latestStage: { jobId: string; runId?: string; stage: NonNullable<JobRow['stage']> } | null = null;
+    const settledRuns = new Set<string>();
+    const runKey = (jobId: string, runId?: string): string => `${jobId}:${runId ?? ''}`;
+    const renderVideoStatus = (): void => {
+      if (!uiSessionState) return;
+      mascot?.setVideoStatus(currentVideoStatusText(uiSessionState as UiSessionState, watchPaused, statusHasVideo, statusSnapshot));
+    };
+    const refreshVideoStatus = async (): Promise<void> => {
+      const videoKey = statusVideoKey;
+      const bvid = detectBvid(statusHref);
+      if ((!videoKey && !bvid) || !uiSessionState || uiSessionState === 'INACTIVE') return;
+      let page = 1;
+      try { page = Number(new URL(statusHref).searchParams.get('p')) || 1; } catch { /* 默认第 1P */ }
+      const revision = ++statusRevision;
+      try {
+        const result = await bridge.request<CurrentVideoStatus & { ok: boolean; videoKey?: string }>({
+          type: 'CURRENT_VIDEO_STATUS', ...(videoKey ? { videoKey } : { bvid, page }),
+        });
+        if (revision !== statusRevision || videoKey !== statusVideoKey || !result?.ok || !result.videoKey) return;
+        if (videoKey && result.videoKey !== videoKey) return;
+        if (!videoKey) statusVideoKey = result.videoKey;
+        if (latestStage && result.job?.id === latestStage.jobId && result.job.runId === latestStage.runId && result.job.status === 'running') {
+          result.job = { ...result.job, stage: latestStage.stage };
+        } else if (result.job?.id !== latestStage?.jobId || result.job?.runId !== latestStage?.runId) latestStage = null;
+        statusSnapshot = result;
+        renderVideoStatus();
+      } catch {
+        if (revision === statusRevision && videoKey === statusVideoKey && uiSessionState === 'ACTIVE' && !watchPaused) {
+          mascot?.setVideoStatus('当前状态暂不可用，稍后再试');
+        }
+      }
+    };
     const syncCollection = (restart = false): void => {
       const enabled = !extensionInvalidated && uiSessionState === 'ACTIVE' && !watchPaused;
       if (enabled === collectionEnabled && !restart) return;
@@ -93,12 +132,22 @@ export default defineContentScript({
       }
       panel?.handleEvent(e);
       if (e.type === 'WATCH_SETTINGS') {
-        watchPaused = e.paused === true;
+        if (typeof e.bubbles === 'boolean') mascot?.setBubblesEnabled(e.bubbles);
+        if (typeof e.paused === 'boolean') watchPaused = e.paused;
         syncCollection(e.restartWatcher === true);
+        renderVideoStatus();
+        if (statusHasVideo) void refreshVideoStatus();
       }
       if (e.type === 'SESSION_STATE' && e.state) {
         const changed = uiSessionState !== e.state;
         uiSessionState = e.state;
+        if (e.state === 'INACTIVE') {
+          ++statusRevision;
+          statusVideoKey = null;
+          statusSnapshot = undefined;
+          latestStage = null;
+          settledRuns.clear();
+        }
         syncCollection();
         if (changed) mascot?.setSessionState(e.state as UiSessionState);
         // P2.5：隐藏豆包只在陪看会话内生效——回 INACTIVE 自动解除（激活入口必须可见）
@@ -108,23 +157,33 @@ export default defineContentScript({
         }
         // P1.10 时机：激活/恢复后复核登录态（force 绕缓存）
         if (changed && e.state === 'ACTIVE') void requestLoginCheck(1);
+        renderVideoStatus();
+        if (statusHasVideo) void refreshVideoStatus();
       }
       // P1.10：登录态翻转 → 气泡（未登录激活=login 限频 kind；翻正=welcome）；引导卡由面板自管
       if (e.type === 'LOGIN_STATE') applyLoginState(e.loggedIn ?? null);
       // 记完/失败的表情反馈只在激活期（睡觉时不吵醒，F3 克制语义）；
       // kind 供 P1.9 准则#4 同类气泡 10min 限频（连看多视频不轰炸）
-      if (mascot?.session === 'ACTIVE') {
-        if (e.type === 'SUMMARY_DONE') {
-          mascot.pulse('happy', 9000);
-          void mascot.say('写完啦！点我看笔记 📖', 9000, 'done');
-        } else if (e.type === 'SUMMARY_FAILED') {
-          // P2.6 F9/F11：Key 无效专属气泡（带去设置指引）；kind 限频防连败轰炸
-          if (e.errorCode === 'KEY_INVALID') {
-            void mascot.say('Key 无效了…到设置里检查一下吧', 7000, 'key-invalid');
-          } else {
-            void mascot.say('有个视频没记完…点开看看', 5000, 'failed');
-          }
+      if (e.videoKey && e.videoKey === statusVideoKey) {
+        if (e.type === 'SUMMARY_PROGRESS' && e.jobId && e.stage &&
+            ['subtitle', 'audio', 'asr', 'llm_map', 'llm_reduce'].includes(e.stage)) {
+          if (settledRuns.has(runKey(e.jobId, e.runId))) return;
+          latestStage = { jobId: e.jobId, runId: e.runId, stage: e.stage as NonNullable<JobRow['stage']> };
+          if (statusSnapshot?.job?.id === e.jobId && statusSnapshot.job.runId === e.runId && statusSnapshot.job.status === 'running') {
+            statusSnapshot = { ...statusSnapshot, job: { ...statusSnapshot.job, stage: latestStage.stage } };
+            renderVideoStatus();
+          } else void refreshVideoStatus();
+        } else if (e.type === 'SUMMARY_DONE' || e.type === 'SUMMARY_FAILED' || e.type === 'SUMMARY_NEED_ASR' || e.type === 'SUMMARY_UPDATED') {
+          const terminal = e.type === 'SUMMARY_DONE' || e.type === 'SUMMARY_FAILED' || e.type === 'SUMMARY_NEED_ASR';
+          if (terminal && e.jobId) settledRuns.add(runKey(e.jobId, e.runId));
+          if (e.type === 'SUMMARY_DONE' && e.jobId && statusSnapshot?.job?.id === e.jobId && statusSnapshot.job.runId === e.runId && mascot?.session === 'ACTIVE') mascot.pulse('happy', 9000);
+          if (terminal && e.jobId && e.jobId === latestStage?.jobId && e.runId === latestStage.runId) latestStage = null;
+          void refreshVideoStatus();
         }
+      } else if (!statusVideoKey && e.videoKey?.startsWith(`${detectBvid(statusHref)}:`) &&
+          ['SUMMARY_PROGRESS', 'SUMMARY_DONE', 'SUMMARY_FAILED', 'SUMMARY_NEED_ASR', 'SUMMARY_UPDATED'].includes(e.type)) {
+        // 身份解析在途时不要丢失终态；仅重新读取当前分 P，忽略事件内容。
+        void refreshVideoStatus();
       }
     });
 
@@ -238,7 +297,20 @@ export default defineContentScript({
     // P3.3：B 站暗色模式 → 宿主同步 .dark 类（Shadow DOM 不吃页面级联，令牌覆盖见 styles.ts）
     setupThemeSync(document, ui.host);
     // P1.9 准则#5：VIDEO_ENTER 解析出当前视频后通知面板跟随（startWatcher 在模块层回调）
-    onVideoKeyResolved = (videoKey) => panel?.followVideo(videoKey);
+    onVideoKeyResolved = (videoKey) => {
+      panel?.followVideo(videoKey);
+      if (statusVideoKey !== videoKey) {
+        const hadVideoKey = statusVideoKey !== null;
+        ++statusRevision;
+        statusVideoKey = videoKey;
+        statusSnapshot = undefined;
+        latestStage = null;
+        settledRuns.clear();
+        if (hadVideoKey) mascot?.setVideoStatus(null);
+      }
+      renderVideoStatus();
+      void refreshVideoStatus();
+    };
     onExtensionInvalidated = () => toast(ui, '扩展已重新加载，请刷新当前页面后继续使用', 10000);
 
     bridge.connect(); // 连接后 SW 回放 SESSION_STATE → 豆包按当前会话态初始化表情/气泡
@@ -272,8 +344,18 @@ export default defineContentScript({
       const key = routeKey(href);
       if (key === lastKey) return;
       lastKey = key;
+      ++statusRevision;
+      statusHref = href;
+      statusHasVideo = !!detectBvid(href);
+      statusVideoKey = null;
+      statusSnapshot = undefined;
+      latestStage = null;
+      settledRuns.clear();
+      mascot?.setVideoStatus(null);
+      renderVideoStatus();
       panel?.routeChanged(href);
       report(detectBvid(href));
+      if (statusHasVideo) void refreshVideoStatus();
     };
     window.addEventListener('popstate', () => onRoute());
     patchHistoryPushState(() => onRoute());
@@ -366,7 +448,6 @@ async function startWatcher(bvid: string | null): Promise<void> {
               if ((r as { ok?: boolean; reason?: string } | undefined)?.reason === 'paused') watchSession?.dispose();
               if ((r as { summaryTriggered?: boolean } | undefined)?.summaryTriggered && mascot?.session === 'ACTIVE') {
                 mascot.setState('note');
-                void mascot.say('开始偷偷记笔记啦～', 4200, 'note');
               }
             })
             .catch((error: unknown) => { if (gen === watchGen && invalidContext(error)) stopInvalidatedWatcher(); });
@@ -386,7 +467,6 @@ async function startWatcher(bvid: string | null): Promise<void> {
               const res = r2 as { ok?: boolean; deduped?: boolean } | undefined;
               if (res?.ok && !res.deduped && mascot?.session === 'ACTIVE') {
                 mascot.setState('note');
-                void mascot.say('开始偷偷记笔记啦～', 4200, 'note'); // kind=note：准则#4 限频
               }
             })
             .catch((error: unknown) => { if (gen === watchGen && invalidContext(error)) stopInvalidatedWatcher(); });

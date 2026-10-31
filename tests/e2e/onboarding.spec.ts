@@ -73,9 +73,12 @@ async function activateForVideo(page: Page, threshold = '5'): Promise<void> {
   await expect(page.locator('#modal-root')).not.toHaveClass(/show/, { timeout: process.env.E2E_HEADED === '1' ? 150_000 : 5000 });
   await expect(page.locator('#mascot')).toHaveClass(/st-happy/);
   await page.getByRole('button', { name: '豆包' }).click();
+  await expect(page.locator('#panel')).toHaveClass(/open/);
   await page.locator('#btn-settings').click();
   await page.locator('#set-threshold').fill(threshold);
   await expect(page.locator('#th-val')).toHaveText(`${threshold} 秒`);
+  const worker = context.serviceWorkers().find(w => w.url().endsWith('/background.js'))!;
+  await expect.poll(() => worker.evaluate(async () => ((await chrome.storage.local.get('settings')).settings as { triggerSeconds?: number } | undefined)?.triggerSeconds)).toBe(Number(threshold));
   await page.goto(videoUrl, { waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('button', { name: '豆包' })).toBeVisible();
 }
@@ -233,7 +236,7 @@ test.beforeEach(async ({}, testInfo) => {
   releaseSegment = null;
   segmentGate = testInfo.title.includes('结束后停止排队预取') ? new Promise<void>(resolve => { releaseSegment = resolve; }) : null;
   releaseView = null;
-  viewGate = testInfo.title.includes('切换视频后详情跟随') ? new Promise<void>(resolve => { releaseView = resolve; }) : null;
+  viewGate = /切换视频后详情跟随|状态气泡不重复/.test(testInfo.title) ? new Promise<void>(resolve => { releaseView = resolve; }) : null;
   delayedViewStarted = false;
   const key = join(profile, 'fixture-key.pem');
   const cert = join(profile, 'fixture-cert.pem');
@@ -470,6 +473,210 @@ test('页面地址中的敏感查询参数不进入扩展日志', async () => {
   await expect.poll(() => logs.some(line => line.includes('route-changed'))).toBe(true);
   expect(logs.join('\n')).not.toContain('test-only-url-secret');
   expect(logs.join('\n')).not.toContain('test-only-route-secret');
+});
+
+test('状态气泡在变化后出现，收起后可悬停或聚焦查看且不启动任务', async () => {
+  test.setTimeout(30_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '120');
+  await page.mouse.move(700, 100);
+  const bubble = page.locator('#mascot-bubble');
+  const mascot = page.locator('#mascot');
+  await expect(page.locator('#panel')).not.toHaveClass(/open/);
+  await expect(bubble).toContainText('等待播放', { timeout: 8_000 });
+  await expect(bubble).toBeHidden({ timeout: 8_000 });
+  await mascot.hover();
+  await expect(bubble).toBeVisible();
+  await expect(bubble).toContainText('等待播放');
+  await page.mouse.move(700, 100);
+  await page.waitForTimeout(500);
+  await expect(bubble).toBeHidden();
+  await mascot.focus();
+  await expect(bubble).toBeVisible();
+  await expect(bubble).toContainText('等待播放');
+  await mascot.blur();
+  await expect(bubble).toBeHidden();
+  expect(modelStarts).toBe(0);
+  expect(audioRequests).toBe(0);
+  expect(playurlRequests).toBe(0);
+});
+
+test('状态气泡隔离不同视频，并在其他标签页关闭气泡后同步隐藏', async () => {
+  test.setTimeout(45_000);
+  const first = await context.newPage();
+  await activateForVideo(first, '5');
+  modelGate = new Promise<void>(resolve => { releaseModel = resolve; });
+  await first.locator('video').evaluate((video: HTMLVideoElement) => video.play());
+  await expect.poll(() => modelStarts, { timeout: 15_000 }).toBe(1);
+  await first.locator('#mascot').hover();
+  await expect(first.locator('#mascot-bubble')).toContainText(/要点|摘要|处理/, { timeout: 10_000 });
+
+  const second = await context.newPage();
+  await second.goto('https://www.bilibili.com/video/BV1NrHw6zEjq', { waitUntil: 'domcontentloaded' });
+  await second.locator('#mascot').hover();
+  await expect(second.locator('#mascot-bubble')).toContainText('等待播放', { timeout: 8_000 });
+  releaseModel?.();
+  await expect.poll(() => segmentStarts, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect(second.locator('#mascot-bubble')).toContainText('等待播放');
+
+  await second.locator('#mascot').click();
+  await second.locator('#btn-settings').click();
+  await second.locator('#sw-bubbles').locator('..').click();
+  await expect(second.locator('#sw-bubbles')).not.toBeChecked();
+  await first.bringToFront();
+  await first.mouse.move(700, 100);
+  await first.locator('#mascot').hover();
+  await expect(first.locator('#mascot-bubble')).toBeHidden();
+});
+
+test('状态气泡不重复弹出相同的等待状态', async () => {
+  test.setTimeout(30_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '120');
+  await page.goto('https://www.bilibili.com/video/BV0000000001', { waitUntil: 'domcontentloaded' });
+  await page.mouse.move(700, 100);
+  const bubble = page.locator('#mascot-bubble');
+  await expect.poll(() => delayedViewStarted).toBe(true);
+  await expect(bubble).toContainText('等待播放');
+  await expect(bubble).toBeHidden({ timeout: 8_000 });
+  releaseView?.();
+  const worker = context.serviceWorkers().find(w => w.url().endsWith('/background.js'))!;
+  await expect.poll(() => worker.evaluate(() => new Promise<boolean>((resolve, reject) => {
+    const request = indexedDB.open('doubao-companion');
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result, tx = db.transaction('visits'), rows = tx.objectStore('visits').getAll();
+      tx.oncomplete = () => { db.close(); resolve(rows.result.some((row: {videoKey: string}) => row.videoKey.startsWith('BV0000000001:'))); };
+      tx.onerror = () => reject(tx.error);
+    };
+  }))).toBe(true);
+  await page.waitForTimeout(500);
+  await expect(bubble).toBeHidden();
+});
+
+test('暂停陪看后状态气泡说明在途任务继续并更新完成结果', async () => {
+  test.setTimeout(45_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '5');
+  modelGate = new Promise<void>(resolve => { releaseModel = resolve; });
+  await page.locator('video').evaluate((video: HTMLVideoElement) => video.play());
+  await expect.poll(() => modelStarts, { timeout: 15_000 }).toBe(1);
+  await page.locator('#mascot').click();
+  await page.locator('#btn-settings').click();
+  await page.locator('#sw-pause').locator('..').click();
+  await expect(page.locator('#sw-pause')).toBeChecked();
+  await page.locator('#btn-close').click();
+  await page.locator('#mascot').hover();
+  await expect(page.locator('#mascot-bubble')).toContainText('暂停');
+  await expect(page.locator('#mascot-bubble')).toContainText('继续');
+  releaseModel?.();
+  await expect(page.locator('#mascot-bubble')).toContainText('摘要已完成', { timeout: 15_000 });
+  await expect(page.locator('#mascot-bubble')).toContainText('暂停');
+});
+
+test('暂停后刷新当前视频仍能只读显示后台任务结果', async () => {
+  test.setTimeout(45_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '5');
+  modelGate = new Promise<void>(resolve => { releaseModel = resolve; });
+  await page.locator('video').evaluate((video: HTMLVideoElement) => video.play());
+  await expect.poll(() => modelStarts, { timeout: 15_000 }).toBe(1);
+  await page.locator('#mascot').click();
+  await page.locator('#btn-settings').click();
+  await page.locator('#sw-pause').locator('..').click();
+  await expect(page.locator('#sw-pause')).toBeChecked();
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.locator('#mascot').hover();
+  await expect(page.locator('#mascot-bubble')).toContainText('暂停');
+  releaseModel?.();
+  await expect(page.locator('#mascot-bubble')).toContainText('摘要已完成', { timeout: 15_000 });
+  expect(modelStarts).toBe(1);
+  expect(audioRequests).toBe(0);
+});
+
+test('已结束任务的迟到进度不会覆盖当前状态', async () => {
+  test.setTimeout(50_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '5');
+  const cdp = await context.newCDPSession(page);
+  let worldId = 0;
+  cdp.on('Runtime.executionContextCreated', ({ context: world }) => { if (world.name === '豆包陪看助手') worldId = world.id; });
+  await cdp.send('Runtime.enable');
+  expect(worldId).toBeGreaterThan(0);
+  const patched = await cdp.send('Runtime.evaluate', { contextId: worldId, expression: `(() => {
+    const originalConnect = chrome.runtime.connect.bind(chrome.runtime);
+    chrome.runtime.connect = (...args) => {
+      const port = originalConnect(...args), add = port.onMessage.addListener.bind(port.onMessage);
+      port.onMessage.addListener = listener => add(message => {
+        globalThis.__statusListener = listener;
+        if (message.type === 'SUMMARY_PROGRESS' && message.jobId && message.stage) { globalThis.__runningStatusJob = message.jobId; globalThis.__runningStatusRun = message.runId; }
+        listener(message);
+      });
+      return port;
+    };
+    const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+    chrome.runtime.sendMessage = (...args) => {
+      const result = send(...args);
+      if (args[0]?.type !== 'CURRENT_VIDEO_STATUS') return result;
+      if (!globalThis.__holdFinishedStatus) return result;
+      return new Promise(resolve => { globalThis.__releaseFinishedStatus = () => resolve(result); });
+    };
+    document.dispatchEvent(new Event('visibilitychange'));
+  })()` });
+  expect(patched.exceptionDetails).toBeUndefined();
+  await expect.poll(async () => (await cdp.send('Runtime.evaluate', { contextId: worldId, expression: 'typeof globalThis.__statusListener', returnByValue: true })).result.value).toBe('function');
+  modelGate = new Promise<void>(resolve => { releaseModel = resolve; });
+  await page.locator('video').evaluate((video: HTMLVideoElement) => video.play());
+  const triggered = await cdp.send('Runtime.evaluate', { contextId: worldId, awaitPromise: true, returnByValue: true, expression: `chrome.runtime.sendMessage({type:'WATCH_TICK', videoKey:'BV1XynB6EEiM:100', watchId:'status-fixture', watchedSeconds:5, progressPct:25})` });
+  expect(triggered.result.value?.ok).toBe(true);
+  await expect.poll(() => modelStarts, { timeout: 15_000 }).toBe(1);
+  await page.locator('#mascot').hover();
+  await expect(page.locator('#mascot-bubble')).toContainText(/摘要|要点/, { timeout: 10_000 });
+  await expect.poll(async () => (await cdp.send('Runtime.evaluate', { contextId: worldId, expression: 'typeof globalThis.__runningStatusJob', returnByValue: true })).result.value).toBe('string');
+  await cdp.send('Runtime.evaluate', { contextId: worldId, expression: `(() => {
+    globalThis.__holdFinishedStatus = true;
+    globalThis.__statusListener({type:'SUMMARY_DONE', videoKey:'BV1XynB6EEiM:100', jobId:globalThis.__runningStatusJob, runId:globalThis.__runningStatusRun});
+  })()` });
+  await expect.poll(async () => (await cdp.send('Runtime.evaluate', { contextId: worldId, expression: 'typeof globalThis.__releaseFinishedStatus', returnByValue: true })).result.value, { timeout: 15_000 }).toBe('function');
+  await cdp.send('Runtime.evaluate', { contextId: worldId, expression: `globalThis.__statusListener({type:'SUMMARY_PROGRESS', videoKey:'BV1XynB6EEiM:100', jobId:globalThis.__runningStatusJob, runId:globalThis.__runningStatusRun, stage:'subtitle'})` });
+  await page.waitForTimeout(250);
+  await expect(page.locator('#mascot-bubble')).not.toContainText('字幕');
+  await cdp.send('Runtime.evaluate', { contextId: worldId, expression: 'globalThis.__holdFinishedStatus = false; globalThis.__releaseFinishedStatus()' });
+  releaseModel?.();
+});
+
+test('自动无字幕状态气泡提示配置语音服务且不下载音频', async () => {
+  test.setTimeout(40_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '5');
+  await page.locator('video').evaluate((video: HTMLVideoElement) => video.play());
+  await page.locator('#mascot').hover();
+  await expect(page.locator('#mascot-bubble')).toContainText('配置语音服务', { timeout: 20_000 });
+  expect(audioFetches).toBe(0);
+  expect(asrSocketRequests).toBe(0);
+});
+
+test('状态气泡自动无字幕实际语音上传等待回复时显示转写中', async () => {
+  test.setTimeout(60_000);
+  const page = await context.newPage();
+  await activateForVideo(page, '5');
+  const worker = context.serviceWorkers().find(w => w.url().endsWith('/background.js'))!;
+  await worker.evaluate(async () => {
+    const c = (globalThis as any).chrome, { settings } = await c.storage.local.get('settings');
+    await c.storage.local.set({ settings: { ...settings, asr: { provider: 'doubao-agent-plan', baseUrl: 'https://openspeech.bytedance.com', modelId: 'doubao-seed-asr-2.0', apiKey: 'fake-asr-key' } } });
+    c.permissions.contains = async () => true;
+  });
+  await page.locator('video').evaluate((video: HTMLVideoElement) => video.play());
+  await page.locator('#mascot').hover();
+  await expect.poll(() => audioFetches, { timeout: 25_000 }).toBe(1);
+  await expect(page.locator('#mascot-bubble')).toContainText('音频');
+  releaseAudio?.();
+  await expect.poll(() => asrFinalFrames, { timeout: 20_000 }).toBe(1);
+  await expect(page.locator('#mascot-bubble')).toContainText('转写');
+  releaseAsrResult?.();
+  await expect(page.locator('#mascot-bubble')).toContainText('摘要已完成', { timeout: 20_000 });
+  expect(audioFetches).toBe(1);
+  expect(asrSocketRequests).toBe(1);
 });
 
 test('豆包默认贴边缩小，不拦截推荐，悬停和键盘聚焦时展开', async () => {

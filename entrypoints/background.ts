@@ -242,7 +242,7 @@ export async function executeViaOffscreen(job: JobRow, ctx: JobContext): Promise
       if (m.progress !== undefined) patch.progress = m.progress;
       if (patch.stage !== undefined || patch.progress !== undefined) void ctx.update(patch);
       // 面板推送：补 videoKey（offscreen 只知道 jobId），deltaText 驱动详情流式打字
-      broadcastToUi({ ...m, type: 'SUMMARY_PROGRESS', videoKey: job.videoKey });
+      broadcastToUi({ ...m, type: 'SUMMARY_PROGRESS', videoKey: job.videoKey, runId: job.runId });
     }
     // P1.11：分段解读流式增量 → SEGMENT_NOTE_STREAM（补 videoKey/segIndex，面板内联卡片打字机）
     if (m?.type === 'SEGMENT_PROGRESS' && m.jobId === job.id && m.deltaText) {
@@ -355,8 +355,8 @@ export const onJobTransition = (j: JobRow): void => {
     // P2.6：失败终态随带错误码/文案（F9 Key 无效→气泡「去设置」；其余码仅随行不消费）
     broadcastToUi(
       t === 'SUMMARY_FAILED' && j.error
-        ? { type: t, videoKey: j.videoKey, errorCode: j.error.code, errorMsg: j.error.msg }
-        : { type: t, videoKey: j.videoKey },
+        ? { type: t, videoKey: j.videoKey, jobId: j.id, runId: j.runId, errorCode: j.error.code, errorMsg: j.error.msg }
+        : { type: t, videoKey: j.videoKey, jobId: j.id, runId: j.runId },
     );
     // F13 预取提速：摘要落库（大纲+转写已就绪）→ 静默入队未解读段（交互链 prio=1 后台消化，
     // 用户点【AI 解读】时大概率缓存命中秒开）
@@ -502,6 +502,7 @@ interface InMsg {
   type?: string;
   bvid?: string | null;
   url?: string;
+  page?: number;
   videoKey?: string;
   watchedSeconds?: number;
   watchId?: string;
@@ -648,7 +649,7 @@ export default defineBackground(() => {
       .then(async (r) => {
         try {
           const settings = await readSettings();
-          if (settingsRevision === settingsBroadcastRevision) p.postMessage({ type: 'WATCH_SETTINGS', paused: settings.paused === true });
+          if (settingsRevision === settingsBroadcastRevision) p.postMessage({ type: 'WATCH_SETTINGS', paused: settings.paused === true, bubbles: settings.bubbles !== false });
           // 连接期间已经收到更新广播时，不再回放较旧的会话快照。
           if (replayRevision === sessionBroadcastRevision) p.postMessage(sessionStateMsg(r.pointer));
         } catch {
@@ -689,6 +690,8 @@ export default defineBackground(() => {
         return browserSessionReady.then(() => handleTriggerSummary(m));
       case 'LIST_QUERY':
         return browserSessionReady.then(() => handleListQuery());
+      case 'CURRENT_VIDEO_STATUS':
+        return browserSessionReady.then(() => handleCurrentVideoStatus(m));
       case 'SUMMARY_OPEN':
         return browserSessionReady.then(() => handleSummaryOpen(m));
       case 'REGENERATE':
@@ -1015,6 +1018,41 @@ async function latestSummary(videoKey: string): Promise<SummaryRow | undefined> 
 async function activeJob(videoKey: string, sessionId: string): Promise<JobRow | undefined> {
   const rows = await db.jobs.where('videoKey').equals(videoKey).toArray();
   return rows.find((j) => j.sessionId === sessionId && j.type !== 'SEGMENT_ANALYZE' && ACTIVE_JOB_STATUSES.includes(j.status));
+}
+
+/** 只读状态快照：不执行保留期判断、队列唤醒或摘要生成，也不返回字幕和摘要正文。 */
+async function handleCurrentVideoStatus(m: InMsg): Promise<Record<string, unknown>> {
+  let { videoKey } = m;
+  if (!videoKey && (!m.bvid || !Number.isInteger(m.page) || m.page! < 1)) return { ok: false };
+  const pointer = await getSessionPointer(browserKv);
+  if (!pointer) return { ok: true, videoKey };
+  if (!videoKey) {
+    // 暂停后刷新时没有 watcher，只从本机会话已有的视频元信息定位分 P。
+    const rows = (await db.videos.where('bvid').equals(m.bvid!).toArray())
+      .filter(row => row.page === m.page)
+      .sort((a, b) => b.fetchedAt - a.fetchedAt);
+    const candidate = rows[0];
+    if (candidate && await db.visits.where({ sessionId: pointer.sessionId, videoKey: candidate.key }).first()) videoKey = candidate.key;
+    if ((await getSessionPointer(browserKv))?.sessionId !== pointer.sessionId) return { ok: false };
+    if (!videoKey) return { ok: true, videoKey: undefined };
+  }
+  const visit = await db.visits.where({ sessionId: pointer.sessionId, videoKey }).first();
+  if (!visit) return { ok: true, videoKey };
+  const [summary, job, jobs] = await Promise.all([
+    latestSummary(videoKey),
+    activeJob(videoKey, pointer.sessionId),
+    db.jobs.where('videoKey').equals(videoKey).toArray(),
+  ]);
+  if ((await getSessionPointer(browserKv))?.sessionId !== pointer.sessionId) return { ok: false };
+  const lastJob = jobs.filter(j => j.sessionId === pointer.sessionId && j.type !== 'SEGMENT_ANALYZE')
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return {
+    ok: true,
+    videoKey,
+    ...(job ? { job: { id: job.id, type: job.type, status: job.status, stage: job.stage, runId: job.runId } } : {}),
+    ...(summary ? { summary: { status: summary.status, source: summary.source, errorCode: summary.error?.code, asrOutdated: summary.asrOutdated } } : {}),
+    ...(lastJob ? { lastJob: { type: lastJob.type, status: lastJob.status, errorCode: lastJob.error?.code } } : {}),
+  };
 }
 
 interface StoredSettings {
@@ -1776,7 +1814,7 @@ async function handleSettingsSave(m: InMsg): Promise<Record<string, unknown>> {
   if (m.paused === true) {
     updateAbort?.abort();
   }
-  if (m.paused !== undefined) broadcastToUi({ type: 'WATCH_SETTINGS', paused: next['paused'] === true });
+  if (m.paused !== undefined || m.bubbles !== undefined) broadcastToUi({ type: 'WATCH_SETTINGS', paused: next['paused'] === true, bubbles: next['bubbles'] !== false });
   if (m.paused === false) {
     void resumeAutoAsrWaiting();
     drainUnlessPaused(true);

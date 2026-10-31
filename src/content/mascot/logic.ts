@@ -1,8 +1,59 @@
 // P1.6 · 豆包纯逻辑（无 DOM/browser 依赖，单测覆盖）：
 // 会话状态→表情映射、拖拽阈值与位置钳位（原型 setupMascotDrag 语义）、
 // 视口相对坐标持久化（02-数据模型 §2 mascotPos {x,y} 为视口相对坐标）、打字机节奏。
+import type { JobRow, SummaryRow } from '../../lib/storage';
+
 export type MascotState = 'idle' | 'happy' | 'thinking' | 'note' | 'sleep';
 export type UiSessionState = 'ACTIVE' | 'GRACE' | 'EXPIRED_PENDING_CONFIRM' | 'CLOSED' | 'INACTIVE';
+
+/** 状态气泡只消费脱敏后的任务元信息，不接收字幕、摘要或密钥。 */
+export interface CurrentVideoStatus {
+  job?: Pick<JobRow, 'id' | 'type' | 'status' | 'stage' | 'runId'>;
+  summary?: Pick<SummaryRow, 'status' | 'source' | 'asrOutdated'> & { errorCode?: string };
+  lastJob?: Pick<JobRow, 'type' | 'status'> & { errorCode?: string };
+}
+
+/** 将当前页面的主任务快照转换为简短状态；分段预取不进入此快照。 */
+export function currentVideoStatusText(
+  session: UiSessionState,
+  paused: boolean,
+  hasVideo: boolean,
+  snapshot?: CurrentVideoStatus,
+): string | null {
+  if (session === 'INACTIVE') return null; // 现有开始陪看按钮仍是唯一入口
+  if (session === 'EXPIRED_PENDING_CONFIRM') return '陪看数据待确认，点豆包查看';
+  if (session === 'GRACE' || session === 'CLOSED') return '陪看已结束，数据帮你留着哦';
+  const job = hasVideo ? snapshot?.job : undefined;
+  const summary = hasVideo ? snapshot?.summary : undefined;
+  const lastJob = hasVideo ? snapshot?.lastJob : undefined;
+  const regenFailed = summary?.status === 'done' && lastJob?.type === 'REGENERATE' && lastJob.status === 'failed';
+  if (paused) {
+    if (regenFailed) return '陪看已暂停；重新生成失败，已保留旧笔记';
+    if (job?.status === 'running') return '陪看已暂停，已开始的任务会继续';
+    if (summary?.status === 'done') return '陪看已暂停，本视频摘要已完成';
+    return '陪看已暂停，已开始的任务可能继续';
+  }
+  if (!hasVideo) return '陪看中，等待打开视频';
+  if (job?.status === 'pending') return '视频正在排队等待处理';
+  if (job?.status === 'running') {
+    const stages: Partial<Record<NonNullable<JobRow['stage']>, string>> = {
+      subtitle: '正在获取字幕…', audio: '正在下载音频…', asr: '正在进行语音转写…',
+      llm_map: '正在整理视频要点…', llm_reduce: '正在撰写视频摘要…',
+    };
+    return (job.stage && stages[job.stage]) || '正在处理当前视频…';
+  }
+  const code = summary?.errorCode;
+  if (code && ['ASR_NO_SPEECH', 'ASR_TOO_SHORT', 'LOW_CONTENT'].includes(code)) return '语音内容不足，未生成摘要';
+  if ((code === 'KEY_INVALID' || lastJob?.errorCode === 'KEY_INVALID') && summary?.status !== 'done') return '模型 Key 无效，请到设置检查';
+  if (code === 'NEED_ASR_CONFIG') return '没有字幕，请配置语音服务';
+  if (code === 'ASR_PERMISSION_DENIED') return '语音服务未授权，点豆包查看';
+  if (code === 'AUTO_ASR_PENDING') return '没有字幕，正在准备语音识别…';
+  if (regenFailed) return '重新生成失败，已保留旧笔记';
+  if (summary?.status === 'done') return summary.asrOutdated ? '摘要已生成，转写内容需核对' : '摘要已完成，点豆包查看';
+  if (summary?.status === 'need_asr' || job?.status === 'need_confirm') return '语音转写待处理，点豆包查看';
+  if (summary?.status === 'failed' || lastJob?.status === 'failed') return '视频处理未完成，点豆包查看';
+  return '等待播放达到设定时长';
+}
 
 /** 会话态 → 表情（ACTIVE 不切表情：保留最近一次事件表情；结束后睡觉）。 */
 export function mascotStateForSession(session: UiSessionState): MascotState | null {

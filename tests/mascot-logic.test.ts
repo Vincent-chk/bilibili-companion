@@ -15,10 +15,60 @@ import {
   isDragMoved,
   isTypingTarget,
   mascotStateForSession,
+  currentVideoStatusText,
   snapToEdge,
   toRelative,
   typeDelay,
 } from '../src/content/mascot/logic';
+
+describe('当前视频状态文案', () => {
+  const job = { id: 'job', type: 'SUMMARIZE' as const, status: 'running' as const };
+  it('按真实任务阶段显示字幕、音频、转写和摘要进度', () => {
+    expect(currentVideoStatusText('ACTIVE', false, true, { job: { ...job, stage: 'subtitle' } })).toContain('字幕');
+    expect(currentVideoStatusText('ACTIVE', false, true, { job: { ...job, stage: 'audio' } })).toContain('音频');
+    expect(currentVideoStatusText('ACTIVE', false, true, { job: { ...job, stage: 'asr' } })).toContain('转写');
+    expect(currentVideoStatusText('ACTIVE', false, true, { job: { ...job, stage: 'llm_map' } })).toContain('要点');
+    expect(currentVideoStatusText('ACTIVE', false, true, { job: { ...job, stage: 'llm_reduce' } })).toContain('摘要');
+  });
+  it('自动语音识别准备中不误说必须手动确认', () => {
+    const text = currentVideoStatusText('ACTIVE', false, true, {
+      summary: { status: 'need_asr', source: 'asr', errorCode: 'AUTO_ASR_PENDING' },
+    });
+    expect(text).toContain('语音');
+    expect(text).not.toContain('确认');
+  });
+  it('无语音或语音不足不显示摘要已完成', () => {
+    for (const code of ['ASR_NO_SPEECH', 'ASR_TOO_SHORT', 'LOW_CONTENT']) {
+      const text = currentVideoStatusText('ACTIVE', false, true, {
+        summary: { status: 'failed', source: 'asr', errorCode: code },
+      });
+      expect(text).toContain('不足');
+      expect(text).not.toContain('已完成');
+    }
+  });
+  it('密钥无效时直接提示用户去设置检查', () => {
+    const text = currentVideoStatusText('ACTIVE', false, true, {
+      summary: { status: 'failed', source: 'manual_sub', errorCode: 'KEY_INVALID' },
+      lastJob: { type: 'SUMMARIZE', status: 'failed', errorCode: 'KEY_INVALID' },
+    });
+    expect(text).toContain('Key');
+    expect(text).toContain('设置');
+  });
+  it('重生成失败时说明旧摘要保留；暂停时说明在途任务可能继续', () => {
+    const snapshot = {
+      summary: { status: 'done' as const, source: 'ai_sub' as const },
+      lastJob: { type: 'REGENERATE' as const, status: 'failed' as const },
+    };
+    expect(currentVideoStatusText('ACTIVE', false, true, snapshot)).toContain('保留');
+    const paused = currentVideoStatusText('ACTIVE', true, true, { job });
+    expect(paused).toContain('暂停');
+    expect(paused).toContain('继续');
+  });
+  it('无当前视频与未激活状态不会显示其他视频的任务', () => {
+    expect(currentVideoStatusText('ACTIVE', false, false, { job })).toContain('等待');
+    expect(currentVideoStatusText('INACTIVE', false, true, { job })).toBeNull();
+  });
+});
 
 describe('会话态 → 表情映射', () => {
   it('GRACE/待确认/已关闭 → sleep（结束陪看睡觉）', () => {

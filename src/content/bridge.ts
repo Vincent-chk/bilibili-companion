@@ -17,11 +17,13 @@ export type SummaryEventType =
 export interface UiEvent {
   type: SummaryEventType | 'SESSION_STATE' | 'SEEK_TO' | 'LOGIN_STATE' | 'UPDATE_AVAILABLE' | 'WATCH_SETTINGS' | 'EXTENSION_RELOAD_REQUIRED';
   paused?: boolean;
+  bubbles?: boolean;
   restartWatcher?: boolean;
   updateVersion?: string | null;
   updateRevision?: number;
   videoKey?: string;
   jobId?: string;
+  runId?: string;
   stage?: string;
   progress?: number;
   deltaText?: string;

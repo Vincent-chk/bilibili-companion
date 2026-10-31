@@ -53,6 +53,11 @@ export class MascotController {
   #typeTimer: ReturnType<typeof setInterval> | null = null;
   #hideTimer: unknown = null;
   #pulseTimer: unknown = null;
+  #videoStatus: string | null = null;
+  #statusUntil = 0;
+  #statusOwned = false;
+  #bubblesAllowed = true;
+  #bubbleRevision = 0;
   /** P1.9 准则#1：闲时半透明计时；#4：同 kind 气泡限频记录。 */
   #idleTimer: unknown = null;
   #snapTimer: unknown = null;
@@ -106,17 +111,23 @@ export class MascotController {
       hoverTimer = null;
     };
     const deferCollapse = () => {
-      if (!wrap.classList.contains('hover-expanded')) return;
+      if (!wrap.classList.contains('hover-expanded')) {
+        this.#settleVideoStatus();
+        return;
+      }
       cancelHoverTimer();
       hoverTimer = this.#timers.setTimeout(() => {
         hoverTimer = null;
         if (!mascot.matches(':hover') && !bubble.matches(':hover')) wrap.classList.remove('hover-expanded');
+        this.#settleVideoStatus();
       }, 300);
     };
-    mascot.addEventListener('pointerenter', () => { cancelHoverTimer(); wrap.classList.add('hover-expanded'); });
+    mascot.addEventListener('pointerenter', () => { cancelHoverTimer(); wrap.classList.add('hover-expanded'); void this.#showVideoStatus(true); });
     mascot.addEventListener('pointerleave', deferCollapse);
     bubble.addEventListener('pointerenter', () => { if (wrap.classList.contains('hover-expanded')) cancelHoverTimer(); });
     bubble.addEventListener('pointerleave', deferCollapse);
+    mascot.addEventListener('focus', () => { void this.#showVideoStatus(true); });
+    mascot.addEventListener('blur', () => { this.#timers.setTimeout(() => this.#settleVideoStatus(), 0); });
     this.#armIdle();
   }
 
@@ -186,6 +197,7 @@ export class MascotController {
     this.#el.wrap.classList.toggle('hidden', hidden);
     if (hidden) this.hideBubble();
     else if (this.#session === 'INACTIVE') this.showStartBubble(); // 解除隐藏即恢复激活入口
+    else void this.#showVideoStatus(true);
   }
 
   get hidden(): boolean {
@@ -212,12 +224,14 @@ export class MascotController {
    */
   async say(text: string, ms = BUBBLE_MS, kind?: string): Promise<void> {
     if (this.#hidden) return; // P2.5：隐藏豆包期间气泡静默（计时/生成不受影响）
+    const revision = ++this.#bubbleRevision;
     try {
       if (!(await this.deps.bubblesEnabled())) return;
     } catch (error) {
       if (isInvalidated(error)) return;
       throw error;
     }
+    if (revision !== this.#bubbleRevision || this.#hidden) return;
     if (isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
     if (kind) {
       const now = Date.now();
@@ -226,6 +240,7 @@ export class MascotController {
     }
     this.#wake();
     this.#stopTimers();
+    this.#statusOwned = false;
     const b = this.#el.bubble;
     b.classList.remove('hidden');
     b.innerHTML = '';
@@ -256,8 +271,10 @@ export class MascotController {
     const now = Date.now();
     if (bubbleThrottled(this.#lastKindAt.get('start'), now)) return;
     this.#lastKindAt.set('start', now);
+    ++this.#bubbleRevision;
     this.#wake();
     this.#stopTimers();
+    this.#statusOwned = false;
     const b = this.#el.bubble;
     b.classList.remove('hidden');
     b.innerHTML = '要我陪你一起看吗？<br><button class="bubble-btn" id="btn-start">▶ 开始陪看</button>';
@@ -278,10 +295,77 @@ export class MascotController {
   }
 
   hideBubble(): void {
+    ++this.#bubbleRevision;
     this.#stopTimers();
+    this.#statusOwned = false;
     this.#el.bubble.classList.add('hidden');
     this.#el.bubble.innerHTML = '';
     if (!this.#el.mascot.matches(':hover')) this.#el.wrap.classList.remove('hover-expanded');
+  }
+
+  /** 状态变化提示五秒；悬停或键盘聚焦可重新查看，不受通知限频影响。 */
+  setVideoStatus(text: string | null): void {
+    if (text === this.#videoStatus) return;
+    this.#videoStatus = text;
+    ++this.#bubbleRevision;
+    if (!text) {
+      if (this.#statusOwned) this.hideBubble();
+      return;
+    }
+    this.#statusUntil = Date.now() + BUBBLE_MS;
+    void this.#showVideoStatus(false);
+  }
+
+  /** 设置变更经后台广播到全部标签页，防止关闭后遗留状态气泡。 */
+  setBubblesEnabled(enabled: boolean): void {
+    if (this.#bubblesAllowed === enabled) return;
+    this.#bubblesAllowed = enabled;
+    ++this.#bubbleRevision;
+    if (!enabled && this.#statusOwned) this.hideBubble();
+    else if (enabled) void this.#showVideoStatus(this.#statusHeld());
+  }
+
+  #statusHeld(): boolean {
+    return this.#el.mascot.matches(':hover') || this.#el.mascot.matches(':focus') || this.#el.bubble.matches(':hover');
+  }
+
+  async #showVideoStatus(manual: boolean): Promise<void> {
+    const text = this.#videoStatus;
+    if (!text || this.#hidden || !this.#bubblesAllowed || this.#session === 'INACTIVE') return;
+    if (!manual && isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
+    if (manual && !this.#statusHeld() && Date.now() >= this.#statusUntil) return;
+    const revision = ++this.#bubbleRevision;
+    try {
+      if (!(await this.deps.bubblesEnabled())) return;
+    } catch (error) {
+      if (isInvalidated(error)) return;
+      console.error('[doubao] status settings failed', error);
+      return;
+    }
+    if (revision !== this.#bubbleRevision || this.#videoStatus !== text || this.#hidden || !this.#bubblesAllowed) return;
+    if (!manual && isTypingTarget(this.deps.ui.root.ownerDocument.activeElement as never)) return;
+    if (!this.#statusHeld() && Date.now() >= this.#statusUntil) return;
+    this.#stopTimers();
+    this.#statusOwned = true;
+    this.#el.bubble.textContent = text;
+    this.#el.bubble.classList.remove('hidden');
+    this.#wake();
+    this.#settleVideoStatus();
+  }
+
+  #settleVideoStatus(): void {
+    if (!this.#statusOwned) return;
+    if (this.#hideTimer !== null) this.#timers.clearTimeout(this.#hideTimer);
+    this.#hideTimer = null;
+    const remaining = this.#statusUntil - Date.now();
+    if (remaining <= 0) {
+      if (!this.#statusHeld()) this.hideBubble();
+      return;
+    }
+    this.#hideTimer = this.#timers.setTimeout(() => {
+      this.#hideTimer = null;
+      if (!this.#statusHeld()) this.hideBubble();
+    }, remaining);
   }
 
   #stopTimers(): void {
